@@ -118,8 +118,8 @@ impl Catalog {
             .map_err(|e| Error::Catalog { message: format!("{url}: {e}") })?;
 
         let response = check(response, &url).await?;
-        let raw: Vec<RawModel> = response.json().await.map_err(|e| Error::Catalog { message: format!("{url}: {e}") })?;
-        Ok(raw.into_iter().map(RawModel::into_entry).collect())
+        let raw: Vec<RawModel> = decode(response, &url).await?;
+        Ok(raw.into_iter().filter_map(RawModel::into_entry).collect())
     }
 
     /// The files in a repository, at a revision (`main` by default).
@@ -132,7 +132,7 @@ impl Catalog {
             .await
             .map_err(|e| Error::Catalog { message: format!("{info_url}: {e}") })?;
         let response = check(response, &info_url).await?;
-        let info: RawRepoInfo = response.json().await.map_err(|e| Error::Catalog { message: format!("{info_url}: {e}") })?;
+        let info: RawRepoInfo = decode(response, &info_url).await?;
 
         let tree_url = format!("{}/api/models/{repo_id}/tree/{revision}", self.endpoint);
         let response = self
@@ -141,7 +141,7 @@ impl Catalog {
             .await
             .map_err(|e| Error::Catalog { message: format!("{tree_url}: {e}") })?;
         let response = check(response, &tree_url).await?;
-        let tree: Vec<RawTreeEntry> = response.json().await.map_err(|e| Error::Catalog { message: format!("{tree_url}: {e}") })?;
+        let tree: Vec<RawTreeEntry> = decode(response, &tree_url).await?;
 
         let mut files: Vec<CatalogFile> = tree
             .into_iter()
@@ -183,6 +183,33 @@ impl Catalog {
 }
 
 /// Turn a non-2xx into an error that names what to do about it.
+/// Decode a JSON body, saying *what* failed when it fails.
+///
+/// `Response::json()` collapses every parse failure into the string "error decoding response
+/// body" — no field, no offset, no clue whether the cause was the network or the shape. Hugging
+/// Face adds and changes fields regularly, so that is precisely the error a user of this app is
+/// most likely to hit, and it is the one that tells them least.
+///
+/// Reading the body first costs one allocation and buys a serde error that names the field and
+/// the line, plus the text that was actually there. A search response is kilobytes; a repository
+/// tree is tens of kilobytes. Neither is worth protecting at the cost of an unactionable error.
+async fn decode<T: serde::de::DeserializeOwned>(response: reqwest::Response, url: &str) -> Result<T> {
+    let body =
+        response.text().await.map_err(|e| Error::Catalog { message: format!("{url}: the response body could not be read: {e}") })?;
+    serde_json::from_str(&body).map_err(|e| {
+        // The line serde stopped on, so the message carries the offending text and not just a
+        // coordinate the reader has no way to look up.
+        let context = body.lines().nth(e.line().saturating_sub(1)).map(|line| {
+            let from = e.column().saturating_sub(60);
+            let snippet: String = line.chars().skip(from).take(160).collect();
+            format!(" — near: {snippet}")
+        });
+        Error::Catalog {
+            message: format!("{url}: the response did not match what this client expects: {e}{}", context.unwrap_or_default()),
+        }
+    })
+}
+
 async fn check(response: reqwest::Response, url: &str) -> Result<reqwest::Response> {
     if response.status().is_success() {
         return Ok(response);
@@ -204,8 +231,17 @@ async fn check(response: reqwest::Response, url: &str) -> Result<reqwest::Respon
 
 #[derive(Deserialize)]
 struct RawModel {
-    #[serde(alias = "modelId")]
-    id: String,
+    /// Hugging Face sends **both** `id` and `modelId`, carrying the same value.
+    ///
+    /// `#[serde(alias = "modelId")]` looks like the lenient way to accept either name and is the
+    /// exact opposite: an alias points both names at one field, so a payload carrying both is a
+    /// *duplicate field* and serde rejects the entire response — every search, for every query,
+    /// with an error that named neither the field nor the cause. Two optional fields accept
+    /// either name, both, or neither.
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default, rename = "modelId")]
+    model_id: Option<String>,
     #[serde(default)]
     downloads: u64,
     #[serde(default)]
@@ -221,16 +257,19 @@ struct RawModel {
 }
 
 impl RawModel {
-    fn into_entry(self) -> CatalogEntry {
-        CatalogEntry {
-            id: self.id,
+    /// `None` for an entry carrying no identifier under either name: there is nothing to open and
+    /// nothing to download, so it is dropped rather than allowed to fail the whole search.
+    fn into_entry(self) -> Option<CatalogEntry> {
+        let id = self.id.or(self.model_id)?;
+        Some(CatalogEntry {
+            id,
             downloads: self.downloads,
             likes: self.likes,
             tags: self.tags,
             last_modified: self.last_modified,
             gated: self.gated.map(|g| g.is_gated()).unwrap_or(false),
             pipeline_tag: self.pipeline_tag,
-        }
+        })
     }
 }
 
@@ -318,7 +357,14 @@ mod tests {
                 "/api/models",
                 get(|| async {
                     Json(serde_json::json!([
+                        // **Both** `id` and `modelId`, because that is what the real endpoint
+                        // sends on every entry. This fixture used to carry one name per entry and
+                        // never both, which is how `#[serde(alias = "modelId")]` on `id` — a
+                        // duplicate field against a real response — passed its own test while
+                        // failing every search in the shipped app.
                         {
+                            "_id": "66e98ae0be5913b903da60c1",
+                            "id": "bartowski/Qwen3-4B-Instruct-GGUF",
                             "modelId": "bartowski/Qwen3-4B-Instruct-GGUF",
                             "downloads": 12345, "likes": 42,
                             "tags": ["gguf", "text-generation"],
@@ -328,7 +374,12 @@ mod tests {
                         },
                         // `gated: "manual"` — a string where a bool would be expected. The shape
                         // that breaks a naive client.
-                        { "id": "meta/gated-model-GGUF", "downloads": 7, "gated": "manual" }
+                        { "id": "meta/gated-model-GGUF", "downloads": 7, "gated": "manual" },
+                        // Only `modelId`: the older shape, still accepted.
+                        { "modelId": "legacy/only-model-id-GGUF", "downloads": 3 },
+                        // No identifier under either name — dropped, and it must not cost the
+                        // user the other three results.
+                        { "downloads": 1 }
                     ]))
                 }),
             )
@@ -365,12 +416,14 @@ mod tests {
     async fn search_reads_both_id_shapes_and_both_gated_shapes() {
         let catalog = Catalog::new(fake_hub().await, None);
         let results = catalog.search("qwen", 10).await.expect("searches");
-        assert_eq!(results.len(), 2);
+        assert_eq!(results.len(), 3, "the entry with no identifier is dropped, the rest survive");
+        // Carries `id` and `modelId` together, as every real entry does.
         assert_eq!(results[0].id, "bartowski/Qwen3-4B-Instruct-GGUF");
         assert_eq!(results[0].downloads, 12345);
         assert!(!results[0].gated);
         assert_eq!(results[1].id, "meta/gated-model-GGUF");
         assert!(results[1].gated, "\"manual\" is gated");
+        assert_eq!(results[2].id, "legacy/only-model-id-GGUF", "`modelId` alone still identifies a repository");
     }
 
     #[tokio::test]
