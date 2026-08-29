@@ -11,6 +11,7 @@ import { bytes, count, eta, params, rate, relativeTime, tokens } from '../lib/fo
 import type { CatalogEntry, CatalogRepo, DownloadProgress, HardwareSnapshot } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { EmptyState, FitBadge, Icon, QuantBadge, Spinner } from './common'
+import { MiningCatalog } from './MiningCatalog'
 
 export function ModelsView() {
   const [tab, setTab] = useState<'installed' | 'discover'>('installed')
@@ -283,6 +284,16 @@ function DiscoverPanel() {
 
   return (
     <div className="p-4">
+      {/* The chain's own list first. It is short, fixed, and unguessable — nobody types
+          "Misakachain/Qwen3.6-35B-A3B-PALW-runtime" into a search box — so a search-only Discover
+          hid the only models on this page that can earn anything. */}
+      <MiningCatalog />
+
+      <h3 className="mt-6 text-sm font-semibold">Any other GGUF model</h3>
+      <p className="mb-3 mt-1 text-xs text-ink-500 dark:text-ink-400">
+        Chat models, from the whole of Hugging Face. These do not mine — they are for talking to.
+      </p>
+
       <form
         className="flex gap-2"
         onSubmit={(event) => {
