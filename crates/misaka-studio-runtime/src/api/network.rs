@@ -187,3 +187,53 @@ fn default_log_limit() -> usize {
 async fn node_log(State(state): State<Arc<AppState>>, Query(query): Query<LogQuery>) -> Json<Vec<String>> {
     Json(state.node.recent_log(query.limit.min(600)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use misaka_studio_core::palw::default_class;
+
+    fn default_artifact_name() -> &'static str {
+        match &default_class().artifact {
+            PalwArtifactSource::Download { filename, .. } => filename,
+            other => panic!("the default class must publish an artifact, got {other:?}"),
+        }
+    }
+
+    fn default_artifact_size() -> u64 {
+        match &default_class().artifact {
+            PalwArtifactSource::Download { size_bytes, .. } => *size_bytes,
+            other => panic!("the default class must publish an artifact, got {other:?}"),
+        }
+    }
+
+    /// An empty models directory must not produce a path. Handing the node an artifact flag
+    /// pointing at nothing would turn "mine the floor" into a node that refuses to start.
+    #[tokio::test]
+    async fn no_artifact_means_no_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(default_class_artifact(dir.path()).await, None);
+    }
+
+    /// The size is the check, not the name. A half-finished copy under the right filename is the
+    /// case this exists for: the node would refuse it at startup, and having the Studio hand it
+    /// over anyway costs the operator a sync to find out.
+    #[tokio::test]
+    async fn a_short_file_is_not_the_default_artifact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        tokio::fs::write(dir.path().join(default_artifact_name()), b"not the whole thing").await.expect("write");
+        assert_eq!(default_class_artifact(dir.path()).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_full_sized_artifact_is_offered_by_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(default_artifact_name());
+        // Sparse: the whole point is that this check reads metadata, not 1.7 GiB.
+        let file = std::fs::File::create(&path).expect("create");
+        file.set_len(default_artifact_size()).expect("set_len");
+        drop(file);
+
+        assert_eq!(default_class_artifact(dir.path()).await, Some(path));
+    }
+}
