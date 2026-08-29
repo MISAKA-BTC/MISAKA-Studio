@@ -4,6 +4,7 @@
 // process is not there every other part of the UI is showing stale data. Saying so in one place,
 // permanently, beats a toast that has already faded by the time someone looks up.
 
+import logo from '../assets/misaka-logo.png'
 import { relativeTime } from '../lib/format'
 import { useStudio, type View } from '../store/studio'
 import { Icon, type IconName } from './common'
@@ -33,7 +34,9 @@ export function Sidebar() {
   return (
     <aside className="flex h-full w-64 shrink-0 flex-col border-r border-ink-200 bg-white dark:border-ink-800 dark:bg-ink-900">
       <div className="flex items-center gap-2.5 px-4 py-4">
-        <div className="flex size-8 items-center justify-center rounded-lg bg-arc-600 text-sm font-bold text-white">M</div>
+        {/* The project's own mark, not a letter in a box. It carries its own colour in both
+            themes, so it is drawn at its native aspect rather than cropped into a square. */}
+        <img src={logo} alt="" className="h-7 w-auto shrink-0" />
         <div className="min-w-0">
           <div className="truncate text-sm font-semibold">MISAKA Studio</div>
           <div className="flex items-center gap-1.5 text-[0.7rem] text-ink-500 dark:text-ink-400">
