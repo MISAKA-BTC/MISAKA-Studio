@@ -293,7 +293,7 @@ export type Conversation = {
 
 export type PalwArtifactSource =
   | { kind: 'derived_from_seed' }
-  | { kind: 'download'; filename: string; sha256: string; size_bytes: number; hf_repo: string; convert_command: string }
+  | { kind: 'download'; filename: string; repo_path: string; sha256: string; size_bytes: number; hf_repo: string; convert_command: string }
   | { kind: 'convert_locally'; extension: string; approx_size_bytes: number; source_repo: string; convert_command: string }
 
 export type PalwClassReadiness =

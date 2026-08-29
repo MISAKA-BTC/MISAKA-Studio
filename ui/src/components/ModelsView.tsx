@@ -11,7 +11,7 @@ import { bytes, count, eta, params, rate, relativeTime, tokens } from '../lib/fo
 import type { CatalogEntry, CatalogRepo, DownloadProgress, HardwareSnapshot } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { EmptyState, FitBadge, Icon, QuantBadge, Spinner } from './common'
-import { MiningCatalog } from './MiningCatalog'
+import { InstalledMiningArtifacts, MiningCatalog } from './MiningCatalog'
 
 export function ModelsView() {
   const [tab, setTab] = useState<'installed' | 'discover'>('installed')
@@ -49,7 +49,14 @@ export function ModelsView() {
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         {active.length > 0 && <DownloadsPanel downloads={downloads} />}
-        {tab === 'installed' ? <InstalledList /> : <DiscoverPanel />}
+        {tab === 'installed' ? (
+          <>
+            <InstalledMiningArtifacts />
+            <InstalledList />
+          </>
+        ) : (
+          <DiscoverPanel />
+        )}
       </div>
     </div>
   )

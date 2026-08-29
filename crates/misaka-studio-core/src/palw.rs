@@ -13,7 +13,7 @@
 //! | class | artifact | share |
 //! |---|---|---|
 //! | `PALW-BASE-0` | none — derived from a seed on every node | 600‰ |
-//! | `PALW-QWEN25-A16` | `.palwart`, 1.7 GiB, converted locally | 200‰ |
+//! | `PALW-QWEN25-A16` | `qwen25-1.5b-a16.palwart`, 1.7 GiB, downloadable | 200‰ |
 //! | `QWEN36` | `qwen36.palwq36`, 34 GiB, downloadable | 200‰ |
 //!
 //! # What this table is, and is not
@@ -42,14 +42,19 @@ pub enum PalwArtifactSource {
     DerivedFromSeed,
     /// A file published for download, verifiable against a pinned digest before use.
     Download {
+        /// The name the file takes on disk — the basename of `repo_path`, and what a scan of the
+        /// models directory looks for.
         filename: &'static str,
+        /// Path within the repository. Not the same string as `filename` the moment an artifact
+        /// lives in a subdirectory, and conflating the two downloads a 404.
+        repo_path: &'static str,
         /// SHA-256 of the file itself — what the download manager verifies.
         sha256: &'static str,
         size_bytes: u64,
         /// Hugging Face repository holding it.
         hf_repo: &'static str,
-        /// Converting from the source GGUF is the alternative route; named so the UI can offer
-        /// both.
+        /// Rebuilding the artifact from the public weights is the alternative route, and the one
+        /// that trusts nobody; named so the UI can offer both.
         convert_command: &'static str,
     },
     /// Must be converted locally from public weights — no direct download is published.
@@ -112,18 +117,23 @@ pub const TESTNET11_CLASSES: &[PalwClassSpec] = &[
     },
     PalwClassSpec {
         name: "PALW-QWEN25-A16",
-        description: "Qwen2.5-1.5B-Instruct, W8A16 static-PTQ — the dense tier. Converted locally from the public \
-                      weights (~3 s, 2.9 GiB read); no download of the artifact itself is published.",
+        description: "Qwen2.5-1.5B-Instruct, W8A16 static-PTQ — the dense tier. The published artifact is the \
+                      conversion of the public weights; rebuilding it yourself takes ~3 s over a 2.9 GiB read and \
+                      lands on the same registered root, which is the only reason downloading it is safe.",
         share_permille: 200,
         class_id_hex: "",
         class_id_complete: false,
-        // PALW_RC_GENESIS_QWEN25_A16_ARTIFACT_ROOT, consensus/core/src/config/params.rs.
+        // PALW_RC_GENESIS_QWEN25_A16_ARTIFACT_ROOT, consensus/core/src/config/params.rs — and
+        // printed verbatim in the artifact repository's own card.
         artifact_root_hex: "c00faa480f2344d4a737e5b2e87ab6064d8d6e42c1ffeb6aa0a14ed62134299a\
                             7c9dc08f15342cefca1e29390810e6d2c5879f4c3853ebe43a9e2d47ed57ba17",
-        artifact: PalwArtifactSource::ConvertLocally {
-            extension: ".palwart",
-            approx_size_bytes: 1_825_361_100, // ~1.7 GiB, per the classes runbook
-            source_repo: "Qwen/Qwen2.5-1.5B-Instruct",
+        artifact: PalwArtifactSource::Download {
+            filename: "qwen25-1.5b-a16.palwart",
+            repo_path: "palw-runtime/qwen25-1.5b-a16.palwart",
+            // The repository's LFS object id, which *is* the file's SHA-256.
+            sha256: "a8c4e53e5b30dd0d4dc6ef791e0513890a07a2b3a22d045e612536bba1240b1f",
+            size_bytes: 1_795_427_276,
+            hf_repo: "Misakachain/Qwen2.5-1.5B-PALW-A16-runtime",
             convert_command: "qwen25-convert /path/to/Qwen2.5-1.5B-Instruct --a16 --out qwen25-1.5b-a16.palwart",
         },
         is_base: false,
@@ -143,6 +153,7 @@ pub const TESTNET11_CLASSES: &[PalwClassSpec] = &[
                             13d1b727537f0d03d349253aa11ef427e4047c2166b69fd7edb46a4a9984b368",
         artifact: PalwArtifactSource::Download {
             filename: "qwen36.palwq36",
+            repo_path: "qwen36.palwq36",
             sha256: "7a944595a4256ab0aa4ca8b59f39fea268654b3630e54fb354cf1fa7658cf08c",
             size_bytes: 36_492_831_232,
             hf_repo: "Misakachain/Qwen3.6-35B-A3B-PALW-runtime",
@@ -186,7 +197,16 @@ pub struct PalwClassStatus {
 /// its models directory (and the node's app dir if it knows one); this stays pure so it is
 /// testable without a filesystem.
 pub fn assess_classes(artifact_files: &[(String, String, u64)], total_memory: u64) -> Vec<PalwClassStatus> {
-    TESTNET11_CLASSES
+    assess(TESTNET11_CLASSES, artifact_files, total_memory)
+}
+
+/// The same, against an arbitrary class list.
+///
+/// Separate from [`assess_classes`] so the registry snapshot is not the only input this logic can
+/// ever be shown: every class currently registered publishes its artifact, and without this the
+/// convert-locally branch below would be code no test can reach.
+pub fn assess(classes: &[PalwClassSpec], artifact_files: &[(String, String, u64)], total_memory: u64) -> Vec<PalwClassStatus> {
+    classes
         .iter()
         .map(|spec| {
             let readiness = match &spec.artifact {
@@ -255,6 +275,13 @@ mod tests {
             if !class.artifact_root_hex.is_empty() {
                 assert_eq!(class.artifact_root_hex.len(), 128, "{}", class.name);
             }
+            // A repository path that does not end in the name the file takes on disk is two
+            // separate failures at once: the download 404s, or it lands under a name the
+            // directory scan will never recognise and the class reads as missing forever.
+            if let PalwArtifactSource::Download { filename, repo_path, sha256, .. } = &class.artifact {
+                assert!(repo_path.ends_with(filename), "{}: {repo_path} does not end with {filename}", class.name);
+                assert_eq!(sha256.len(), 64, "{}", class.name);
+            }
         }
     }
 
@@ -291,12 +318,46 @@ mod tests {
     }
 
     #[test]
-    fn missing_artifacts_say_whether_a_download_exists() {
+    fn every_registered_model_class_can_be_installed_without_a_toolchain() {
         let statuses = assess_classes(&[], 64 << 30);
-        let qwen36 = statuses.iter().find(|s| s.spec.name == "QWEN36").expect("class");
-        assert_eq!(qwen36.readiness, PalwClassReadiness::ArtifactMissing { downloadable: true });
-        let qwen25 = statuses.iter().find(|s| s.spec.name == "PALW-QWEN25-A16").expect("class");
-        assert_eq!(qwen25.readiness, PalwClassReadiness::ArtifactMissing { downloadable: false });
+        for status in statuses.iter().filter(|s| !s.spec.is_base) {
+            assert_eq!(
+                status.readiness,
+                PalwClassReadiness::ArtifactMissing { downloadable: true },
+                "{} publishes an artifact, so an empty machine must be one click from it",
+                status.spec.name
+            );
+        }
+    }
+
+    /// The convert-locally branch, which no currently registered class takes. Kept covered
+    /// because "not reachable today" and "correct" are different claims.
+    #[test]
+    fn a_class_with_no_published_artifact_says_so_instead_of_offering_a_download() {
+        const ONLY: &[PalwClassSpec] = &[PalwClassSpec {
+            name: "SYNTHETIC",
+            description: "",
+            share_permille: 1000,
+            class_id_hex: "",
+            class_id_complete: false,
+            artifact_root_hex: "",
+            artifact: PalwArtifactSource::ConvertLocally {
+                extension: ".palwart",
+                approx_size_bytes: 1 << 30,
+                source_repo: "example/weights",
+                convert_command: "convert --out out.palwart",
+            },
+            is_base: false,
+        }];
+
+        let missing = assess(ONLY, &[], 64 << 30);
+        assert_eq!(missing[0].readiness, PalwClassReadiness::ArtifactMissing { downloadable: false });
+
+        // Presence is judged by extension here: a conversion's byte size varies with its input,
+        // so there is no size to compare against and the root check is the node's.
+        let files = vec![("/m/out.palwart".to_string(), "out.palwart".to_string(), 12u64)];
+        let present = assess(ONLY, &files, 64 << 30);
+        assert!(matches!(present[0].readiness, PalwClassReadiness::ArtifactPresent { .. }));
     }
 
     /// A 34 GiB class on a 16 GiB laptop: listed, and honest about why it will not run — not

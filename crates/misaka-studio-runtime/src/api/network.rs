@@ -101,7 +101,7 @@ async fn download_artifact(
         .ok_or_else(|| Error::bad_request(format!("no PALW class named '{name}'")))?;
 
     match &spec.artifact {
-        PalwArtifactSource::Download { filename, sha256, size_bytes, hf_repo, .. } => {
+        PalwArtifactSource::Download { repo_path, sha256, size_bytes, hf_repo, .. } => {
             let settings = state.settings.read().await.clone();
             let catalog = state.catalog().await;
             let progress = state
@@ -114,7 +114,9 @@ async fn download_artifact(
                     // The artifact is pinned by content digest, so `main` is safe here in a way
                     // it is not for models: a moved branch cannot change what verifies.
                     "main".to_string(),
-                    filename.to_string(),
+                    // The path inside the repository — the download manager takes the basename
+                    // for the destination, which is the name the class scan looks for.
+                    repo_path.to_string(),
                     Some(sha256.to_string()),
                     Some(*size_bytes),
                     None,

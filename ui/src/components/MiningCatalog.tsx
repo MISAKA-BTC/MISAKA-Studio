@@ -27,16 +27,17 @@ function repoUrl(endpoint: string | undefined, repo: string): string {
   return `${base}/${repo}`
 }
 
-export function MiningCatalog() {
+/**
+ * The class list, re-read whenever a download settles.
+ *
+ * An artifact that just landed must stop saying "not installed" on its own: the alternative is a
+ * list that stays wrong until someone reloads the window, which is exactly the moment they would
+ * conclude the download had failed.
+ */
+function useClassStatuses(): { classes: PalwClassStatus[] | null; error: string | null } {
   const [classes, setClasses] = useState<PalwClassStatus[] | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const toast = useStudio((s) => s.toast)
-  const setDownload = useStudio((s) => s.setDownload)
   const downloads = useStudio((s) => s.downloads)
-
-  // Re-read once every download has settled. An artifact that just landed must stop saying "not
-  // installed" on its own — the alternative is a list that is wrong until someone thinks to
-  // reload the window, which is exactly when they would conclude the download failed.
   const settled = downloads.filter((d) => d.status === 'completed' || d.status === 'failed' || d.status === 'cancelled').length
 
   const refresh = useCallback(async () => {
@@ -51,6 +52,68 @@ export function MiningCatalog() {
   useEffect(() => {
     void refresh()
   }, [refresh, settled])
+
+  return { classes, error }
+}
+
+/**
+ * The class artifacts that are actually on this machine, for the Installed tab.
+ *
+ * They live in the models directory beside the GGUFs and are invisible to the model scanner —
+ * different extension, different runtime, not something you can chat with. Without this, a 34 GiB
+ * file could sit on disk with nothing in the app willing to admit it was there.
+ */
+export function InstalledMiningArtifacts() {
+  const { classes } = useClassStatuses()
+  const held = (classes ?? []).filter((c) => c.readiness.state === 'artifact_present' || c.readiness.state === 'artifact_mismatch')
+  if (held.length === 0) return null
+
+  return (
+    <section className="card m-4 mb-0 p-4">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <h3 className="text-sm font-semibold">Mining class artifacts</h3>
+        <span className="text-[0.7rem] text-ink-500 dark:text-ink-400">not chat models — these produce blocks</span>
+      </div>
+      <div className="mt-3 space-y-2">
+        {held.map((cls) => {
+          const { readiness } = cls
+          const path = readiness.state === 'artifact_present' || readiness.state === 'artifact_mismatch' ? readiness.path : null
+          const size = readiness.state === 'artifact_present' || readiness.state === 'artifact_mismatch' ? readiness.size_bytes : null
+          return (
+            <div key={cls.spec.name} className="rounded-xl border border-ink-200 p-3 dark:border-ink-800">
+              <div className="flex flex-wrap items-center gap-2">
+                <h4 className="mono text-sm font-semibold">{cls.spec.name}</h4>
+                <span className="badge bg-arc-500/15 text-arc-700 dark:text-arc-300">{cls.spec.share_permille}‰ share</span>
+                {readiness.state === 'artifact_present' ? (
+                  <span className="badge bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">on disk</span>
+                ) : (
+                  <span className="badge bg-red-100 text-red-800 dark:bg-red-950/60 dark:text-red-300">wrong size on disk</span>
+                )}
+              </div>
+              <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-[0.7rem] text-ink-500 dark:text-ink-400">
+                <span>{bytes(size)}</span>
+                <span className="mono truncate">{path}</span>
+              </div>
+              {/* Presence is a filename, not an identity. The node re-derives the registered root
+                  at startup and refuses a mismatch, so this list stops short of calling a file
+                  verified — that word belongs to the check that actually ran. */}
+              <p className="mt-1.5 text-[0.7rem] text-ink-500 dark:text-ink-400">
+                {readiness.state === 'artifact_present'
+                  ? 'Point the node at this path to mine this class. It verifies the registered root at startup — a file that does not match is refused there, not here.'
+                  : 'A truncated download or a different conversion. Delete it and install again; the node would refuse this file at startup.'}
+              </p>
+            </div>
+          )
+        })}
+      </div>
+    </section>
+  )
+}
+
+export function MiningCatalog() {
+  const { classes, error } = useClassStatuses()
+  const toast = useStudio((s) => s.toast)
+  const setDownload = useStudio((s) => s.setDownload)
 
   const install = async (name: string) => {
     try {
@@ -102,7 +165,13 @@ export function MiningCatalog() {
 function MiningRow({ cls, onInstall }: { cls: PalwClassStatus; onInstall: (name: string) => void }) {
   const { spec, readiness } = cls
   const system = useStudio((s) => s.system)
+  const downloads = useStudio((s) => s.downloads)
   const artifact = spec.artifact
+  // An install already running. The progress bar is above this list, but the button is where the
+  // eye is after clicking it, and one that still says "Install" invites a second click.
+  const inFlight =
+    artifact.kind === 'download' &&
+    downloads.some((d) => d.file.endsWith(artifact.filename) && (d.status === 'downloading' || d.status === 'verifying'))
   const repo = artifact.kind === 'download' ? artifact.hf_repo : artifact.kind === 'convert_locally' ? artifact.source_repo : null
 
   // Worded for this list, not the Network tab's: here the question is "is it on this machine yet",
@@ -179,18 +248,28 @@ function MiningRow({ cls, onInstall }: { cls: PalwClassStatus; onInstall: (name:
           {/* Offered even when the artifact is larger than this machine's memory. The note above
               already says it will not run here, and hiding the button would leave someone
               installing onto an external disk with no way to do it. */}
-          <button type="button" className={cls.memory_note ? 'btn-ghost' : 'btn-outline'} onClick={() => onInstall(spec.name)}>
-            <Icon name="download" className="size-3.5" />
-            {cls.memory_note ? `Install anyway — ${bytes(artifact.size_bytes)}` : `Install ${bytes(artifact.size_bytes)}`}
+          <button
+            type="button"
+            className={cls.memory_note ? 'btn-ghost' : 'btn-outline'}
+            disabled={inFlight}
+            onClick={() => onInstall(spec.name)}
+          >
+            {inFlight ? <Spinner className="size-3.5" /> : <Icon name="download" className="size-3.5" />}
+            {inFlight
+              ? 'Installing…'
+              : cls.memory_note
+                ? `Install anyway — ${bytes(artifact.size_bytes)}`
+                : `Install ${bytes(artifact.size_bytes)}`}
           </button>
         </div>
       )}
 
-      {artifact.kind === 'convert_locally' && readiness.state !== 'artifact_present' && (
+      {artifact.kind !== 'derived_from_seed' && readiness.state !== 'artifact_present' && (
         <div className="mt-2.5">
           <p className="text-[0.7rem] text-ink-500 dark:text-ink-400">
-            No artifact is published for this class — it is built from the public weights above, and the conversion is what makes
-            it byte-identical to the registered root:
+            {artifact.kind === 'download'
+              ? 'Or rebuild it from the public weights and trust nobody — the conversion is deterministic, so it lands on the same registered root or it is not this class:'
+              : 'No artifact is published for this class — it is built from the public weights above, and the conversion is what makes it byte-identical to the registered root:'}
           </p>
           <div className="mt-1 flex items-center gap-1">
             <code className="mono min-w-0 flex-1 truncate rounded bg-ink-100 px-2 py-1 text-[0.65rem] dark:bg-ink-800" title={artifact.convert_command}>
