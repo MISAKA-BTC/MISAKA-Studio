@@ -16,6 +16,7 @@ import type { ChatMessage } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { CopyButton, EmptyState, Icon, Spinner } from './common'
 import { Markdown } from './Markdown'
+import { useClassStatuses } from './MiningCatalog'
 import { ModelBar } from './ModelBar'
 
 export function ChatView() {
@@ -27,6 +28,10 @@ export function ChatView() {
   const editMessage = useStudio((s) => s.editMessage)
   const runtime = useStudio((s) => s.runtime)
   const models = useStudio((s) => s.models)
+  // Only consulted for the empty state, to tell "nothing installed" apart from "something
+  // installed that this window cannot load".
+  const { classes } = useClassStatuses()
+  const installedClass = (classes ?? []).find((cls) => cls.readiness.state === 'artifact_present')
 
   const conversation = conversations.find((c) => c.id === activeId) ?? null
   const messages = conversation?.messages ?? []
@@ -68,6 +73,18 @@ export function ChatView() {
               <>
                 No models are installed yet. Open <strong>Models → Discover</strong> to find one on Hugging Face — the list shows what
                 fits this machine before you download anything.
+                {/* Otherwise this reads as "nothing was installed" to someone who just watched
+                    1.7 GiB arrive. A class artifact is a real thing on disk; it is simply not a
+                    thing this window can load, and saying which is the difference between a
+                    confusing screen and an informative one. */}
+                {installedClass && (
+                  <>
+                    {' '}
+                    The <span className="mono">{installedClass.spec.name}</span> class artifact <em>is</em> installed — but it is
+                    not a chat model. It is what the <strong>node</strong> executes to produce blocks; this window drives the
+                    inference engine, which loads GGUF.
+                  </>
+                )}
               </>
             ) : runtime?.model_id ? (
               <>Ask anything. Everything runs on this machine; nothing leaves it.</>

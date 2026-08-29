@@ -40,7 +40,7 @@ function repoUrl(endpoint: string | undefined, repo: string): string {
  * list that stays wrong until someone reloads the window, which is exactly the moment they would
  * conclude the download had failed.
  */
-function useClassStatuses(): { classes: PalwClassStatus[] | null; error: string | null } {
+export function useClassStatuses(): { classes: PalwClassStatus[] | null; error: string | null } {
   const [classes, setClasses] = useState<PalwClassStatus[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const downloads = useStudio((s) => s.downloads)
