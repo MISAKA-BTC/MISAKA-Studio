@@ -12,6 +12,7 @@ use misaka_studio_core::settings::{BackendKind, Settings, default_data_dir, defa
 use misaka_studio_runtime::{AppState, api, locate_ui};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(name = "misaka-studiod", version, about = "MISAKA Studio runtime: local LLM inference with an OpenAI-compatible API")]
@@ -179,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let parent_gone = args.exit_on_stdin_close.then(watch_stdin_eof);
+    let shutdown_state = state.clone();
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -211,6 +213,11 @@ async fn main() -> anyhow::Result<()> {
                     tracing::info!("shutting down");
                 }
             }
+
+            // Before the process goes: a download task does not stop just because the listener
+            // did, and a restart that resumes a `.part` the previous process is still appending
+            // to produces a file of the right size and the wrong bytes.
+            shutdown_state.downloads.cancel_all(Duration::from_secs(5)).await;
         })
         .await?;
 

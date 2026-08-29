@@ -126,6 +126,51 @@ impl DownloadManager {
         Ok(())
     }
 
+    /// Stop every running download and wait, briefly, for them to actually stop.
+    ///
+    /// Shutdown has to do this, and the reason is a corrupted 1.7 GiB file that took an hour to
+    /// produce. A `.part` is resumed by appending from its current length, which is only correct
+    /// while exactly one process is appending. Nothing about "the server stopped listening" stops
+    /// a download task, so a stop-and-restart left the old process still writing while the new
+    /// one resumed from a length that was already stale — two writers, interleaved bytes, a file
+    /// of exactly the right size and entirely wrong content. The digest check caught it, which is
+    /// what it is for, but the whole transfer was lost.
+    ///
+    /// Waiting matters as much as cancelling: a flag nobody has read yet stops nothing, and the
+    /// process exits with the task still mid-`write_all`. The grace period is bounded because a
+    /// stuck socket must not be able to hold shutdown open — the download resumes next time.
+    pub async fn cancel_all(&self, grace: Duration) {
+        {
+            let jobs = self.jobs.read().await;
+            let mut running = 0;
+            for job in jobs.values() {
+                if matches!(job.progress.status, DownloadStatus::Downloading | DownloadStatus::Verifying) {
+                    job.cancel.store(true, Ordering::SeqCst);
+                    running += 1;
+                }
+            }
+            if running == 0 {
+                return;
+            }
+            tracing::info!("stopping {running} download(s) before exit; partial files are kept and resume next time");
+        }
+
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            let still_running = self
+                .jobs
+                .read()
+                .await
+                .values()
+                .any(|j| matches!(j.progress.status, DownloadStatus::Downloading | DownloadStatus::Verifying));
+            if !still_running {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tracing::warn!("a download did not stop within the grace period; its .part file may be short of what was reported");
+    }
+
     /// Forget a finished download. Refuses while it is still running — the alternative is a task
     /// writing to a file nothing is tracking.
     pub async fn forget(&self, id: &str) -> Result<()> {
