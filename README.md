@@ -122,13 +122,22 @@ that makes the block.**
 
 * **Mining classes, as a list you can act on.** A block on MISAKA is won by verified LLM
   inference in one of the chain-registered classes — `PALW-BASE-0` (the deterministic floor,
-  600‰, needs nothing), `PALW-QWEN25-A16` (200‰, converted locally from public Qwen2.5 weights),
-  `QWEN36` (200‰, a 34 GiB Qwen3.6-35B artifact, downloadable and digest-pinned). Each card
-  shows its share, its artifact requirement, this machine's readiness — including an honest
-  "this machine cannot run this class" when the artifact exceeds RAM — and, when a node is
-  running, the class's **live on-chain status** from the node's own `--palw-dump-classes` table.
-  The artifact download reuses the model download pipeline, verified against the chain-pinned
-  SHA-256.
+  600‰, needs nothing), `PALW-QWEN25-A16` (200‰, a 1.7 GiB W8A16 Qwen2.5-1.5B artifact),
+  `QWEN36` (200‰, a 34 GiB Qwen3.6-35B artifact). Both model classes are downloadable and
+  digest-pinned. The list is the top half of **Models → Discover**, above the free-text search,
+  because nobody guesses these repository names; each card shows its share, what installs, this
+  machine's readiness — including an honest "this machine cannot run this class" when the
+  artifact exceeds RAM — and, when a node is running, the class's **live on-chain status** from
+  the node's own `--palw-dump-classes` table. The artifact download reuses the model download
+  pipeline, verified against the chain-pinned SHA-256.
+* **The default class arrives on first run.** `PALW-QWEN25-A16` is the Studio's default: the
+  first start fetches `qwen25-1.5b-a16.palwart` (1.7 GiB) into the models directory, verified
+  against the digest testnet-11 registered in genesis, and a producer started with no class
+  artifact configured then mines that class rather than the floor. It is a download and not a
+  file in this repository because it cannot be one — GitHub refuses any file over 100 MB, and
+  LFS's free tier is smaller than this single artifact. It appears in the download list like any
+  other and can be cancelled there; **Network → Install the default class artifact on first run**
+  turns it off for a metered connection, or for a machine that will only ever chat.
 * **Observer** — point the tab at any reachable node RPC and read the chain.
 * **Verifier** — run a full node; on this chain syncing *is* verifying, no bond required. With a
   bonded key the same node takes panel duty and files receipts on producers' claims.

@@ -21,6 +21,12 @@ import type { PalwClassStatus } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { CopyButton, Icon, Spinner } from './common'
 
+/**
+ * The class the runtime installs on first run — `palw::DEFAULT_CLASS`, repeated here only to put
+ * a badge on it. The install itself is the runtime's decision and does not consult this.
+ */
+const DEFAULT_CLASS = 'PALW-QWEN25-A16'
+
 /** `https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct`, honouring an `HF_ENDPOINT` mirror. */
 function repoUrl(endpoint: string | undefined, repo: string): string {
   const base = endpoint && /^https?:\/\//.test(endpoint) ? endpoint.replace(/\/+$/, '') : 'https://huggingface.co'
@@ -84,6 +90,7 @@ export function InstalledMiningArtifacts() {
               <div className="flex flex-wrap items-center gap-2">
                 <h4 className="mono text-sm font-semibold">{cls.spec.name}</h4>
                 <span className="badge bg-arc-500/15 text-arc-700 dark:text-arc-300">{cls.spec.share_permille}‰ share</span>
+                {cls.spec.name === DEFAULT_CLASS && <span className="badge bg-arc-600 text-white">default class</span>}
                 {readiness.state === 'artifact_present' ? (
                   <span className="badge bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">on disk</span>
                 ) : (
@@ -98,9 +105,11 @@ export function InstalledMiningArtifacts() {
                   at startup and refuses a mismatch, so this list stops short of calling a file
                   verified — that word belongs to the check that actually ran. */}
               <p className="mt-1.5 text-[0.7rem] text-ink-500 dark:text-ink-400">
-                {readiness.state === 'artifact_present'
-                  ? 'Point the node at this path to mine this class. It verifies the registered root at startup — a file that does not match is refused there, not here.'
-                  : 'A truncated download or a different conversion. Delete it and install again; the node would refuse this file at startup.'}
+                {readiness.state !== 'artifact_present'
+                  ? 'A truncated download or a different conversion. Delete it and install again; the node would refuse this file at startup.'
+                  : cls.spec.name === DEFAULT_CLASS
+                    ? 'The default class: starting the node as a producer mines this without any further configuration. The node verifies the registered root at startup — a file that does not match is refused there, not here.'
+                    : 'Name this path as the class artifact in Network settings to mine this class instead. The node verifies the registered root at startup — a file that does not match is refused there, not here.'}
               </p>
             </div>
           )
@@ -196,6 +205,7 @@ function MiningRow({ cls, onInstall }: { cls: PalwClassStatus; onInstall: (name:
       <div className="flex flex-wrap items-center gap-2">
         <h4 className="mono text-sm font-semibold">{spec.name}</h4>
         <span className="badge bg-arc-500/15 text-arc-700 dark:text-arc-300">{spec.share_permille}‰ share</span>
+        {spec.name === DEFAULT_CLASS && <span className="badge bg-arc-600 text-white">default · installed on first run</span>}
         {spec.is_base && <span className="badge bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300">floor · always producible</span>}
         {badge}
       </div>

@@ -112,6 +112,78 @@ impl AppState {
         self.catalog.read().await.clone()
     }
 
+    /// Install the default class's artifact in the background, if it is not already here.
+    ///
+    /// "Download the Studio and it can already mine a model class" is the intent, and the reason
+    /// it is a first-run download rather than a file in the repository is arithmetic: the
+    /// artifact is 1.7 GiB, GitHub refuses any file over 100 MB, and LFS's free tier is smaller
+    /// than the file. So the bytes arrive the same way pressing Install would deliver them —
+    /// same manager, same progress in the UI, same verification against the digest the chain
+    /// registered — just without anyone having to ask.
+    ///
+    /// It never blocks startup and never fails it. No network, a full disk, a mirror that is
+    /// down: each of those leaves a working Studio with the Install button exactly where it was.
+    /// Called by the binary rather than from `new` so that constructing state in a test does not
+    /// reach the network.
+    pub fn spawn_default_class_install(self: &Arc<Self>) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let settings = state.settings.read().await.clone();
+            if !settings.node.install_default_class_artifact {
+                return;
+            }
+
+            let spec = misaka_studio_core::palw::default_class();
+            let misaka_studio_core::palw::PalwArtifactSource::Download { filename, repo_path, sha256, size_bytes, hf_repo, .. } =
+                &spec.artifact
+            else {
+                // A class with no published artifact cannot be preinstalled, and inventing a
+                // conversion the user did not ask for is not the fallback.
+                return;
+            };
+
+            let destination = settings.models_dir.join(filename);
+            match tokio::fs::metadata(&destination).await {
+                Ok(meta) if meta.len() == *size_bytes => return,
+                // Someone else's file under our name — a half-copy, a different conversion. Not
+                // ours to delete, and re-downloading beside it is not possible anyway.
+                Ok(meta) => {
+                    tracing::warn!(
+                        "{} exists at {} bytes where {} expects {size_bytes}; leaving it alone",
+                        destination.display(),
+                        meta.len(),
+                        spec.name
+                    );
+                    return;
+                }
+                Err(_) => {}
+            }
+
+            tracing::info!("installing the default class artifact for {} from {hf_repo} ({size_bytes} bytes)", spec.name);
+            let catalog = state.catalog().await;
+            let started = state
+                .downloads
+                .start(
+                    &catalog,
+                    state.store.clone(),
+                    settings.models_dir.clone(),
+                    hf_repo.to_string(),
+                    // Pinned by content digest, so a branch that moves cannot change what
+                    // verifies — the same reason the class download endpoint uses `main`.
+                    "main".to_string(),
+                    repo_path.to_string(),
+                    Some(sha256.to_string()),
+                    Some(*size_bytes),
+                    None,
+                )
+                .await;
+            match started {
+                Ok(progress) => tracing::info!("default class artifact downloading into {}", progress.destination.display()),
+                Err(e) => tracing::warn!("could not start the default class artifact download: {e}"),
+            }
+        });
+    }
+
     pub async fn backend(&self) -> SharedBackend {
         self.backend.read().await.clone()
     }

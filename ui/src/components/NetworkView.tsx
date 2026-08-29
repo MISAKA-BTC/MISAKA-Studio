@@ -17,7 +17,7 @@ import { api } from '../lib/api'
 import { bytes, count, shortHash } from '../lib/format'
 import type { NetworkOverview, NodeClassRow, PalwClassStatus, Settings } from '../lib/types'
 import { useStudio } from '../store/studio'
-import { CopyButton, EmptyState, Field, Icon, Section, Spinner } from './common'
+import { CopyButton, EmptyState, Field, Icon, Section, Spinner, Toggle } from './common'
 
 export function NetworkView() {
   const [overview, setOverview] = useState<NetworkOverview | null>(null)
@@ -436,6 +436,12 @@ function NodeSettingsPanel({ settings, save }: { settings: Settings; save: (s: S
       <Field label="Attach to RPC" hint="Watch an already-running node instead of launching one. host:port of its --rpclisten-json endpoint.">
         <input className="input mt-1" placeholder="127.0.0.1:28210" value={draft.rpc_url ?? ''} onChange={(e) => set('rpc_url', text(e.target.value))} />
       </Field>
+      <Toggle
+        label="Install the default class artifact on first run"
+        hint="PALW-QWEN25-A16, 1.7 GB, fetched once and verified against the digest the chain registered — so a fresh install can mine a model class without hunting for a file. It appears in the download list and can be cancelled there. Turn it off on a metered connection, or if this machine will only ever chat."
+        checked={draft.install_default_class_artifact}
+        onChange={(v) => set('install_default_class_artifact', v)}
+      />
 
       {draft.role === 'producer' && (
         <>
@@ -451,11 +457,14 @@ function NodeSettingsPanel({ settings, save }: { settings: Settings; save: (s: S
           <Field label="Fee outpoint" hint="Usually your bond carrier's change (txid:1). Empty = panel runs receipts-only.">
             <input className="input mt-1" placeholder="<txid>:1" value={draft.fee_outpoint ?? ''} onChange={(e) => set('fee_outpoint', text(e.target.value))} />
           </Field>
-          <Field label="Class id" hint="Empty mines the floor (BASE-0, no artifact). Paste a model class id to mine that class.">
-            <input className="input mt-1 mono" placeholder="(floor)" value={draft.producer_class ?? ''} onChange={(e) => set('producer_class', text(e.target.value))} />
+          <Field label="Class id" hint="Usually empty: the artifact below is what selects the class, and the node derives the id from it. Paste one only to pin a class explicitly.">
+            <input className="input mt-1 mono" placeholder="(from the artifact)" value={draft.producer_class ?? ''} onChange={(e) => set('producer_class', text(e.target.value))} />
           </Field>
-          <Field label="Class artifact" hint="Path to the class artifact file, for a model class.">
-            <input className="input mt-1" placeholder="/models/qwen36.palwq36" value={draft.class_artifact ?? ''} onChange={(e) => set('class_artifact', text(e.target.value))} />
+          <Field
+            label="Class artifact"
+            hint="Empty uses the default class artifact when it is in the models directory, and mines the floor when it is not. Set a path to mine a different class."
+          >
+            <input className="input mt-1" placeholder="(default class, or the floor)" value={draft.class_artifact ?? ''} onChange={(e) => set('class_artifact', text(e.target.value))} />
           </Field>
         </>
       )}

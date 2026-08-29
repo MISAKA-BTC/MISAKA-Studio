@@ -143,11 +143,30 @@ struct StartBody {
 }
 
 async fn start_node(State(state): State<Arc<AppState>>, body: Option<Json<StartBody>>) -> Result<Json<NodeView>> {
-    let mut node_settings = state.settings.read().await.node.clone();
+    let settings = state.settings.read().await.clone();
+    let mut node_settings = settings.node.clone();
     if let Some(Json(StartBody { role: Some(role) })) = body {
         node_settings.role = role;
     }
+    if node_settings.class_artifact.is_none() {
+        node_settings.class_artifact = default_class_artifact(&settings.models_dir).await;
+    }
     Ok(Json(state.node.start(&node_settings).await?))
+}
+
+/// The default class's artifact, when this machine holds it.
+///
+/// Resolved at launch instead of being written into the settings file on first run, because it is
+/// a path *under the models directory*: pinning it once would keep naming the old directory the
+/// moment someone moves their models, and the node would then refuse to produce over a file that
+/// is sitting right where it should be. Left `None` when the file is absent or the wrong size, so
+/// an empty setting still means "mine the floor" rather than "fail to start".
+async fn default_class_artifact(models_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let spec = misaka_studio_core::palw::default_class();
+    let PalwArtifactSource::Download { filename, size_bytes, .. } = &spec.artifact else { return None };
+    let path = models_dir.join(filename);
+    let meta = tokio::fs::metadata(&path).await.ok()?;
+    (meta.len() == *size_bytes).then_some(path)
 }
 
 async fn stop_node(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>> {

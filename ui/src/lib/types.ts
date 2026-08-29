@@ -226,6 +226,7 @@ export type Settings = {
     class_artifact: string | null
     appdir: string | null
     extra_args: string[]
+    install_default_class_artifact: boolean
   }
   huggingface: { endpoint: string; token: string | null; max_concurrent_downloads: number }
   ui: { theme: 'system' | 'light' | 'dark'; show_provenance: boolean; show_performance: boolean }

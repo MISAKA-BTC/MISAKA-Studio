@@ -163,6 +163,24 @@ pub const TESTNET11_CLASSES: &[PalwClassSpec] = &[
     },
 ];
 
+/// The class the Studio installs on first run and produces in when none is chosen.
+///
+/// **Not the chain's default.** That is the floor: no file, no download, and what a node mines
+/// when no class is named. This is the Studio's answer to a different question — of the classes
+/// that actually run a model, which one can a machine that just downloaded this app be expected
+/// to hold and install? QWEN36 is 34 GiB. The floor runs no model at all. That leaves one, at
+/// 1.7 GiB and a single verified download, and shipping the floor by default would mean an app
+/// whose headline is verified inference that never loads a model.
+pub const DEFAULT_CLASS: &str = "PALW-QWEN25-A16";
+
+/// The spec [`DEFAULT_CLASS`] names.
+///
+/// Panics if the registry no longer carries that name, which is a build that should not have
+/// linked rather than a condition to handle at runtime; the test below is what holds it.
+pub fn default_class() -> &'static PalwClassSpec {
+    TESTNET11_CLASSES.iter().find(|class| class.name == DEFAULT_CLASS).expect("DEFAULT_CLASS names a registered class")
+}
+
 /// Whether this machine holds a class's artifact, and whether it plausibly can run it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -315,6 +333,20 @@ mod tests {
         let statuses = assess_classes(&files, 64 << 30);
         let qwen36 = statuses.iter().find(|s| s.spec.name == "QWEN36").expect("class");
         assert!(matches!(qwen36.readiness, PalwClassReadiness::ArtifactMismatch { expected_bytes: 36_492_831_232, .. }));
+    }
+
+    /// The default is preinstalled on first run, so it has to be a class that *can* be: named in
+    /// the registry, publishing an artifact, and not the floor — which needs no file and would
+    /// make the whole bootstrap a no-op.
+    #[test]
+    fn the_default_class_is_one_that_can_actually_be_preinstalled() {
+        let spec = default_class();
+        assert_eq!(spec.name, DEFAULT_CLASS);
+        assert!(!spec.is_base, "the floor needs no artifact; preinstalling it would install nothing");
+        assert!(
+            matches!(spec.artifact, PalwArtifactSource::Download { .. }),
+            "a default with no published artifact cannot be installed without a toolchain"
+        );
     }
 
     #[test]

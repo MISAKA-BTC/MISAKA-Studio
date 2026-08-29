@@ -225,7 +225,11 @@ pub enum NetworkRole {
 }
 
 /// The MISAKA node this Studio watches or supervises.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+///
+/// `Default` is written out rather than derived because one field has to default to *on*, and a
+/// derived `Default` would silently make it `false` — which is the difference between a fresh
+/// install that can mine and one that cannot, decided by a missing line.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NodeSettings {
     /// Path to the `kaspad` binary (the misakas node keeps upstream's binary name). `None` means
@@ -256,6 +260,33 @@ pub struct NodeSettings {
     pub appdir: Option<PathBuf>,
     /// Extra arguments appended verbatim to the node's command line.
     pub extra_args: Vec<String>,
+    /// Fetch the default class's artifact (`palw::DEFAULT_CLASS`) on first run, so a machine that
+    /// just downloaded the Studio can mine a model class without hunting for a file.
+    ///
+    /// On by default. It is a 1.7 GiB verified download that appears in the download list like
+    /// any other and can be cancelled there; turn it off for a metered connection, or for a
+    /// machine that is only ever going to chat.
+    pub install_default_class_artifact: bool,
+}
+
+impl Default for NodeSettings {
+    fn default() -> Self {
+        NodeSettings {
+            kaspad_path: None,
+            rpc_url: None,
+            network: NodeNetwork::default(),
+            role: NetworkRole::default(),
+            mining_address: None,
+            producer_key_path: None,
+            producer_bond: None,
+            fee_outpoint: None,
+            producer_class: None,
+            class_artifact: None,
+            appdir: None,
+            extra_args: Vec::new(),
+            install_default_class_artifact: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

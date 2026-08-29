@@ -161,6 +161,9 @@ async fn main() -> anyhow::Result<()> {
     let cors_origins = settings.server.cors_origins.clone();
     let state = AppState::new(settings, settings_path, data_dir).await;
     tokio::spawn(state.metrics.clone().run());
+    // Before the listener binds, so a first run is already fetching the default class artifact
+    // by the time the window has finished opening.
+    state.spawn_default_class_install();
 
     let models = state.store.list().await.len();
     let app = api::router(state.clone(), ui_dir.clone(), cors_origins);
