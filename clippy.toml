@@ -1,0 +1,4 @@
+# `DownloadManager::start` legitimately takes nine: a download is identified by repository,
+# revision, file, destination, expected digest and expected size, and collapsing them into a
+# struct would only move the same nine names one level down.
+too-many-arguments-threshold = 10

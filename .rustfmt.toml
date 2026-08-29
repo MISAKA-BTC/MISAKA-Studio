@@ -1,0 +1,9 @@
+# The same settings the code was written under, carried over from the MISAKA node's repository so a
+# file moved between the two does not reformat. `max_width = 135` with `use_small_heuristics =
+# "Max"` is what keeps a struct literal or a match arm on one line where it reads better as one.
+max_width = 135
+use_field_init_shorthand = true
+use_try_shorthand = true
+use_small_heuristics = "Max"
+newline_style = "auto"
+edition = "2024"

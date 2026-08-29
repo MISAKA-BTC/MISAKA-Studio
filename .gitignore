@@ -1,0 +1,19 @@
+# Build output.
+/target/
+ui/node_modules/
+ui/dist/
+desktop/src-tauri/gen/
+
+# Settings, models and the inference log live in the user's data directory, not here — but people
+# do point `--models-dir` at a checkout while testing, and a GGUF must never be committed by
+# accident. Same for the sidecars that carry a model's provenance.
+*.gguf
+*.gguf.part
+*.misaka.json
+inference-records.jsonl
+
+# An access token belongs in the settings file the app writes, which is outside the repository.
+.env
+.env.*
+
+.DS_Store

@@ -1,0 +1,55 @@
+# MISAKA Studio.
+#
+# Its own repository, and its own cargo workspace, for the reason it was split out of the node's
+# tree: a desktop app pulls in an HTTP server, a TLS stack, a process supervisor and (for the
+# shell) Tauri's system-webview bindings, none of which a validator's build should have to
+# resolve, lock, or audit. The provenance layer stays in step with the chain by deriving the same
+# hashes, not by sharing a lockfile — see `crates/misaka-studio-core/src/provenance.rs`.
+[workspace]
+resolver = "2"
+members = ["crates/misaka-studio-core", "crates/misaka-studio-runtime", "desktop/src-tauri"]
+
+# The Tauri shell is a member but NOT a default member: it links the platform webview
+# (webkit2gtk on Linux, WebView2 on Windows, WKWebView on macOS), which a headless CI runner
+# and most contributors' containers do not have. Still in the workspace so it shares the
+# lockfile and the lints; out of the default build so a fresh clone can build everything else.
+default-members = ["crates/misaka-studio-core", "crates/misaka-studio-runtime"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+authors = ["MISAKA contributors"]
+license = "ISC"
+repository = "https://github.com/MISAKA-BTC/misaka-studio"
+
+[workspace.dependencies]
+misaka-studio-core = { version = "0.1.0", path = "crates/misaka-studio-core" }
+
+anyhow = "1"
+axum = { version = "0.8", features = ["macros", "ws"] }
+blake2b_simd = "1.0"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+hex = "0.4"
+mime_guess = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sysinfo = "0.31"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "process", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
