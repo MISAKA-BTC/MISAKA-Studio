@@ -13,8 +13,8 @@
 //! The seam that matters is the second one. Everything above it speaks
 //! [`GenerationRequest`](backend::GenerationRequest) and
 //! [`StreamEvent`](backend::StreamEvent); no route, no UI component and no record names an
-//! engine. Replacing llama.cpp with the deterministic runtime the misakas repository already
-//! carries for PALW is then an implementation of one trait, not a rewrite.
+//! engine. Replacing llama.cpp with the deterministic runtime this repository already carries
+//! for PALW is then an implementation of one trait, not a rewrite.
 //!
 //! The other thing this layer does that a thin proxy would not: it records **what ran**. Every
 //! completion produces an [`InferenceRecord`](misaka_studio_core::provenance::InferenceRecord)
@@ -28,6 +28,7 @@ pub mod catalog;
 pub mod download;
 pub mod error;
 pub mod metrics;
+pub mod node;
 pub mod records;
 pub mod state;
 pub mod store;

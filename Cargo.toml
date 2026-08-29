@@ -1,18 +1,22 @@
-# MISAKA Studio.
+# MISAKA Studio — a SEPARATE cargo workspace, deliberately.
 #
-# Its own repository, and its own cargo workspace, for the reason it was split out of the node's
-# tree: a desktop app pulls in an HTTP server, a TLS stack, a process supervisor and (for the
-# shell) Tauri's system-webview bindings, none of which a validator's build should have to
-# resolve, lock, or audit. The provenance layer stays in step with the chain by deriving the same
-# hashes, not by sharing a lockfile — see `crates/misaka-studio-core/src/provenance.rs`.
+# The node's workspace is a consensus artifact: one lockfile, one lint config, and a
+# `cargo check` that has to stay honest for everyone who builds a validator. A desktop app
+# pulls in an HTTP server, a TLS stack, a process supervisor and (for the shell) Tauri's
+# system-webview bindings — none of which a node should have to resolve, lock, or audit.
+#
+# So the Studio keeps its own lockfile and its own dependency graph, and the root workspace
+# lists `misaka-studio` under `exclude`. `cargo build` at the repository root is unchanged;
+# `cargo build` inside this directory builds the Studio.
 [workspace]
 resolver = "2"
 members = ["crates/misaka-studio-core", "crates/misaka-studio-runtime", "desktop/src-tauri"]
 
 # The Tauri shell is a member but NOT a default member: it links the platform webview
 # (webkit2gtk on Linux, WebView2 on Windows, WKWebView on macOS), which a headless CI runner
-# and most contributors' containers do not have. Still in the workspace so it shares the
-# lockfile and the lints; out of the default build so a fresh clone can build everything else.
+# and most contributors' containers do not have. Same rule the node applies to
+# `misaka-palw-worker`: still in the workspace so it shares the lockfile and the lints, out of
+# the default build so a fresh clone can build everything else.
 default-members = ["crates/misaka-studio-core", "crates/misaka-studio-runtime"]
 
 [workspace.package]
@@ -21,7 +25,7 @@ edition = "2024"
 rust-version = "1.88.0"
 authors = ["MISAKA contributors"]
 license = "ISC"
-repository = "https://github.com/MISAKA-BTC/misaka-studio"
+repository = "https://github.com/MISAKA-BTC/misakas"
 
 [workspace.dependencies]
 misaka-studio-core = { version = "0.1.0", path = "crates/misaka-studio-core" }
@@ -43,6 +47,8 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "process", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["io"] }
+# Plain ws:// to a loopback node; no TLS feature on purpose.
+tokio-tungstenite = "0.23"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
