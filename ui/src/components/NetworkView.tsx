@@ -13,6 +13,7 @@
 //   Studio afterwards.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { PromptMiningPanel } from './PromptMiningPanel'
 import { api } from '../lib/api'
 import { bytes, count, shortHash } from '../lib/format'
 import type { MiningState, NetworkOverview, NodeClassRow, PalwClassStatus, PoolStatus, Settings } from '../lib/types'
@@ -153,6 +154,8 @@ export function NetworkView() {
 
         <div className="space-y-4">
           <PoolPanel />
+
+          <PromptMiningPanel />
           <RolesPanel role={overview.role} supervised={supervised} />
           {settings && <NodeSettingsPanel settings={settings} save={saveSettings} />}
           {node.command_line && (

@@ -30,6 +30,7 @@ pub mod management;
 pub mod network;
 pub mod openai;
 pub mod pool;
+pub mod prompt_mining;
 
 /// Build the whole application router.
 pub fn router(state: Arc<AppState>, ui_dir: Option<PathBuf>, cors_origins: Vec<String>) -> axum::Router {

@@ -9,6 +9,8 @@ import type {
   BackendInfo,
   NetworkOverview,
   PoolStatus,
+  PromptMiningRun,
+  PromptMiningStatus,
   NodeView,
   PalwClassStatus,
   CatalogEntry,
@@ -104,6 +106,12 @@ export const api = {
     request<Record<string, unknown>>('/api/v1/network/pool/join', { method: 'POST', body: JSON.stringify({ url: url ?? null }) }),
   poolLeave: () => request<Record<string, unknown>>('/api/v1/network/pool/leave', { method: 'POST' }),
   poolFaucet: () => request<Record<string, unknown>>('/api/v1/network/pool/faucet', { method: 'POST' }),
+  promptMining: () => request<PromptMiningStatus>('/api/v1/network/prompt-mining'),
+  promptMiningRun: (prompt: string, maxTokens?: number) =>
+    request<PromptMiningRun>('/api/v1/network/prompt-mining/run', {
+      method: 'POST',
+      body: JSON.stringify({ prompt, max_tokens: maxTokens ?? null }),
+    }),
   networkClasses: () => request<PalwClassStatus[]>('/api/v1/network/classes'),
   downloadClassArtifact: (name: string) =>
     request<DownloadProgress>(`/api/v1/network/classes/${encodeURIComponent(name)}/download`, { method: 'POST' }),

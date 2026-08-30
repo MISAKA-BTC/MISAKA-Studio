@@ -390,3 +390,44 @@ export type PoolStatus =
       blocks_won: number
       activity: string[]
     }
+
+/** The gateway's own account of itself: the runtime it runs and the identity it answers for. */
+export type GatewayHealth = {
+  runtime_manifest_hash: string
+  template_id: string
+  class_id: string | null
+  bond: string | null
+  operator_id: string | null
+}
+
+/**
+ * Three answers, not two. `unknown` is what a catalog of documented prefixes can honestly say
+ * about an id it does not hold in full — a prefix that fails to match rules nothing out.
+ */
+export type ClassMatch =
+  | { state: 'registered'; name: string }
+  | { state: 'not_registered' }
+  | { state: 'unknown'; complete_ids: number; total_classes: number }
+
+export type PromptMiningStatus = {
+  gateway_url: string
+  unreachable: string | null
+  health: GatewayHealth | null
+  class: ClassMatch | null
+}
+
+/** How far a commitment got. Today there is one value, and its name is the whole truth. */
+export type ChainReach = 'committed_not_submitted'
+
+export type PromptMiningRun = {
+  answer: string
+  cu: string
+  fp_job_id: string
+  trace_root: string
+  output_root: string
+  schedule_root: string
+  artifact: string
+  prompt_tokens: number | null
+  completion_tokens: number | null
+  chain: ChainReach
+}

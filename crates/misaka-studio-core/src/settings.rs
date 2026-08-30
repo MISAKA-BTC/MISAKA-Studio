@@ -274,6 +274,11 @@ pub struct NodeSettings {
     pub pool_slot_id: Option<String>,
     /// The bearer that lets this Studio read its slot's status. Not a wallet key.
     pub pool_slot_token: Option<String>,
+    /// Base URL of a free-prompt gateway (`misaka-palw-gateway`), the endpoint that turns one
+    /// prompt into one inference carrying its own commitment (ADR-0044). `None` uses the local
+    /// default; a pool-hosted gateway is the same field with someone else's host in it, which is
+    /// what "mine with a prompt and no node here" means.
+    pub palw_gateway_url: Option<String>,
 }
 
 impl Default for NodeSettings {
@@ -295,6 +300,7 @@ impl Default for NodeSettings {
             pool_url: None,
             pool_slot_id: None,
             pool_slot_token: None,
+            palw_gateway_url: None,
         }
     }
 }
