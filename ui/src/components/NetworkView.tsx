@@ -427,8 +427,10 @@ function PoolPanel() {
       <section className="card p-4">
         <h3 className="text-sm font-semibold">Mine via pool — no node needed</h3>
         <p className="mt-1 text-xs leading-relaxed text-ink-500 dark:text-ink-400">
-          The pool runs a real producer for you on its own machine. Joining creates your slot; sending it{' '}
-          <strong>10 MSK</strong> is the entire setup — the slot registers its bond by itself and mines the floor class.
+          The pool runs a real producer for you on its own machine. Joining creates your slot; funding it with{' '}
+          <strong>10 MSK</strong> is the entire setup — the slot registers its bond by itself and mines the floor class. The{' '}
+          <strong>misakascan faucet</strong> hands out exactly enough (12 MSK, once per address), and there is a button for it
+          after you join.
         </p>
         <p className="mt-2 text-[0.7rem] leading-relaxed text-amber-800 dark:text-amber-300">
           The trade, stated plainly: the slot&apos;s producer seed is generated on the pool host and stays there — that is what
@@ -491,10 +493,33 @@ function PoolPanel() {
           </div>
         </div>
         {pool.phase === 'awaiting_funds' && (
-          <p className="rounded-lg bg-amber-50 p-2 text-[0.7rem] text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
-            Send at least {msk(pool.min_funding_sompi)} to the slot address, as a normal transfer (not mining rewards). The slot
-            registers the bond by itself — nothing else to press.
-          </p>
+          <div className="rounded-lg bg-amber-50 p-2 dark:bg-amber-950/40">
+            <p className="text-[0.7rem] text-amber-800 dark:text-amber-300">
+              Send at least {msk(pool.min_funding_sompi)} to the slot address, as a normal transfer (not mining rewards). The
+              easiest source is the <strong>misakascan faucet</strong> — one grant per address, sized to cover the bond. The
+              slot registers the bond by itself once the funds confirm.
+            </p>
+            <button
+              type="button"
+              className="btn-outline mt-2"
+              disabled={busy}
+              onClick={async () => {
+                setBusy(true)
+                try {
+                  await api.poolFaucet()
+                  toast('success', 'Faucet grant requested — the slot registers its bond once it confirms')
+                  await refresh()
+                } catch (e) {
+                  toast('error', (e as Error).message)
+                } finally {
+                  setBusy(false)
+                }
+              }}
+            >
+              {busy ? <Spinner className="size-3.5" /> : <Icon name="download" className="size-3.5" />}
+              Request 12 MSK from the faucet
+            </button>
+          </div>
         )}
         {pool.bond_outpoint && (
           <div>

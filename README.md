@@ -141,7 +141,9 @@ that makes the block.**
 * **Mine via pool — no node at all.** The Network tab can join a hosted producer slot
   (`contrib/minerpool/`, deployed at `misakascan.com/pool`): joining creates a real
   `kaspad --palw-produce` on the pool host, and funding the slot's address with 10 MSK is the
-  entire remaining setup — the slot registers its own bond and mines the floor class. The trade
+  entire remaining setup — the slot registers its own bond and mines the floor class. Testnet
+  MSK comes from the **misakascan faucet** (`misakascan.com/faucet`): one 12 MSK grant per
+  address, sized to cover exactly one bond, requestable from the panel with a button. The trade
   is stated in the panel, not buried: the slot's seed lives on the pool host (that is what "no
   node" means), and a copy is written to this machine so the rewards stay recoverable without
   the pool's cooperation.

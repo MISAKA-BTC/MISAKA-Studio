@@ -46,7 +46,10 @@ kept beside it — a status we maintained separately would drift into flattery.
 
 ## Two numbers that are not obvious
 
-* **Minimum funding is 10 MSK**, not the chain's 400,000-sompi collateral floor. A UTXO's
+* **Minimum funding is 10 MSK**, not the chain's 400,000-sompi collateral floor — and the
+  misakascan faucet's grant is set to 12 MSK *because* of this: a faucet that hands out less
+  than one bond's worth would make "get funds from the faucet" a lie. One grant per address,
+  one per source per day (`misaka-faucet.service` on the fleet, `FAUCET_GRANT=12`). A UTXO's
   KIP-0009 storage mass grows as the output shrinks, so the smallest *carryable* collateral
   is ~8.34M sompi — the node raises its default to fit and the funding has to cover it.
 * **Txids are 128 hex characters** on this chain (PQ hashes). The first version of

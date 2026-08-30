@@ -28,7 +28,7 @@ use std::time::Duration;
 const DEFAULT_POOL_URL: &str = "https://misakascan.com/pool";
 
 pub fn router() -> Router<Arc<AppState>> {
-    Router::new().route("/", get(status)).route("/join", post(join)).route("/leave", post(leave))
+    Router::new().route("/", get(status)).route("/join", post(join)).route("/leave", post(leave)).route("/faucet", post(faucet))
 }
 
 fn http() -> reqwest::Client {
@@ -158,4 +158,48 @@ async fn leave(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Va
         "left": slot,
         "note": "the slot itself keeps running on the pool host, and the seed file was kept — only this Studio forgot it"
     })))
+}
+
+/// Ask the faucet at the pool's own origin to fund the slot.
+///
+/// The misakascan deployment serves both from one host — `…/pool` and `…/faucet` — and its
+/// faucet's grant (12 MSK) is sized to cover exactly one bond: the KIP-0009 relay floor puts
+/// the smallest carryable collateral near 8.34M sompi, so a smaller grant would leave a slot
+/// that can never register and a "get funds from the faucet" line that is a lie. The faucet's
+/// own rules pass through untouched — one grant per address ever, one per source per day —
+/// because restating limits we do not enforce is how docs drift from behaviour.
+async fn faucet(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>> {
+    let node = state.settings.read().await.node.clone();
+    let (Some(url), Some(slot_id), Some(token)) = (&node.pool_url, &node.pool_slot_id, &node.pool_slot_token) else {
+        return Err(Error::bad_request("no pool slot to fund — join the pool first"));
+    };
+
+    // The slot's address is the pool's fact, not a stored copy that could go stale.
+    let status = pool_get(&format!("{url}/v1/slots/{slot_id}"), Some(token)).await?;
+    let address =
+        status.get("address").and_then(|v| v.as_str()).ok_or_else(|| Error::bad_request("the pool's status names no slot address"))?;
+
+    // `https://host/pool` → `https://host` — the faucet is the pool origin's sibling.
+    let origin = {
+        let after_scheme = url.find("://").map(|i| i + 3).unwrap_or(0);
+        match url[after_scheme..].find('/') {
+            Some(slash) => &url[..after_scheme + slash],
+            None => url.as_str(),
+        }
+    };
+
+    let response = http()
+        .post(format!("{origin}/faucet/v1/claim"))
+        .json(&serde_json::json!({ "address": address }))
+        .send()
+        .await
+        .map_err(|e| Error::bad_request(format!("the faucet did not answer: {origin}: {e}")))?;
+    let status_code = response.status();
+    let body: serde_json::Value =
+        response.json().await.map_err(|e| Error::bad_request(format!("the faucet's answer was not JSON: {e}")))?;
+    if !status_code.is_success() {
+        let msg = body.get("error").and_then(|e| e.as_str()).unwrap_or("unexplained");
+        return Err(Error::bad_request(format!("the faucet refused ({status_code}): {msg}")));
+    }
+    Ok(Json(body))
 }

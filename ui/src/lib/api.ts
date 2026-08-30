@@ -103,6 +103,7 @@ export const api = {
   poolJoin: (url?: string | null) =>
     request<Record<string, unknown>>('/api/v1/network/pool/join', { method: 'POST', body: JSON.stringify({ url: url ?? null }) }),
   poolLeave: () => request<Record<string, unknown>>('/api/v1/network/pool/leave', { method: 'POST' }),
+  poolFaucet: () => request<Record<string, unknown>>('/api/v1/network/pool/faucet', { method: 'POST' }),
   networkClasses: () => request<PalwClassStatus[]>('/api/v1/network/classes'),
   downloadClassArtifact: (name: string) =>
     request<DownloadProgress>(`/api/v1/network/classes/${encodeURIComponent(name)}/download`, { method: 'POST' }),
