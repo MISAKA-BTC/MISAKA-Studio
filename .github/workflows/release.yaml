@@ -95,6 +95,17 @@ jobs:
       - name: Install the Tauri CLI
         run: cargo install tauri-cli --version '^2' --locked
 
+      # Invoked from `desktop/src-tauri` because that is where the config lives — but note that the
+      # config's two kinds of path do NOT share a base, which is what broke the first release run
+      # on all three platforms at once:
+      #
+      #   frontendDist        is relative to the config file      -> desktop/src-tauri/../../ui/dist
+      #   beforeBuildCommand  runs in the app dir (desktop/)      -> desktop/../ui
+      #
+      # Written as `../../ui`, the before-command resolved to a `ui/` one level ABOVE the checkout
+      # (`/Users/runner/work/MISAKA-Studio/ui`) and died on a package.json that was never there.
+      # Moving the invocation around cannot fix that; tauri picks the app dir itself. The fix is in
+      # the config, and this step stays where the CLI expects to be run.
       - name: Bundle
         working-directory: desktop/src-tauri
         run: cargo tauri build --bundles ${{ matrix.bundles }}
