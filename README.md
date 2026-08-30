@@ -138,6 +138,13 @@ that makes the block.**
   LFS's free tier is smaller than this single artifact. It appears in the download list like any
   other and can be cancelled there; **Network → Install the default class artifact on first run**
   turns it off for a metered connection, or for a machine that will only ever chat.
+* **Mine via pool — no node at all.** The Network tab can join a hosted producer slot
+  (`contrib/minerpool/`, deployed at `misakascan.com/pool`): joining creates a real
+  `kaspad --palw-produce` on the pool host, and funding the slot's address with 10 MSK is the
+  entire remaining setup — the slot registers its own bond and mines the floor class. The trade
+  is stated in the panel, not buried: the slot's seed lives on the pool host (that is what "no
+  node" means), and a copy is written to this machine so the rewards stay recoverable without
+  the pool's cooperation.
 * **Observer** — point the tab at any reachable node RPC and read the chain.
 * **Verifier** — run a full node; on this chain syncing *is* verifying, no bond required. With a
   bonded key the same node takes panel duty and files receipts on producers' claims.

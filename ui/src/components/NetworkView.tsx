@@ -15,7 +15,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../lib/api'
 import { bytes, count, shortHash } from '../lib/format'
-import type { NetworkOverview, NodeClassRow, PalwClassStatus, Settings } from '../lib/types'
+import type { NetworkOverview, NodeClassRow, PalwClassStatus, PoolStatus, Settings } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { CopyButton, EmptyState, Field, Icon, Section, Spinner, Toggle } from './common'
 
@@ -137,6 +137,7 @@ export function NetworkView() {
         </div>
 
         <div className="space-y-4">
+          <PoolPanel />
           <RolesPanel role={overview.role} supervised={supervised} />
           {settings && <NodeSettingsPanel settings={settings} save={saveSettings} />}
           {node.command_line && (
@@ -345,6 +346,179 @@ function ClassCard({
         )}
       </div>
     </div>
+  )
+}
+
+/** Sompi, in the unit people talk in. */
+function msk(sompi: number | null | undefined): string {
+  return sompi === null || sompi === undefined ? '—' : `${(sompi / 1e8).toLocaleString(undefined, { maximumFractionDigits: 2 })} MSK`
+}
+
+/**
+ * Mining through the hosted pool — the rung below Observer: no node here at all.
+ *
+ * The panel's whole job is honesty about a convenient thing. A pool slot is a real producer on
+ * the pool's machine, holding a seed this Studio also keeps a copy of; the user's only act is
+ * funding the slot address, which IS the bond. So the panel shows the pool's own status verbatim
+ * — funding address, phase, bond, blocks — and states the custody trade in one line instead of
+ * a terms-of-service nobody reads.
+ */
+function PoolPanel() {
+  const [pool, setPool] = useState<PoolStatus | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [url, setUrl] = useState('')
+  const toast = useStudio((s) => s.toast)
+
+  const refresh = useCallback(async () => {
+    try {
+      setPool(await api.pool())
+      setError(null)
+    } catch (e) {
+      setError((e as Error).message)
+    }
+  }, [])
+
+  // Slower than the node poll on purpose: every status read makes the pool host do real work
+  // (systemd + a wallet RPC), and a joined slot changes phase on the scale of blocks, not frames.
+  useEffect(() => {
+    void refresh()
+    const timer = setInterval(() => void refresh(), 10_000)
+    return () => clearInterval(timer)
+  }, [refresh])
+
+  const join = async () => {
+    setBusy(true)
+    try {
+      await api.poolJoin(url.trim() === '' ? null : url.trim())
+      toast('success', 'Joined the pool — fund the slot address and it mines by itself')
+      await refresh()
+    } catch (e) {
+      toast('error', (e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const leave = async () => {
+    setBusy(true)
+    try {
+      await api.poolLeave()
+      toast('info', 'Left the pool slot (it keeps running; the seed file was kept)')
+      await refresh()
+    } catch (e) {
+      toast('error', (e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (!pool) {
+    return (
+      <section className="card p-4">
+        <h3 className="text-sm font-semibold">Mine via pool</h3>
+        <p className="mt-1 text-[0.7rem] text-ink-500 dark:text-ink-400">{error ?? 'Reading the pool state…'}</p>
+      </section>
+    )
+  }
+
+  if (!pool.joined) {
+    return (
+      <section className="card p-4">
+        <h3 className="text-sm font-semibold">Mine via pool — no node needed</h3>
+        <p className="mt-1 text-xs leading-relaxed text-ink-500 dark:text-ink-400">
+          The pool runs a real producer for you on its own machine. Joining creates your slot; sending it{' '}
+          <strong>10 MSK</strong> is the entire setup — the slot registers its bond by itself and mines the floor class.
+        </p>
+        <p className="mt-2 text-[0.7rem] leading-relaxed text-amber-800 dark:text-amber-300">
+          The trade, stated plainly: the slot&apos;s producer seed is generated on the pool host and stays there — that is what
+          &ldquo;no node&rdquo; means. A copy is saved here too, so the rewards are yours to recover without the pool.
+        </p>
+        <input
+          className="input mono mt-3"
+          placeholder={pool.default_url}
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+        />
+        <button type="button" className="btn-primary mt-2 w-full justify-center" disabled={busy} onClick={() => void join()}>
+          {busy ? <Spinner className="size-3.5" /> : <Icon name="globe" className="size-3.5" />}
+          Join the pool
+        </button>
+        {error && <p className="mt-2 text-[0.7rem] text-red-600 dark:text-red-400">{error}</p>}
+      </section>
+    )
+  }
+
+  const phaseBadge =
+    pool.phase === 'producing' ? (
+      <span className="badge bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">producing</span>
+    ) : pool.phase === 'awaiting_funds' ? (
+      <span className="badge bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300">waiting for funds</span>
+    ) : pool.phase === 'holding' ? (
+      <span className="badge bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300">holding</span>
+    ) : pool.phase === 'stopped' ? (
+      <span className="badge bg-red-100 text-red-800 dark:bg-red-950/60 dark:text-red-300">stopped</span>
+    ) : (
+      <span className="badge bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300">{pool.phase}</span>
+    )
+
+  return (
+    <section className="card p-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <h3 className="text-sm font-semibold">Pool slot</h3>
+        <span className="mono text-[0.7rem] text-ink-500 dark:text-ink-400">{pool.slot_id}</span>
+        {phaseBadge}
+      </div>
+
+      <div className="mt-3 space-y-2 text-xs">
+        <div>
+          <div className="text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">Slot address — fund this</div>
+          <div className="mt-0.5 flex items-center gap-1">
+            <span className="mono min-w-0 flex-1 truncate" title={pool.address}>
+              {pool.address}
+            </span>
+            <CopyButton text={pool.address} label="Copy the slot address" />
+          </div>
+        </div>
+        <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+          <div>
+            <div className="text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">Balance</div>
+            <div className="tabular-nums">{msk(pool.balance_sompi)}</div>
+          </div>
+          <div>
+            <div className="text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">Blocks won</div>
+            <div className="tabular-nums">{pool.blocks_won}</div>
+          </div>
+        </div>
+        {pool.phase === 'awaiting_funds' && (
+          <p className="rounded-lg bg-amber-50 p-2 text-[0.7rem] text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
+            Send at least {msk(pool.min_funding_sompi)} to the slot address, as a normal transfer (not mining rewards). The slot
+            registers the bond by itself — nothing else to press.
+          </p>
+        )}
+        {pool.bond_outpoint && (
+          <div>
+            <div className="text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">Bond</div>
+            <div className="mono truncate" title={pool.bond_outpoint}>
+              {shortHash(pool.bond_outpoint, 14, 8)}
+            </div>
+          </div>
+        )}
+        {pool.activity.length > 0 && (
+          <pre className="mono max-h-36 overflow-auto rounded-lg bg-ink-900 p-2 text-[0.62rem] leading-relaxed text-ink-200 dark:bg-black/50">
+            {pool.activity.slice(-8).join('\n')}
+          </pre>
+        )}
+        <p className="text-[0.7rem] leading-relaxed text-ink-500 dark:text-ink-400">
+          The slot&apos;s seed also lives on the pool host — your copy is <span className="mono">{pool.seed_path}</span>. Rewards
+          accrue at the slot address; that seed is what spends them.
+        </p>
+      </div>
+
+      <button type="button" className="btn-ghost mt-3" disabled={busy} onClick={() => void leave()}>
+        Forget this slot
+      </button>
+    </section>
   )
 }
 

@@ -227,6 +227,9 @@ export type Settings = {
     appdir: string | null
     extra_args: string[]
     install_default_class_artifact: boolean
+    pool_url: string | null
+    pool_slot_id: string | null
+    pool_slot_token: string | null
   }
   huggingface: { endpoint: string; token: string | null; max_concurrent_downloads: number }
   ui: { theme: 'system' | 'light' | 'dark'; show_provenance: boolean; show_performance: boolean }
@@ -359,3 +362,22 @@ export type NetworkOverview = {
   kaspad_found: boolean
   kaspad_path: string
 }
+
+// --- the miner pool --------------------------------------------------------
+
+export type PoolStatus =
+  | { joined: false; default_url: string }
+  | {
+      joined: true
+      pool_url: string
+      seed_path: string
+      slot_id: string
+      address: string
+      phase: string
+      bond_outpoint: string | null
+      fee_outpoint: string | null
+      balance_sompi: number | null
+      min_funding_sompi: number
+      blocks_won: number
+      activity: string[]
+    }

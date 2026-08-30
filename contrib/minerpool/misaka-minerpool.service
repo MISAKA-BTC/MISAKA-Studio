@@ -1,0 +1,11 @@
+[Unit]
+Description=MISAKA miner pool API (hosted producer slots)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/misaka-minerpool/pool.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

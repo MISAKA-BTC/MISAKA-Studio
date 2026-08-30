@@ -1,0 +1,161 @@
+//! `/api/v1/network/pool` — mining through a hosted producer, for a machine that runs no node.
+//!
+//! The pool (misakascan.com/pool) rents out producer *slots*: a real `kaspad --palw-produce`
+//! on the pool host, with its own seed and its own bond. Joining creates the slot; funding the
+//! slot's address is the entire remaining ask — the slot registers its bond by itself and mines.
+//!
+//! Two things this module is careful to say out loud, because the convenience hides them:
+//!
+//! * **The slot's seed lives on the pool host.** That is not a leak, it is the deal — "mine
+//!   without a node" means someone else's node holds the key that signs your blocks and owns
+//!   your rewards. The join response carries the seed exactly once; we write it to a 0600 file
+//!   in the data directory so the user is never *only* trusting the pool, and we name that file
+//!   in every status response.
+//! * **This Studio is a client of the pool, not its operator.** Status is whatever the pool's
+//!   own API answers, passed through — inventing a friendlier shape here would let the Studio
+//!   claim things about a remote producer it cannot see.
+
+use crate::state::AppState;
+use crate::{Error, Result};
+use axum::extract::State;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde::Deserialize;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// The operator's public pool. A different one is a `url` away — the API is three routes.
+const DEFAULT_POOL_URL: &str = "https://misakascan.com/pool";
+
+pub fn router() -> Router<Arc<AppState>> {
+    Router::new().route("/", get(status)).route("/join", post(join)).route("/leave", post(leave))
+}
+
+fn http() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
+        .user_agent(concat!("misaka-studio/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .expect("http client builds")
+}
+
+fn seed_path(state: &AppState, slot_id: &str) -> std::path::PathBuf {
+    state.data_dir.join(format!("pool-{slot_id}.seed"))
+}
+
+async fn pool_get(url: &str, token: Option<&str>) -> Result<serde_json::Value> {
+    let mut request = http().get(url);
+    if let Some(token) = token {
+        request = request.header("x-pool-token", token);
+    }
+    let response = request.send().await.map_err(|e| Error::bad_request(format!("the pool did not answer: {url}: {e}")))?;
+    let status = response.status();
+    let body: serde_json::Value =
+        response.json().await.map_err(|e| Error::bad_request(format!("the pool's answer was not JSON: {url}: {e}")))?;
+    if !status.is_success() {
+        let msg = body.get("error").and_then(|e| e.as_str()).unwrap_or("unexplained");
+        return Err(Error::bad_request(format!("the pool refused ({status}): {msg}")));
+    }
+    Ok(body)
+}
+
+/// What the Network tab renders: not joined (with the default URL to offer), or the slot's
+/// live status as the pool tells it.
+async fn status(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>> {
+    let node = state.settings.read().await.node.clone();
+    let (Some(url), Some(slot_id), Some(token)) = (&node.pool_url, &node.pool_slot_id, &node.pool_slot_token) else {
+        return Ok(Json(serde_json::json!({ "joined": false, "default_url": DEFAULT_POOL_URL })));
+    };
+    let mut body = pool_get(&format!("{url}/v1/slots/{slot_id}"), Some(token)).await?;
+    if let Some(map) = body.as_object_mut() {
+        map.insert("joined".into(), true.into());
+        map.insert("pool_url".into(), url.clone().into());
+        map.insert("seed_path".into(), seed_path(&state, slot_id).display().to_string().into());
+    }
+    Ok(Json(body))
+}
+
+#[derive(Deserialize)]
+struct JoinBody {
+    #[serde(default)]
+    url: Option<String>,
+}
+
+async fn join(State(state): State<Arc<AppState>>, body: Option<Json<JoinBody>>) -> Result<Json<serde_json::Value>> {
+    let settings = state.settings.read().await.clone();
+    if settings.node.pool_slot_id.is_some() {
+        return Err(Error::bad_request("already joined a pool slot — leave it first if you want a fresh one"));
+    }
+    let url = body.and_then(|Json(b)| b.url).or(settings.node.pool_url.clone()).unwrap_or_else(|| DEFAULT_POOL_URL.to_string());
+    let url = url.trim_end_matches('/').to_string();
+    if !(url.starts_with("https://") || url.starts_with("http://127.0.0.1") || url.starts_with("http://localhost")) {
+        // A slot seed travels back over this connection once. Plaintext across a network is not
+        // a place a key may transit, so anything unencrypted must be loopback.
+        return Err(Error::bad_request("a pool URL must be https:// (or loopback http:// for development)"));
+    }
+
+    let response = http()
+        .post(format!("{url}/v1/slots"))
+        .send()
+        .await
+        .map_err(|e| Error::bad_request(format!("the pool did not answer: {url}: {e}")))?;
+    let status = response.status();
+    let mut body: serde_json::Value =
+        response.json().await.map_err(|e| Error::bad_request(format!("the pool's answer was not JSON: {e}")))?;
+    if !status.is_success() {
+        let msg = body.get("error").and_then(|e| e.as_str()).unwrap_or("unexplained");
+        return Err(Error::bad_request(format!("the pool refused the join ({status}): {msg}")));
+    }
+
+    let slot_id = body
+        .get("slot_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::bad_request("the pool's join answer names no slot_id"))?
+        .to_string();
+    let token = body
+        .get("token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::bad_request("the pool's join answer carries no token"))?
+        .to_string();
+
+    // The seed's one transit ends here: into a 0600 file beside the settings, and out of the
+    // response the UI sees. The pool holds its copy either way; ours is what makes the rewards
+    // recoverable without the pool's cooperation.
+    if let Some(seed) = body.get("seed_hex").and_then(|v| v.as_str()) {
+        let path = seed_path(&state, &slot_id);
+        std::fs::write(&path, format!("{seed}\n")).map_err(|e| Error::io(path.display(), e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        body.as_object_mut().map(|m| m.remove("seed_hex"));
+        body.as_object_mut().map(|m| m.insert("seed_path".into(), path.display().to_string().into()));
+    }
+
+    let mut new = settings.clone();
+    new.node.pool_url = Some(url);
+    new.node.pool_slot_id = Some(slot_id);
+    new.node.pool_slot_token = Some(token);
+    state.apply_settings(new).await?;
+
+    Ok(Json(body))
+}
+
+/// Forget the slot. The pool keeps running it (its bond and claims are on-chain facts a client
+/// cannot retract), and the seed file stays — deleting key material is not something an HTTP
+/// endpoint gets to decide.
+async fn leave(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>> {
+    let settings = state.settings.read().await.clone();
+    let slot = settings.node.pool_slot_id.clone();
+    let mut new = settings;
+    new.node.pool_url = None;
+    new.node.pool_slot_id = None;
+    new.node.pool_slot_token = None;
+    state.apply_settings(new).await?;
+    Ok(Json(serde_json::json!({
+        "left": slot,
+        "note": "the slot itself keeps running on the pool host, and the seed file was kept — only this Studio forgot it"
+    })))
+}

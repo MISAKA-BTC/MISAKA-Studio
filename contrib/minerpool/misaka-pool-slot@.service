@@ -1,0 +1,16 @@
+[Unit]
+Description=MISAKA pool slot %i — hosted testnet-11 producer
+After=network.target
+
+[Service]
+ExecStart=/opt/misaka-minerpool/run-slot.sh /var/lib/misaka-minerpool/slots/slot-%i
+Restart=always
+RestartSec=20
+# kaspad installs a SIGINT handler only; TERM would drop RocksDB on the floor.
+KillSignal=SIGINT
+TimeoutStopSec=45
+# One leaking node must not take the host (node0 on ibm leaks ~0.22 GB/h; same code).
+MemoryMax=6G
+
+[Install]
+WantedBy=multi-user.target

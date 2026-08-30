@@ -8,6 +8,7 @@
 import type {
   BackendInfo,
   NetworkOverview,
+  PoolStatus,
   NodeView,
   PalwClassStatus,
   CatalogEntry,
@@ -98,6 +99,10 @@ export const api = {
   saveSettings: (settings: Settings) => request<Settings>('/api/v1/settings', { method: 'PUT', body: JSON.stringify(settings) }),
 
   network: () => request<NetworkOverview>('/api/v1/network'),
+  pool: () => request<PoolStatus>('/api/v1/network/pool'),
+  poolJoin: (url?: string | null) =>
+    request<Record<string, unknown>>('/api/v1/network/pool/join', { method: 'POST', body: JSON.stringify({ url: url ?? null }) }),
+  poolLeave: () => request<Record<string, unknown>>('/api/v1/network/pool/leave', { method: 'POST' }),
   networkClasses: () => request<PalwClassStatus[]>('/api/v1/network/classes'),
   downloadClassArtifact: (name: string) =>
     request<DownloadProgress>(`/api/v1/network/classes/${encodeURIComponent(name)}/download`, { method: 'POST' }),

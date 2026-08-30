@@ -267,6 +267,13 @@ pub struct NodeSettings {
     /// any other and can be cancelled there; turn it off for a metered connection, or for a
     /// machine that is only ever going to chat.
     pub install_default_class_artifact: bool,
+    /// Base URL of a miner pool (`…/pool`), for mining without running a node here. The pool
+    /// hosts the producer; joining it needs nothing but funding the slot it hands back.
+    pub pool_url: Option<String>,
+    /// The slot this Studio joined, if any — the pool's identifier for "your producer".
+    pub pool_slot_id: Option<String>,
+    /// The bearer that lets this Studio read its slot's status. Not a wallet key.
+    pub pool_slot_token: Option<String>,
 }
 
 impl Default for NodeSettings {
@@ -285,6 +292,9 @@ impl Default for NodeSettings {
             appdir: None,
             extra_args: Vec::new(),
             install_default_class_artifact: true,
+            pool_url: None,
+            pool_slot_id: None,
+            pool_slot_token: None,
         }
     }
 }

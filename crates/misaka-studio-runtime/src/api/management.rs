@@ -50,6 +50,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/settings", get(get_settings).route_layer(axum::middleware::from_fn(pass)).put(put_settings))
         .route("/settings/reset", post(reset_settings))
         .nest("/network", crate::api::network::router())
+        .nest("/network/pool", crate::api::pool::router())
         .route("/records", get(list_records))
         .route("/records/{id}", get(get_record))
 }
