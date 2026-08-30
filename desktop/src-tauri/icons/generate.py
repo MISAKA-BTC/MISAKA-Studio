@@ -7,8 +7,19 @@ what is in the PNGs without decoding them. Run from this directory:
 
     python3 generate.py
 
-It writes 32x32.png, 128x128.png, 128x128@2x.png and icon.png (1024, the source for
-`npm run tauri icon`, which produces the .ico and .icns that Windows and macOS bundles need).
+It writes 32x32.png, 128x128.png, 128x128@2x.png and icon.png (1024).
+
+`icon.ico` sits beside them and is NOT written by this script. Windows needs it and only Windows
+does: tauri-build looks for an `.ico` in `bundle.icon`, falls back to `icons/icon.ico`, and fails
+the build outright when neither exists — so its absence is invisible on macOS and Linux and stops
+the Windows installer every time. That is exactly how it was found. This docstring used to name
+`npm run tauri icon` as the step that produces it; there is no such npm script in this repository,
+the step was never run, and the .ico was never committed. Regenerate it from icon.png with:
+
+    cargo tauri icon icons/icon.png -o /tmp/icons   # then copy /tmp/icons/icon.ico back here
+
+It is written elsewhere and only the .ico is taken, because the CLI also rewrites the PNGs above
+and emits Store, Android and iOS sets this project does not bundle.
 
 No third-party imaging library: a rounded square and three strokes is a hundred lines of
 arithmetic, and the alternative is a build-time dependency on Pillow for an asset that changes
