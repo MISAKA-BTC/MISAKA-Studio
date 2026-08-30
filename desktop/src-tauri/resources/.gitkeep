@@ -1,0 +1,8 @@
+The release workflow copies `misaka-studiod` (or `.exe`) here before `cargo tauri build`, and the
+bundle's `resources: ["resources/*"]` carries it into the installer — which is what lets an
+installed app run with no Rust, no Node and no PATH entry on the user's machine.
+
+This file exists so the directory does, because a resource glob that matches nothing is behaviour
+this repository cannot test on the platform that matters: the Windows bundle is only ever built by
+CI. Keeping the directory present means the glob always has this file to match, so the local
+`cargo tauri build` path does not depend on an assumption nobody here can check.

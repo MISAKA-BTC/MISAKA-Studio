@@ -1,0 +1,146 @@
+name: Release
+
+# Builds the thing a non-developer can actually run.
+#
+# The README's quick start asks for Rust, Node, Git and a C++ toolchain, then fifteen minutes of
+# compiling — which is the right instruction for someone working ON the Studio and the wrong one
+# for someone who wants to USE it. A Windows user following it hits three "not recognised" errors
+# before the first line of the build. None of that is needed to run a compiled binary, so this
+# compiles it once, here, on the platform it is for.
+#
+# Why a workflow and not a checked-in binary: this repository's own CI is the only Windows machine
+# it has. A release built anywhere else is a claim; one built here is reproducible from a tag, and
+# the toolchain versions are the ones the CI already tests against.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish under (e.g. v0.1.0). Leave empty for a draft with no tag.'
+        required: false
+        type: string
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bundle:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: Windows installer
+            # NSIS is the one that produces a double-clickable .exe; the MSI is for managed
+            # deployments and comes from the same build.
+            bundles: nsis,msi
+          - os: macos-latest
+            label: macOS bundle
+            bundles: dmg
+          - os: ubuntu-latest
+            label: Linux bundle
+            bundles: deb,appimage
+    steps:
+      - name: Fix CRLF
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: actions/setup-node@1e60f620b9541d16bece96c5465dc8ee9832be0b # v4
+        with:
+          node-version: '22'
+
+      - name: Linux webview dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2
+
+      - name: Build the UI
+        run: |
+          npm --prefix ui ci
+          npm --prefix ui run build
+
+      # The shell looks for the runtime beside its own executable (`locate_runtime_binary`), so the
+      # bundle has to carry it. Building it first and copying it into the desktop crate's resources
+      # is what makes the installed app self-contained: no PATH, no second download, no Rust on the
+      # user's machine.
+      - name: Build the runtime
+        run: cargo build --release --bin misaka-studiod
+
+      - name: Stage the runtime as a bundle resource
+        shell: bash
+        run: |
+          mkdir -p desktop/src-tauri/resources
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/release/misaka-studiod.exe desktop/src-tauri/resources/
+          else
+            cp target/release/misaka-studiod desktop/src-tauri/resources/
+          fi
+          ls -l desktop/src-tauri/resources
+
+      - name: Install the Tauri CLI
+        run: cargo install tauri-cli --version '^2' --locked
+
+      - name: Bundle
+        working-directory: desktop/src-tauri
+        run: cargo tauri build --bundles ${{ matrix.bundles }}
+
+      - name: Collect the installers
+        shell: bash
+        run: |
+          mkdir -p dist
+          # Tauri's output layout differs per bundle type; take everything installable and let the
+          # upload list what it found rather than asserting a path that moves between versions.
+          find target/release/bundle -type f \
+            \( -name '*.exe' -o -name '*.msi' -o -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' \) \
+            -exec cp {} dist/ \;
+          ls -l dist
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: misaka-studio-${{ runner.os }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Draft the release
+    needs: bundle
+    if: inputs.tag != '' || startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          path: artifacts
+
+      # A DRAFT, deliberately. These installers are unsigned, so Windows SmartScreen will warn on
+      # first run and macOS Gatekeeper will refuse without an explicit override — facts a release
+      # note has to state before anyone downloads. Publishing is a human step that includes writing
+      # that down.
+      - uses: softprops/action-gh-release@c062e08bd532815e2082a85e87e3ef29c3e6d191 # v2
+        with:
+          draft: true
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: artifacts/**/*
+          body: |
+            Unsigned builds. On first run:
+
+            * **Windows** — SmartScreen shows "Windows protected your PC". Choose *More info* →
+              *Run anyway*.
+            * **macOS** — Gatekeeper refuses the app. Right-click it → *Open*, then confirm.
+
+            Chat needs an inference engine the Studio does not bundle: install llama.cpp so
+            `llama-server` is on PATH. Mining does not need it.

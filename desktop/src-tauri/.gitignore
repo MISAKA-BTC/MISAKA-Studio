@@ -1,0 +1,4 @@
+# The staged runtime binary — built per platform by the release workflow, never committed.
+# The directory itself is kept (see resources/.gitkeep).
+resources/*
+!resources/.gitkeep
