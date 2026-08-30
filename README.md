@@ -57,6 +57,21 @@ model at all:
 ./target/release/misaka-studiod --ui-dir ui/dist --backend mock
 ```
 
+### On Windows
+
+The block above is bash. **Windows PowerShell 5.1 — the one that ships with Windows — has no
+`&&`**, and reports `&& はこのバージョンでは有効なステートメント区切りではありません`
+("&& is not a valid statement separator in this version"). Use `;`, backslashes, and the `.exe`:
+
+```powershell
+cargo build --release
+npm --prefix ui install; npm --prefix ui run build
+.\target\release\misaka-studiod.exe --ui-dir ui\dist
+```
+
+PowerShell 7 (`pwsh`) does support `&&`, so the bash lines work there unchanged apart from the
+path separators. Git Bash and WSL run the bash block as written.
+
 ### The desktop app
 
 ```bash
