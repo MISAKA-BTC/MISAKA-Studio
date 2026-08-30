@@ -161,7 +161,7 @@ impl Catalog {
             .collect();
         // Largest first: within one repository, size tracks quality, and the top of the list is
         // where someone with a big machine should be looking.
-        files.sort_by(|a, b| b.size.cmp(&a.size));
+        files.sort_by_key(|f| std::cmp::Reverse(f.size));
 
         Ok(CatalogRepo {
             id: repo_id.to_string(),
