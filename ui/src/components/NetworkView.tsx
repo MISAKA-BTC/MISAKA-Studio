@@ -74,6 +74,19 @@ export function NetworkView() {
     }
   }
 
+  const resetNode = async () => {
+    setBusy(true)
+    try {
+      await api.resetNode()
+      toast('success', 'Data directory deleted — the node is syncing the current chain')
+      await refresh()
+    } catch (e) {
+      toast('error', (e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const downloadArtifact = async (name: string) => {
     try {
       const progress = await api.downloadClassArtifact(name)
@@ -104,6 +117,7 @@ export function NetworkView() {
             busy={busy}
             onStart={start}
             onStop={stop}
+            onReset={resetNode}
           />
 
           <section className="card p-5">
@@ -165,11 +179,13 @@ function NodePanel({
   busy,
   onStart,
   onStop,
+  onReset,
 }: {
   overview: NetworkOverview
   busy: boolean
   onStart: (role: 'observer' | 'verifier' | 'producer') => void
   onStop: () => void
+  onReset: () => void
 }) {
   const status = overview.node.status
   const supervised = status.source === 'supervised'
@@ -209,6 +225,11 @@ function NodePanel({
         </div>
       </div>
 
+      {/* Before the "no kaspad" hint: this node HAS a binary and it ran — it stopped for a reason
+          it stated, and the reason has a remedy. Leaving it under a connection-refused line was
+          how a re-minted testnet looked like a broken install. */}
+      {overview.node.blocker?.kind === 'stale_chain_data' && <StaleChainPanel said={overview.node.blocker.said} busy={busy} onReset={onReset} />}
+
       {!overview.kaspad_found && !status.reachable && (
         <p className="mt-3 flex gap-2 rounded-lg bg-amber-50 p-2 text-xs text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
           <Icon name="warning" className="mt-0.5 size-4 shrink-0" />
@@ -236,6 +257,41 @@ function NodePanel({
         </p>
       )}
     </section>
+  )
+}
+
+/**
+ * The re-minted-testnet banner.
+ *
+ * Shows the node's own sentence rather than a paraphrase, because the button under it deletes a
+ * chain: the user is answering the question the node asked, and they should see it in the words it
+ * asked it in. The action is separate from Start for the same reason — no field left unset can
+ * reach it by accident.
+ */
+function StaleChainPanel({ said, busy, onReset }: { said: string; busy: boolean; onReset: () => void }) {
+  return (
+    <div className="mt-3 rounded-lg bg-amber-50 p-3 dark:bg-amber-950/40">
+      <div className="flex gap-2">
+        <Icon name="warning" className="mt-0.5 size-4 shrink-0 text-amber-700 dark:text-amber-400" />
+        <div className="min-w-0">
+          <p className="text-xs font-semibold text-amber-900 dark:text-amber-200">
+            This network was re-minted — the data directory holds a different chain
+          </p>
+          <p className="mt-1 text-[0.7rem] leading-relaxed text-amber-800 dark:text-amber-300">
+            The node asked whether to delete it and exited when nothing answered: the Studio starts it with pipes, so a
+            question is an exit. Deleting is safe for a node that only follows the chain — everything goes back on the
+            wire — but it is <strong>not</strong> safe for anything you keep only here.
+          </p>
+          <pre className="mono mt-2 overflow-x-auto rounded bg-amber-100/70 p-2 text-[0.62rem] leading-relaxed text-amber-900 dark:bg-black/30 dark:text-amber-200">
+            {said}
+          </pre>
+          <button type="button" className="btn-danger mt-2" disabled={busy} onClick={onReset}>
+            {busy ? <Spinner className="size-3.5" /> : <Icon name="trash" className="size-3.5" />}
+            Delete the data directory and start
+          </button>
+        </div>
+      </div>
+    </div>
   )
 }
 

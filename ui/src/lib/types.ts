@@ -346,12 +346,15 @@ export type NodeClassRow = {
   budget_blocks: number | null
 }
 
+export type NodeBlocker = { kind: 'stale_chain_data'; said: string }
+
 export type NodeView = {
   status: NodeStatus
   role: 'observer' | 'verifier' | 'producer'
   command_line: string[] | null
   classes_from_node: NodeClassRow[]
   activity: string[]
+  blocker: NodeBlocker | null
 }
 
 export type NetworkOverview = {

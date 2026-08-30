@@ -214,11 +214,22 @@ pub(crate) fn is_activity_line(line: &str) -> bool {
         "[palw-dump]",
         "Consensus params fingerprint",
         "Genesis mismatch",
+        "Genesis not found",
         "accepted block",
         "Accepted block",
     ]
     .iter()
     .any(|needle| line.contains(needle))
+}
+
+/// The node's own words for "this data directory holds a different chain".
+///
+/// Matched on the sentence rather than an exit code, because the exit code is the same `0` the
+/// node uses for every declined prompt — and the sentence is what tells the user which prompt it
+/// was. Both halves are matched: the question alone appears in the runbooks, and the refusal alone
+/// is printed for any declined question.
+pub(crate) fn stale_chain_line(log: &VecDeque<String>) -> Option<String> {
+    log.iter().rev().find(|line| line.contains("Genesis not found in active consensus DB")).cloned()
 }
 
 /// How many log lines the supervisor keeps, and how many activity lines.
@@ -255,6 +266,26 @@ pub struct NodeView {
     pub command_line: Option<Vec<String>>,
     pub classes_from_node: Vec<NodeClassRow>,
     pub activity: Vec<String>,
+    /// Why the node is not running, when it said so before exiting.
+    pub blocker: Option<NodeBlocker>,
+}
+
+/// **A startup the node refused, named rather than left as "connection refused".**
+///
+/// The node asks its questions on a terminal, and the Studio starts it with pipes — so a question
+/// is an exit. The RPC poll that follows reports what a poll can report: nothing answered on the
+/// port. That is true and useless, and it is the message a user gets today for a condition with a
+/// one-click remedy.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NodeBlocker {
+    /// A testnet was re-minted under this data directory. The node will not touch the old chain
+    /// without being told to, and it cannot ask.
+    StaleChainData {
+        /// The line the node printed, verbatim — the remedy is destructive, so the evidence for
+        /// it is shown rather than summarised.
+        said: String,
+    },
 }
 
 impl NodeManager {
@@ -346,6 +377,16 @@ impl NodeManager {
     /// Launch a supervised node. Refuses when one is already running — two nodes sharing an
     /// appdir corrupt its database, and "start" must never be the thing that does that.
     pub async fn start(&self, settings: &NodeSettings) -> Result<NodeView> {
+        self.start_inner(settings, false).await
+    }
+
+    /// Start after deleting a data directory that holds a different chain — the remedy for
+    /// [`NodeBlocker::StaleChainData`], and the only caller that may pass `true`.
+    pub async fn start_accepting_data_loss(&self, settings: &NodeSettings) -> Result<NodeView> {
+        self.start_inner(settings, true).await
+    }
+
+    async fn start_inner(&self, settings: &NodeSettings, accept_data_loss: bool) -> Result<NodeView> {
         {
             let mut guard = self.supervised.write().await;
             if let Some(node) = guard.as_mut() {
@@ -358,7 +399,18 @@ impl NodeManager {
 
         let binary = Self::resolve_kaspad(settings.kaspad_path.as_ref());
         let rpc_port = default_json_rpc_port(settings.network);
-        let args = Self::build_args(settings, rpc_port)?;
+        let mut args = Self::build_args(settings, rpc_port)?;
+        if accept_data_loss {
+            // `--yes` answers every interactive question, and on this path exactly one is
+            // expected: the re-minted testnet's "your database needs to be fully deleted".
+            //
+            // It is a per-launch argument and never a setting. The flag's blast radius is every
+            // question the node might ever ask, so leaving it on would turn future prompts —
+            // ones nobody has read — into silent yeses; and the answer it gives here destroys a
+            // chain. A user pressed a button that said so, for this start, and the command line
+            // the UI shows carries the flag so the choice is visible afterwards.
+            args.push("--yes".into());
+        }
         let rpc_url = format!("ws://127.0.0.1:{rpc_port}");
 
         {
@@ -452,7 +504,15 @@ impl NodeManager {
             let logs = self.logs.lock().expect("log lock");
             (logs.classes.clone(), logs.activity.iter().cloned().collect())
         };
-        Ok(NodeView { status, role, command_line, classes_from_node, activity })
+        // Only when nothing is answering: a running node's old log lines are history, not a
+        // blocker, and a stale banner on a healthy node is its own kind of lie.
+        let blocker = (!status.reachable)
+            .then(|| {
+                let logs = self.logs.lock().expect("log lock");
+                stale_chain_line(&logs.log).map(|said| NodeBlocker::StaleChainData { said })
+            })
+            .flatten();
+        Ok(NodeView { status, role, command_line, classes_from_node, activity, blocker })
     }
 
     pub async fn is_supervising(&self) -> bool {
@@ -579,5 +639,40 @@ mod tests {
         assert!(is_activity_line("[palw-panel] registered bond abc:0"));
         assert!(is_activity_line("Consensus params fingerprint: 15bab795… (network testnet-11)"));
         assert!(!is_activity_line("2026-08-29 mempool size 3"));
+    }
+
+    /// **The regenesis failure, as the node actually prints it** (measured on the live fleet,
+    /// 2026-08-30). A re-minted testnet makes every node with the old chain on disk ask a
+    /// question, and the Studio starts nodes with pipes — so the question is an exit, and the RPC
+    /// poll that follows says only "connection refused". The line is the whole difference between
+    /// a mystery and a button.
+    #[test]
+    fn a_re_minted_testnet_is_recognised_from_the_line_the_node_prints() {
+        let mut log = VecDeque::new();
+        log.push_back("2026-08-30 10:06:36 [INFO ] Application directory: /var/lib/x/appdir".to_string());
+        log.push_back(
+            "Genesis not found in active consensus DB. This happens when Testnets are restarted and your              database needs to be fully deleted. Do you confirm the delete? (y/n)"
+                .to_string(),
+        );
+        log.push_back("Operation was rejected (), exiting..".to_string());
+        assert!(stale_chain_line(&log).is_some_and(|l| l.contains("needs to be fully deleted")));
+    }
+
+    /// A node that is merely down, or one that never started, must not be offered a chain-deleting
+    /// remedy for a condition it did not report.
+    #[test]
+    fn an_ordinary_failure_is_not_a_stale_chain() {
+        let mut log = VecDeque::new();
+        log.push_back("thread 'main' panicked at kaspad/src/daemon.rs: --palw-produce needs …".to_string());
+        log.push_back("Operation was rejected (), exiting..".to_string());
+        assert_eq!(stale_chain_line(&log), None, "a declined prompt is not evidence of WHICH prompt");
+        assert_eq!(stale_chain_line(&VecDeque::new()), None);
+    }
+
+    /// The genesis line is worth showing in the activity feed too — it is the one line that
+    /// explains an otherwise silent restart loop.
+    #[test]
+    fn the_genesis_line_reaches_the_activity_feed() {
+        assert!(is_activity_line("Genesis not found in active consensus DB. This happens when Testnets are restarted"));
     }
 }

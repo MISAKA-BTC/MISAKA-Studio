@@ -23,6 +23,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/classes", get(classes))
         .route("/classes/{name}/download", post(download_artifact))
         .route("/node/start", post(start_node))
+        .route("/node/reset", post(reset_node))
         .route("/node/stop", post(stop_node))
         .route("/node/log", get(node_log))
 }
@@ -132,6 +133,27 @@ async fn download_artifact(
             Err(Error::bad_request(format!("{} needs no artifact — every node derives it from a seed", spec.name)))
         }
     }
+}
+
+/// Restart the node after deleting a data directory that holds a different chain.
+///
+/// A separate verb from `/node/start`, not a flag on it: this one destroys the local chain, and a
+/// caller cannot reach it by leaving a field unset. It refuses unless the node actually said the
+/// data was stale — so it cannot be used as a general "wipe my node" button, and a user who clicks
+/// it is answering the exact question the node asked.
+async fn reset_node(State(state): State<Arc<AppState>>) -> Result<Json<NodeView>> {
+    let settings = state.settings.read().await.clone();
+    let view = state.node.view(&settings.node).await?;
+    if !matches!(view.blocker, Some(crate::node::NodeBlocker::StaleChainData { .. })) {
+        return Err(Error::bad_request(
+            "this node did not report stale chain data — nothing here would delete a chain on a guess.              Start it normally and read what it says.",
+        ));
+    }
+    let mut node_settings = settings.node.clone();
+    if node_settings.class_artifact.is_none() {
+        node_settings.class_artifact = default_class_artifact(&settings.models_dir).await;
+    }
+    Ok(Json(state.node.start_accepting_data_loss(&node_settings).await?))
 }
 
 #[derive(Deserialize)]
