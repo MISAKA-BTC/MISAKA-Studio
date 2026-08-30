@@ -466,9 +466,14 @@ pub fn build_backend(settings: &Settings, hardware: &HardwareSnapshot) -> Shared
         BackendKind::Mock => Arc::new(MockBackend::default()),
         BackendKind::Mlx => Arc::new(MlxBackend::new(settings.backend.mlx_server_path.clone(), timeout)),
         BackendKind::LlamaCpp => Arc::new(LlamaCppBackend::new(settings.backend.llama_server_path.clone(), tag, timeout)),
-        // Reserved, and refused rather than silently substituted: a user who selected the MISAKA
-        // runtime must not be given llama.cpp under a record that names MISAKA.
-        BackendKind::Misaka => Arc::new(MisakaBackend),
+        // The integer runtime, driven through the same child-engine supervisor as the others. It
+        // refuses rather than substituting when its server is missing: a record naming MISAKA must
+        // come from the MISAKA runtime.
+        BackendKind::Misaka => Arc::new(MisakaBackend::new(
+            settings.backend.misaka_serve_path.clone(),
+            settings.backend.misaka_tokenizer_path.clone(),
+            timeout,
+        )),
         // Auto: MLX where it can run, llama.cpp everywhere else. MLX is chosen only on Apple
         // Silicon, and only when its server is actually installed — the check happens at load,
         // where a missing engine is reported with a remedy.

@@ -33,7 +33,8 @@ pub enum BackendKind {
     LlamaCpp,
     /// Apple's MLX, via `mlx_lm.server`. macOS/Apple Silicon only.
     Mlx,
-    /// The deterministic in-tree runtime. Not yet available to the Studio.
+    /// The deterministic integer runtime (`misaka-palw-serve`), driven as a child process. Its
+    /// arithmetic is the class a chain registers, so two machines running one artifact agree.
     Misaka,
     /// A built-in fake that streams a canned reply. For UI work and tests with no model.
     Mock,
@@ -107,6 +108,14 @@ pub struct BackendSettings {
     pub llama_server_path: Option<PathBuf>,
     /// Path to the MLX server entry point (macOS).
     pub mlx_server_path: Option<PathBuf>,
+    /// Path to `misaka-palw-serve`, the integer runtime's OpenAI server. `None` looks beside the
+    /// Studio's own executable and on PATH, the same way the other engines are found.
+    pub misaka_serve_path: Option<PathBuf>,
+    /// The tokenizer the MISAKA runtime renders prompts with. `None` looks for `tokenizer.json`
+    /// beside the artifact — a `.palwart` carries weights and a tokenizer COMMITMENT, never the
+    /// tokenizer file itself (the class identity includes what the ids mean; consensus never runs
+    /// one), so the file has to come from somewhere and this is where the Studio is told.
+    pub misaka_tokenizer_path: Option<PathBuf>,
     pub gpu_layers: GpuLayers,
     /// Generation threads. `None` lets the engine choose, which it does better than a fixed
     /// default copied from someone else's machine.
@@ -130,6 +139,8 @@ impl Default for BackendSettings {
             kind: BackendKind::Auto,
             llama_server_path: None,
             mlx_server_path: None,
+            misaka_serve_path: None,
+            misaka_tokenizer_path: None,
             gpu_layers: GpuLayers::Auto,
             threads: None,
             flash_attention: FlashAttention::default(),

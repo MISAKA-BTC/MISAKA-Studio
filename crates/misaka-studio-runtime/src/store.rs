@@ -244,7 +244,20 @@ fn scan_dir(dir: &Path, depth: usize, found: &mut HashMap<String, LocalModel>) {
             continue;
         }
 
-        if !name.to_ascii_lowercase().ends_with(".gguf") {
+        // A PALW artifact is one model file, like a GGUF, and belongs in the same list — the
+        // MISAKA runtime backend loads it and no other backend can. Its shape is NOT read here:
+        // this crate does not parse `.palwart`, and inventing a layer count from an extension
+        // would put a guess in a record. The engine reports the real shape at `/health` when it
+        // loads the file.
+        let lower = name.to_ascii_lowercase();
+        if lower.ends_with(".palwart") {
+            let sidecar = Sidecar::load(&path);
+            if let Some(model) = inspect_palw_artifact(&path, sidecar) {
+                found.entry(model.id.clone()).or_insert(model);
+            }
+            continue;
+        }
+        if !lower.ends_with(".gguf") {
             continue;
         }
         // A multi-part GGUF is one model: llama.cpp is pointed at part 1 and finds the rest, so
@@ -267,6 +280,44 @@ fn scan_dir(dir: &Path, depth: usize, found: &mut HashMap<String, LocalModel>) {
             Err(e) => tracing::warn!(path = %path.display(), "skipping: {e}"),
         }
     }
+}
+
+/// **A `.palwart` as a model entry: what the file proves, and nothing else.**
+///
+/// Every shape field stays `None`. The Studio has no decoder for this format — the integer runtime
+/// does — so a `block_count` or a `context_length` here would be a number nobody measured, in the
+/// one place a user reads to decide whether a model fits their machine. The size and the digest
+/// are facts about the file, and the sidecar's repository is a fact about where it came from.
+fn inspect_palw_artifact(path: &Path, sidecar: Sidecar) -> Option<LocalModel> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let size_bytes = metadata.len();
+    let modified_at = metadata.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
+    let name = path.file_stem()?.to_string_lossy().to_string();
+    let mut model = LocalModel {
+        id: name.clone(),
+        name,
+        path: path.to_path_buf(),
+        size_bytes,
+        quantization: None,
+        architecture: Some("palw".into()),
+        parameter_count: None,
+        context_length: None,
+        block_count: None,
+        expert_count: None,
+        kv_cache_bytes_per_token: None,
+        // The runtime renders Qwen's template itself, from the tokenizer file it is given — the
+        // artifact carries a tokenizer COMMITMENT, never a template.
+        has_chat_template: false,
+        source: sidecar.source.clone(),
+        sha256: None,
+        modified_at,
+    };
+    if let (Some(sha), Some(hashed)) = (sidecar.sha256, sidecar.hashed_size)
+        && hashed == size_bytes
+    {
+        model.sha256 = Some(sha);
+    }
+    Some(model)
 }
 
 /// `model-00002-of-00003.gguf` is a continuation shard; part 1 represents the model.
