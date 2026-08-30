@@ -20,7 +20,7 @@ members = ["crates/misaka-studio-core", "crates/misaka-studio-runtime", "desktop
 default-members = ["crates/misaka-studio-core", "crates/misaka-studio-runtime"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88.0"
 authors = ["MISAKA contributors"]
@@ -28,7 +28,7 @@ license = "ISC"
 repository = "https://github.com/MISAKA-BTC/misakas"
 
 [workspace.dependencies]
-misaka-studio-core = { version = "0.1.0", path = "crates/misaka-studio-core" }
+misaka-studio-core = { version = "0.1.1", path = "crates/misaka-studio-core" }
 
 anyhow = "1"
 axum = { version = "0.8", features = ["macros", "ws"] }

@@ -74,10 +74,13 @@ jobs:
           npm --prefix ui ci
           npm --prefix ui run build
 
-      # The shell looks for the runtime beside its own executable (`locate_runtime_binary`), so the
-      # bundle has to carry it. Building it first and copying it into the desktop crate's resources
-      # is what makes the installed app self-contained: no PATH, no second download, no Rust on the
-      # user's machine.
+      # The bundle has to carry the runtime: that is what makes the installed app self-contained —
+      # no PATH, no second download, no Rust on the user's machine. Note where it ends up. This
+      # copies into the desktop crate's `resources/`, and tauri keeps that directory name inside
+      # the bundle, so the sidecar sits one level DOWN from the executable (and in
+      # `Contents/Resources/resources/` on macOS) — NOT beside it, which is what this comment used
+      # to claim and what `locate_runtime_binary` used to assume. v0.1.0 shipped the file in every
+      # installer with no way to reach it.
       - name: Build the runtime
         run: cargo build --release --bin misaka-studiod
 
@@ -121,6 +124,26 @@ jobs:
             -exec cp {} dist/ \;
           ls -l dist
 
+      # A no-install path, Windows only: the two binaries the installer lays down, in the layout
+      # the app looks for them in. macOS already has one — the .app inside the dmg is dragged
+      # wherever the user likes — and Linux has the AppImage. Windows was the platform with no
+      # answer for someone who cannot or will not run an installer that asks for admin.
+      #
+      # pwsh rather than bash: `Compress-Archive` and `ConvertFrom-Json` ship with the runner, so
+      # this depends on nothing that has to be installed or found on PATH.
+      - name: Portable zip
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = (Get-Content desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $stage = "dist/misaka-studio-$version-x64-portable"
+          New-Item -ItemType Directory -Force -Path "$stage/resources" | Out-Null
+          Copy-Item target/release/misaka-studio.exe "$stage/"
+          Copy-Item desktop/src-tauri/resources/misaka-studiod.exe "$stage/resources/"
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip" -Force
+          Remove-Item -Recurse -Force $stage
+          Get-ChildItem dist
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: misaka-studio-${{ runner.os }}
@@ -152,6 +175,10 @@ jobs:
             * **Windows** — SmartScreen shows "Windows protected your PC". Choose *More info* →
               *Run anyway*.
             * **macOS** — Gatekeeper refuses the app. Right-click it → *Open*, then confirm.
+
+            **Windows without installing**: `misaka-studio-*-x64-portable.zip` is the same two
+            binaries in a folder. Unzip it anywhere and run `misaka-studio.exe`; keep `resources/`
+            beside it, which is where the app looks for its runtime. No admin, no installer.
 
             Chat needs an inference engine the Studio does not bundle: install llama.cpp so
             `llama-server` is on PATH. Mining does not need it.

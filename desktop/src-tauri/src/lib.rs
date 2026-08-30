@@ -104,9 +104,17 @@ pub fn resolve_runtime(preferred_port: u16) -> RuntimeSource {
 
 /// Where `misaka-studiod` is.
 ///
-/// Three layouts, because the app runs in three of them: a packaged bundle (beside the executable,
-/// or in a macOS `.app`'s `MacOS` directory), a `cargo tauri dev` build (the workspace's target
-/// directory), and a developer's PATH.
+/// The layouts the app actually runs in, which is more than the three this comment used to
+/// claim: an installed bundle (`resources/` beside the executable on Windows and Linux,
+/// `Contents/Resources/resources/` in a macOS `.app`), the portable layout and a `cargo build`
+/// tree (bare beside the executable), a `cargo tauri dev` build (the workspace target directory),
+/// and a developer's PATH.
+///
+/// The bundle cases were missing until v0.1.0 shipped without them: the sidecar was present in
+/// every installer and unreachable from all three, because the search fell through to the
+/// relative developer paths below, which resolve against the process CWD and exist only on a
+/// machine that built the thing. `the_sidecar_is_found_in_a_*` covers each layout now, built
+/// from the directory trees the v0.1.0 artifacts were found to contain.
 pub fn locate_runtime_binary(exe_dir: Option<&Path>) -> Option<PathBuf> {
     let name = if cfg!(windows) { "misaka-studiod.exe" } else { "misaka-studiod" };
 
@@ -119,10 +127,15 @@ pub fn locate_runtime_binary(exe_dir: Option<&Path>) -> Option<PathBuf> {
 
     if let Some(dir) = exe_dir {
         let candidates = [
+            // A `cargo build` tree, and the portable layout: bare beside the executable.
             dir.join(name),
+            // A Windows or Linux bundle. `resources/*` keeps its directory name when tauri copies
+            // it in, so the sidecar lands one level DOWN from the executable, not beside it.
+            dir.join("resources").join(name),
             // `cargo tauri dev` puts the shell in target/debug next to the sidecar.
             dir.join("..").join(name),
-            // A macOS bundle: Contents/MacOS/<app> and Contents/Resources/<sidecar>.
+            // A macOS bundle: Contents/MacOS/<app> and Contents/Resources/resources/<sidecar>.
+            dir.join("../Resources/resources").join(name),
             dir.join("../Resources").join(name),
         ];
         for candidate in candidates {
@@ -230,8 +243,65 @@ mod tests {
         assert!(!hostile.contains("alert(1);\""), "the quote must stay escaped: {hostile}");
     }
 
+    /// The layouts the bundlers actually produce, taken from the v0.1.0 artifacts by extracting
+    /// them: `resources/*` keeps its directory name inside the bundle, so the sidecar is never
+    /// bare beside the executable the way a `cargo build` leaves it.
+    #[test]
+    fn the_sidecar_is_found_in_a_windows_or_linux_bundle() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: single-threaded under ENV_LOCK.
+        unsafe { std::env::remove_var("MISAKA_STUDIOD") };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let name = if cfg!(windows) { "misaka-studiod.exe" } else { "misaka-studiod" };
+        let resources = dir.path().join("resources");
+        std::fs::create_dir_all(&resources).expect("mkdir");
+        let sidecar = resources.join(name);
+        std::fs::write(&sidecar, b"#!/bin/sh\n").expect("write");
+
+        let found = locate_runtime_binary(Some(dir.path())).expect("the sidecar");
+        assert_eq!(found.canonicalize().ok(), sidecar.canonicalize().ok(), "found {found:?}");
+    }
+
+    #[test]
+    fn the_sidecar_is_found_in_a_macos_app_bundle() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: single-threaded under ENV_LOCK.
+        unsafe { std::env::remove_var("MISAKA_STUDIOD") };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let name = if cfg!(windows) { "misaka-studiod.exe" } else { "misaka-studiod" };
+        let macos = dir.path().join("Contents/MacOS");
+        let resources = dir.path().join("Contents/Resources/resources");
+        std::fs::create_dir_all(&macos).expect("mkdir");
+        std::fs::create_dir_all(&resources).expect("mkdir");
+        let sidecar = resources.join(name);
+        std::fs::write(&sidecar, b"#!/bin/sh\n").expect("write");
+
+        let found = locate_runtime_binary(Some(&macos)).expect("the sidecar");
+        assert_eq!(found.canonicalize().ok(), sidecar.canonicalize().ok(), "found {found:?}");
+    }
+
+    /// The portable layout and a `cargo build` tree: bare beside the executable.
+    #[test]
+    fn the_sidecar_is_found_beside_the_executable() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: single-threaded under ENV_LOCK.
+        unsafe { std::env::remove_var("MISAKA_STUDIOD") };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let name = if cfg!(windows) { "misaka-studiod.exe" } else { "misaka-studiod" };
+        let sidecar = dir.path().join(name);
+        std::fs::write(&sidecar, b"#!/bin/sh\n").expect("write");
+
+        let found = locate_runtime_binary(Some(dir.path())).expect("the sidecar");
+        assert_eq!(found.canonicalize().ok(), sidecar.canonicalize().ok(), "found {found:?}");
+    }
+
+    /// `MISAKA_STUDIOD` is process-global and `locate_runtime_binary` reads it first, so every
+    /// test that depends on it being set — or unset — has to hold this.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn an_explicit_binary_path_is_honoured() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
         let name = if cfg!(windows) { "misaka-studiod.exe" } else { "misaka-studiod" };
         let path = dir.path().join(name);
