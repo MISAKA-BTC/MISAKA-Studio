@@ -15,7 +15,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../lib/api'
 import { bytes, count, shortHash } from '../lib/format'
-import type { NetworkOverview, NodeClassRow, PalwClassStatus, PoolStatus, Settings } from '../lib/types'
+import type { MiningState, NetworkOverview, NodeClassRow, PalwClassStatus, PoolStatus, Settings } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { CopyButton, EmptyState, Field, Icon, Section, Spinner, Toggle } from './common'
 
@@ -110,6 +110,7 @@ export function NetworkView() {
 
   return (
     <div className="h-full overflow-y-auto p-4">
+      <MiningBanner mining={node.mining} pool={null} />
       <div className="grid gap-4 xl:grid-cols-3">
         <div className="space-y-4 xl:col-span-2">
           <NodePanel
@@ -169,6 +170,69 @@ export function NetworkView() {
             </section>
           )}
         </div>
+      </div>
+    </div>
+  )
+}
+
+
+/**
+ * **"Am I mining?" — answered at the top of the tab, before anything else.**
+ *
+ * The question has three plausible-looking wrong answers on this screen: a loaded model (that is
+ * chat), a reachable node (that is verification) and the Producer role being selected (that is an
+ * intention). A user who saw all three concluded they were mining and they were not. So this reads
+ * only the producer's own `produced block #N`, states the answer in one word, and when the answer
+ * is no it carries the node's own reason rather than making the user go looking for it.
+ */
+function MiningBanner({ mining }: { mining: MiningState; pool: null }) {
+  if (mining.state === 'producing') {
+    return (
+      <div className="mb-4 flex flex-wrap items-center gap-3 rounded-xl border border-emerald-300 bg-emerald-50 p-4 dark:border-emerald-900 dark:bg-emerald-950/40">
+        <span className="relative flex size-3 shrink-0">
+          <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+          <span className="relative inline-flex size-3 rounded-full bg-emerald-500" />
+        </span>
+        <div className="min-w-0 flex-1">
+          <p className="text-sm font-semibold text-emerald-900 dark:text-emerald-200">Mining — this machine is producing blocks</p>
+          <p className="mt-0.5 text-xs text-emerald-800 dark:text-emerald-300">
+            {mining.blocks} block{mining.blocks === 1 ? '' : 's'} since this node started
+            {mining.latest_number !== null && <> · latest is the chain&apos;s #{mining.latest_number}</>}
+          </p>
+        </div>
+      </div>
+    )
+  }
+
+  if (mining.state === 'starting') {
+    return (
+      <div className="mb-4 flex flex-wrap items-center gap-3 rounded-xl border border-amber-300 bg-amber-50 p-4 dark:border-amber-900 dark:bg-amber-950/40">
+        <Spinner className="size-4 shrink-0 text-amber-700 dark:text-amber-400" />
+        <div className="min-w-0 flex-1">
+          <p className="text-sm font-semibold text-amber-900 dark:text-amber-200">Not mining yet — the producer is running but has won nothing</p>
+          <p className="mt-0.5 text-xs leading-relaxed text-amber-800 dark:text-amber-300">
+            {mining.holding ? (
+              <>
+                The node says: <span className="mono">{mining.holding}</span>
+              </>
+            ) : (
+              <>Syncing, or waiting for its first win. The node states a reason here as soon as it has one.</>
+            )}
+          </p>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="mb-4 flex flex-wrap items-center gap-3 rounded-xl border border-ink-200 bg-ink-50 p-4 dark:border-ink-800 dark:bg-ink-900/40">
+      <span className="size-3 shrink-0 rounded-full bg-ink-400" />
+      <div className="min-w-0 flex-1">
+        <p className="text-sm font-semibold">Not mining</p>
+        <p className="mt-0.5 text-xs leading-relaxed text-ink-500 dark:text-ink-400">
+          Chatting is not mining and neither is following the chain: a block is made by a node running the class&apos;s model under
+          a bonded key. Start as <strong>Producer</strong> below, or join the pool and let one run for you.
+        </p>
       </div>
     </div>
   )

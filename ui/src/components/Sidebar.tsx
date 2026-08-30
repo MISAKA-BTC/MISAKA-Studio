@@ -4,10 +4,70 @@
 // process is not there every other part of the UI is showing stale data. Saying so in one place,
 // permanently, beats a toast that has already faded by the time someone looks up.
 
+import { useEffect, useState } from 'react'
 import logo from '../assets/misaka-logo.png'
+import { api } from '../lib/api'
 import { relativeTime } from '../lib/format'
+import type { MiningState } from '../lib/types'
 import { useStudio, type View } from '../store/studio'
 import { Icon, type IconName } from './common'
+
+/**
+ * **The mining light, where it is always visible.**
+ *
+ * The Network tab answers this properly; this exists because the question is asked from the Chat
+ * tab, by someone who just watched a model reply and reasonably wondered whether that was mining.
+ * It is not, and a dot that is only truthful when you go looking for it is not much of an answer.
+ *
+ * Polled slowly on purpose: it is a light, not a dashboard, and every read walks the node's log.
+ */
+function MiningLight() {
+  const [mining, setMining] = useState<MiningState | null>(null)
+
+  useEffect(() => {
+    let live = true
+    const read = async () => {
+      try {
+        const overview = await api.network()
+        if (live) setMining(overview.node.mining)
+      } catch {
+        if (live) setMining(null)
+      }
+    }
+    void read()
+    const timer = setInterval(() => void read(), 15_000)
+    return () => {
+      live = false
+      clearInterval(timer)
+    }
+  }, [])
+
+  if (!mining || mining.state === 'not_mining') return null
+
+  const producing = mining.state === 'producing'
+  return (
+    <div
+      className={`mx-2 mb-2 flex items-center gap-2 rounded-lg px-3 py-2 text-[0.7rem] ${
+        producing
+          ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
+          : 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300'
+      }`}
+      title={mining.state === 'starting' && mining.holding ? mining.holding : undefined}
+    >
+      {producing ? (
+        <span className="relative flex size-2 shrink-0">
+          <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+          <span className="relative inline-flex size-2 rounded-full bg-emerald-500" />
+        </span>
+      ) : (
+        <span className="size-2 shrink-0 rounded-full bg-amber-500" />
+      )}
+      <span className="min-w-0 flex-1 truncate">
+        {producing ? `Mining · ${mining.blocks} block${mining.blocks === 1 ? '' : 's'}` : 'Producer running · nothing won yet'}
+      </span>
+    </div>
+  )
+}
 
 const NAV: { view: View; label: string; icon: IconName }[] = [
   { view: 'chat', label: 'Chat', icon: 'chat' },
@@ -67,7 +127,11 @@ export function Sidebar() {
         ))}
       </nav>
 
-      <div className="mt-4 flex items-center justify-between px-4 pb-1">
+      <div className="mt-3">
+        <MiningLight />
+      </div>
+
+      <div className="mt-1 flex items-center justify-between px-4 pb-1">
         <span className="text-[0.7rem] font-semibold uppercase tracking-wide text-ink-500 dark:text-ink-400">Conversations</span>
         <button
           type="button"

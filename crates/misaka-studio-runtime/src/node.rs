@@ -228,6 +228,31 @@ pub(crate) fn is_activity_line(line: &str) -> bool {
 /// node uses for every declined prompt — and the sentence is what tells the user which prompt it
 /// was. Both halves are matched: the question alone appears in the runbooks, and the refusal alone
 /// is printed for any declined question.
+/// Read the producer's own lines. `produced block #N` is the only line that proves a block was
+/// made, so it is the only line that flips this to `Producing`; `holding: <reason>` is what the
+/// node says instead, and it carries the reason the operator needs.
+pub(crate) fn mining_state(log: &VecDeque<String>, role: NetworkRole, reachable: bool) -> MiningState {
+    if role != NetworkRole::Producer || !reachable {
+        return MiningState::NotMining;
+    }
+    let mut blocks = 0u64;
+    let mut latest_number = None;
+    let mut holding = None;
+    for line in log {
+        if let Some(rest) = line.split("produced block #").nth(1) {
+            blocks += 1;
+            // Last line wins: the field names the LATEST block, and the log is in order. A line
+            // whose number will not parse leaves the previous one standing rather than blanking it.
+            if let Some(n) = rest.split_whitespace().next().and_then(|n| n.parse::<u64>().ok()) {
+                latest_number = Some(n);
+            }
+        } else if let Some(rest) = line.split("[palw-producer] holding: ").nth(1) {
+            holding = Some(rest.trim().to_string());
+        }
+    }
+    if blocks > 0 { MiningState::Producing { blocks, latest_number } } else { MiningState::Starting { holding } }
+}
+
 pub(crate) fn stale_chain_line(log: &VecDeque<String>) -> Option<String> {
     log.iter().rev().find(|line| line.contains("Genesis not found in active consensus DB")).cloned()
 }
@@ -268,6 +293,32 @@ pub struct NodeView {
     pub activity: Vec<String>,
     /// Why the node is not running, when it said so before exiting.
     pub blocker: Option<NodeBlocker>,
+    /// Whether this machine is actually producing blocks, and the evidence for saying so.
+    pub mining: MiningState,
+}
+
+/// **Is this machine mining?** — one question, answered from the node's own output.
+///
+/// It needs its own answer because every nearby signal is a false friend. A loaded model means
+/// llama.cpp is running, which is chat and not mining. A reachable node means the chain is being
+/// followed, which is verification. `role: producer` means the operator asked to mine, not that
+/// anything was mined. The chain's own producer says `produced block #N`, and until it does, the
+/// honest answer is no.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MiningState {
+    /// No node, or a node that is not configured to produce.
+    NotMining,
+    /// Configured to produce and the node is up, but it has not said `produced block` yet —
+    /// syncing, waiting for its first win, or held.
+    Starting {
+        /// The producer's last `holding: <reason>` line, if it gave one. This is where the real
+        /// answer usually is: no bond, no budget, exposure ceiling, no fee outpoint.
+        holding: Option<String>,
+    },
+    /// The node has produced blocks. `blocks` counts what this supervision has seen — the chain's
+    /// own `#N` is carried separately because a restart resets the first and not the second.
+    Producing { blocks: u64, latest_number: Option<u64> },
 }
 
 /// **A startup the node refused, named rather than left as "connection refused".**
@@ -506,13 +557,17 @@ impl NodeManager {
         };
         // Only when nothing is answering: a running node's old log lines are history, not a
         // blocker, and a stale banner on a healthy node is its own kind of lie.
+        let mining = {
+            let logs = self.logs.lock().expect("log lock");
+            mining_state(&logs.log, role, status.reachable)
+        };
         let blocker = (!status.reachable)
             .then(|| {
                 let logs = self.logs.lock().expect("log lock");
                 stale_chain_line(&logs.log).map(|said| NodeBlocker::StaleChainData { said })
             })
             .flatten();
-        Ok(NodeView { status, role, command_line, classes_from_node, activity, blocker })
+        Ok(NodeView { status, role, command_line, classes_from_node, activity, blocker, mining })
     }
 
     pub async fn is_supervising(&self) -> bool {
@@ -674,5 +729,41 @@ mod tests {
     #[test]
     fn the_genesis_line_reaches_the_activity_feed() {
         assert!(is_activity_line("Genesis not found in active consensus DB. This happens when Testnets are restarted"));
+    }
+
+    /// **The question the UI asks, and the four wrong ways to answer it.** A user with a chat
+    /// model loaded, a synced node and `role: producer` set has three green signals and may still
+    /// have mined nothing; only the producer's own line settles it.
+    #[test]
+    fn mining_is_only_true_once_the_producer_says_it_produced() {
+        let mut log = VecDeque::new();
+        log.push_back("Consensus params fingerprint: f3bf86b4… (network testnet-11)".to_string());
+
+        // Configured and up, nothing produced: not mining, and no reason offered yet.
+        assert_eq!(mining_state(&log, NetworkRole::Producer, true), MiningState::Starting { holding: None });
+
+        // The reason, when the node gives one, is the answer the operator actually needs.
+        log.push_back("[palw-producer] holding: this class's epoch budget is already spent [budget=0]".to_string());
+        match mining_state(&log, NetworkRole::Producer, true) {
+            MiningState::Starting { holding: Some(h) } => assert!(h.contains("epoch budget"), "{h}"),
+            other => panic!("expected a held producer, got {other:?}"),
+        }
+
+        // And the one line that proves a block was made.
+        log.push_back("[palw-producer] produced block #691 6ddac6d7fa4e9fb90d656a3da3b1e0a07bb".to_string());
+        log.push_back("[palw-producer] produced block #692 b86b4cfb186feb1c393f85bf79a389530d8".to_string());
+        // The LATEST number, not the first: the log is in order and the field names the newest
+        // block this supervision saw.
+        assert_eq!(mining_state(&log, NetworkRole::Producer, true), MiningState::Producing { blocks: 2, latest_number: Some(692) });
+    }
+
+    /// A verifier is not mining however healthy it looks, and neither is a producer whose node is
+    /// down — the log it left behind describes a chain it is no longer on.
+    #[test]
+    fn a_verifier_and_an_unreachable_producer_are_both_not_mining() {
+        let mut log = VecDeque::new();
+        log.push_back("[palw-producer] produced block #1 aa".to_string());
+        assert_eq!(mining_state(&log, NetworkRole::Verifier, true), MiningState::NotMining);
+        assert_eq!(mining_state(&log, NetworkRole::Producer, false), MiningState::NotMining);
     }
 }

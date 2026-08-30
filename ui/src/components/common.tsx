@@ -113,7 +113,7 @@ export function CopyButton({ text, label = 'Copy', className = 'btn-ghost' }: { 
   return (
     <button
       type="button"
-      className={className}
+      className={`relative ${className}`}
       title={label}
       onClick={async () => {
         try {
@@ -127,6 +127,12 @@ export function CopyButton({ text, label = 'Copy', className = 'btn-ghost' }: { 
       }}
     >
       <Icon name={copied ? 'check' : 'copy'} className="size-3.5" />
+      {/* `relative` on the BUTTON, not decoration: `sr-only` is `position: absolute`, and with no
+          positioned ancestor its containing block is the document. The clipped 1px box then sits
+          at a document coordinate — measured at y=1973 inside a 720px window — and stretches the
+          page's scrollable area to reach it. The visible symptom is a window that scrolls into
+          blank space below an app that otherwise fits exactly, which is what this looked like.
+          Giving the button a containing block keeps the label where the button is. */}
       <span className="sr-only">{label}</span>
     </button>
   )

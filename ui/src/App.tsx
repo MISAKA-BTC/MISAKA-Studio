@@ -59,7 +59,15 @@ export default function App() {
   return (
     <div className="flex h-full overflow-hidden">
       <Sidebar />
-      <main className="min-w-0 flex-1">
+      {/* `min-h-0` is the whole fix for a page that scrolled forever. A flex item defaults to
+          `min-height: auto`, which means it refuses to be shorter than its content — so a tall
+          view (the Network tab is ~2200px) grew this element past the window instead of being
+          clipped by it, and every view's own `h-full overflow-y-auto` then resolved against a
+          container taller than itself and never scrolled internally. The document scrolled
+          instead, past the end of the app. `overflow-hidden` is the belt to that braces: the
+          shell already clips, and saying so here keeps a future overflowing child from escaping
+          the same way. */}
+      <main className="min-h-0 min-w-0 flex-1 overflow-hidden">
         {view === 'chat' && <ChatView />}
         {view === 'models' && <ModelsView />}
         {view === 'network' && <NetworkView />}

@@ -348,6 +348,11 @@ export type NodeClassRow = {
 
 export type NodeBlocker = { kind: 'stale_chain_data'; said: string }
 
+export type MiningState =
+  | { state: 'not_mining' }
+  | { state: 'starting'; holding: string | null }
+  | { state: 'producing'; blocks: number; latest_number: number | null }
+
 export type NodeView = {
   status: NodeStatus
   role: 'observer' | 'verifier' | 'producer'
@@ -355,6 +360,7 @@ export type NodeView = {
   classes_from_node: NodeClassRow[]
   activity: string[]
   blocker: NodeBlocker | null
+  mining: MiningState
 }
 
 export type NetworkOverview = {
