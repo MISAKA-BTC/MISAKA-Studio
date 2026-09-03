@@ -27,6 +27,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/node/stop", post(stop_node))
         .route("/node/log", get(node_log))
         .route("/producer-key", post(producer_key))
+        .route("/faucet", post(super::pool::faucet_for_address))
 }
 
 /// The whole network picture in one response — what the UI's Network tab renders.

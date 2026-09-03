@@ -27,6 +27,37 @@ use std::time::Duration;
 /// The operator's public pool. A different one is a `url` away — the API is three routes.
 const DEFAULT_POOL_URL: &str = "https://misakascan.com/pool";
 
+/// `POST /api/v1/network/faucet` `{ "address": "misakatest:…" }` — the faucet at the pool's origin,
+/// for an address that is not a slot's: the own-node path's, which the node prints at start.
+/// Same pass-through as [`faucet`]: the faucet's answer is the answer.
+pub async fn faucet_for_address(State(state): State<Arc<AppState>>, Json(body): Json<serde_json::Value>) -> Result<Json<serde_json::Value>> {
+    let address = body.get("address").and_then(|v| v.as_str()).filter(|a| a.contains(':')).ok_or_else(|| Error::bad_request("faucet needs an address"))?;
+    let url = state.settings.read().await.node.pool_url.clone().unwrap_or_else(|| DEFAULT_POOL_URL.to_string());
+    let origin = pool_origin(&url);
+    let response = http()
+        .post(format!("{origin}/faucet/v1/claim"))
+        .json(&serde_json::json!({ "address": address }))
+        .send()
+        .await
+        .map_err(|e| Error::bad_request(format!("the faucet did not answer: {e}")))?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        let why = body.get("error").and_then(|v| v.as_str()).unwrap_or("no reason given");
+        return Err(Error::bad_request(format!("the faucet refused ({status}): {why}")));
+    }
+    Ok(Json(body))
+}
+
+/// `https://host/pool` → `https://host` — the faucet is the pool origin's sibling.
+fn pool_origin(url: &str) -> String {
+    let after_scheme = url.find("://").map(|i| i + 3).unwrap_or(0);
+    match url[after_scheme..].find('/') {
+        Some(slash) => url[..after_scheme + slash].to_string(),
+        None => url.to_string(),
+    }
+}
+
 pub fn router() -> Router<Arc<AppState>> {
     Router::new().route("/", get(status)).route("/join", post(join)).route("/leave", post(leave)).route("/faucet", post(faucet))
 }

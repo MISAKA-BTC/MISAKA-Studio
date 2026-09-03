@@ -205,6 +205,22 @@ pub(crate) fn parse_class_row(line: &str) -> Option<NodeClassRow> {
     })
 }
 
+/// `[palw] producer pay address <addr> (derived from --palw-producer-key; …)` → the address.
+pub(crate) fn parse_pay_address(line: &str) -> Option<String> {
+    let rest = line.split("[palw] producer pay address ").nth(1)?;
+    let address = rest.split_whitespace().next()?;
+    (address.contains(':') && address.len() > 20).then(|| address.to_string())
+}
+
+/// `[palw-panel] registered bond <txid>:<index> …` → `<txid>:<index>`.
+pub(crate) fn parse_registered_bond(line: &str) -> Option<String> {
+    let rest = line.split("[palw-panel] registered bond ").nth(1)?;
+    let outpoint = rest.split_whitespace().next()?;
+    let (txid, index) = outpoint.split_once(':')?;
+    (txid.len() >= 64 && txid.chars().all(|c| c.is_ascii_hexdigit()) && index.chars().all(|c| c.is_ascii_digit()))
+        .then(|| outpoint.to_string())
+}
+
 /// A line worth surfacing in the activity feed: production, panel work, holds, and the identity
 /// lines an operator is told to check.
 pub(crate) fn is_activity_line(line: &str) -> bool {
@@ -213,6 +229,7 @@ pub(crate) fn is_activity_line(line: &str) -> bool {
         "[palw-panel]",
         "[palw-dump]",
         "Consensus params fingerprint",
+        "[palw] producer pay address",
         "Genesis mismatch",
         "Genesis not found",
         "accepted block",
@@ -266,6 +283,12 @@ struct NodeLogState {
     log: VecDeque<String>,
     activity: VecDeque<String>,
     classes: Vec<NodeClassRow>,
+    /// `[palw] producer pay address <addr> (…)` — the node derives it from the producer key when
+    /// no pay address is configured; the address a newcomer funds.
+    pay_address: Option<String>,
+    /// `[palw-panel] registered bond <txid>:<index> …` — printed once by the registration run;
+    /// the value `node.producer_bond` must carry from then on.
+    registered_bond: Option<String>,
 }
 
 struct SupervisedNode {
@@ -295,6 +318,12 @@ pub struct NodeView {
     pub blocker: Option<NodeBlocker>,
     /// Whether this machine is actually producing blocks, and the evidence for saying so.
     pub mining: MiningState,
+    /// The pay address the node printed at start (derived from the producer key when none is
+    /// configured). `None` until the node says it.
+    pub pay_address: Option<String>,
+    /// The bond outpoint the node printed when its registration carrier confirmed. `None` until
+    /// the node says it; the settings' `producer_bond` should be set to it before the next start.
+    pub registered_bond: Option<String>,
 }
 
 /// **Is this machine mining?** — one question, answered from the node's own output.
@@ -554,6 +583,10 @@ impl NodeManager {
 
         let mut status = query_status(&rpc_url).await;
         status.source = source;
+        let (pay_address, registered_bond) = {
+            let logs = self.logs.lock().expect("log lock");
+            (logs.pay_address.clone(), logs.registered_bond.clone())
+        };
         let (classes_from_node, activity) = {
             let logs = self.logs.lock().expect("log lock");
             (logs.classes.clone(), logs.activity.iter().cloned().collect())
@@ -570,7 +603,7 @@ impl NodeManager {
                 stale_chain_line(&logs.log).map(|said| NodeBlocker::StaleChainData { said })
             })
             .flatten();
-        Ok(NodeView { status, role, command_line, classes_from_node, activity, blocker, mining })
+        Ok(NodeView { status, role, command_line, classes_from_node, activity, blocker, mining, pay_address, registered_bond })
     }
 
     pub async fn is_supervising(&self) -> bool {
@@ -607,6 +640,12 @@ async fn drain_node<R: tokio::io::AsyncRead + Unpin>(stream: R, logs: Arc<Mutex<
             state.classes.retain(|existing| existing.class_id != row.class_id);
             state.classes.push(row);
         }
+        if let Some(address) = parse_pay_address(&line) {
+            state.pay_address = Some(address);
+        }
+        if let Some(outpoint) = parse_registered_bond(&line) {
+            state.registered_bond = Some(outpoint);
+        }
         if is_activity_line(&line) {
             if state.activity.len() == ACTIVITY_CAPACITY {
                 state.activity.pop_front();
@@ -620,6 +659,21 @@ async fn drain_node<R: tokio::io::AsyncRead + Unpin>(stream: R, logs: Arc<Mutex<
 mod tests {
     use super::*;
     use misaka_studio_core::settings::NodeSettings;
+
+    #[test]
+    fn the_pay_address_and_the_registered_bond_are_read_off_the_node_lines() {
+        let addr = parse_pay_address(
+            "2026-09-04 07:42:41.875+09:00 [INFO ] [palw] producer pay address misakadev:qg3fzu3xz2f4z8c59q4mc0jl4gdp98kc84xupe7utumym8dt5tytfv9k83hj2gulnrkvws4hukxjycwmj4z56676upssywvh58f9xrsvv28dz3kz (derived from --palw-producer-key; pass --palw-producer-pay-address to override)",
+        )
+        .expect("parses");
+        assert!(addr.starts_with("misakadev:qg3fzu3x"));
+        assert!(parse_pay_address("[palw-panel] no bond yet; registering one").is_none());
+        let bond = parse_registered_bond(&format!("[palw-panel] registered bond {}:0 with 400000 sompi collateral. Restart with …", "ab".repeat(64)))
+            .expect("parses");
+        assert_eq!(bond, format!("{}:0", "ab".repeat(64)));
+        assert!(parse_registered_bond("[palw-panel] registered bond nothing").is_none());
+        assert!(is_activity_line("[palw] producer pay address misakadev:qq (derived)"));
+    }
 
     #[test]
     fn urls_normalize_to_the_network_default_port() {

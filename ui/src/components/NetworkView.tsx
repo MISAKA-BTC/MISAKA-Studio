@@ -16,7 +16,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { PromptMiningPanel } from './PromptMiningPanel'
 import { api } from '../lib/api'
 import { bytes, count, shortHash } from '../lib/format'
-import type { MiningState, NetworkOverview, NodeClassRow, PalwClassStatus, PoolStatus, Settings } from '../lib/types'
+import type { MiningState, NetworkOverview, NodeClassRow, NodeView, PalwClassStatus, PoolStatus, Settings } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { CopyButton, EmptyState, Field, Icon, Section, Spinner, Toggle } from './common'
 
@@ -112,6 +112,7 @@ export function NetworkView() {
   return (
     <div className="h-full overflow-y-auto p-4">
       <MiningBanner mining={node.mining} pool={null} />
+      {(node.pay_address || node.registered_bond) && <ProducerIdentityCard node={node} />}
       <div className="grid gap-4 xl:grid-cols-3">
         <div className="space-y-4 xl:col-span-2">
           <NodePanel
@@ -834,5 +835,83 @@ function NodeSettingsPanel({ settings, save }: { settings: Settings; save: (s: S
         </div>
       )}
     </Section>
+  )
+}
+
+/** What the node said about ITS OWN identity: the address it derived from the producer key (the one
+ *  to fund) and, once the registration carrier confirmed, the bond outpoint the next start must
+ *  carry. Both are read off the node's log lines — the Studio never derives either itself. */
+function ProducerIdentityCard({ node }: { node: NodeView }) {
+  const [busy, setBusy] = useState<'faucet' | 'bond' | null>(null)
+  const [note, setNote] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  return (
+    <div className="card mb-4 p-4">
+      <h3 className="text-sm font-semibold">Your producer, as the node reports it</h3>
+      {node.pay_address && (
+        <div className="mt-2">
+          <div className="text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">Pay address — fund this to register the bond</div>
+          <div className="mono mt-0.5 break-all text-xs">{node.pay_address}</div>
+          <p className="mt-1 text-[0.7rem] text-ink-500 dark:text-ink-400">
+            Derived by the node from the producer key. Rewards land here and the bond's collateral is spent from
+            here; the <strong>misakascan faucet</strong> hands out 12 MSK once per address, which is enough.
+          </p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button type="button" className="btn-secondary" onClick={() => void navigator.clipboard?.writeText(node.pay_address ?? '')}>
+              Copy the address
+            </button>
+            <button
+              type="button"
+              className="btn-primary"
+              disabled={busy !== null}
+              onClick={async () => {
+                setBusy('faucet')
+                setError(null)
+                setNote(null)
+                try {
+                  const r = await api.faucetFor(node.pay_address ?? '')
+                  setNote(`Faucet: ${JSON.stringify(r)}`)
+                } catch (e) {
+                  setError(e instanceof Error ? e.message : String(e))
+                } finally {
+                  setBusy(null)
+                }
+              }}
+            >
+              {busy === 'faucet' ? 'Asking the faucet…' : 'Request 12 MSK from the faucet'}
+            </button>
+          </div>
+        </div>
+      )}
+      {node.registered_bond && (
+        <div className="mt-3">
+          <div className="text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">Registered bond — carry it on the next start</div>
+          <div className="mono mt-0.5 break-all text-xs">{node.registered_bond}</div>
+          <button
+            type="button"
+            className="btn-secondary mt-2"
+            disabled={busy !== null}
+            onClick={async () => {
+              setBusy('bond')
+              setError(null)
+              setNote(null)
+              try {
+                const current = await api.settings()
+                await api.saveSettings({ ...current, node: { ...current.node, producer_bond: node.registered_bond } })
+                setNote('Saved as node.producer_bond — the next node start mines with this bond.')
+              } catch (e) {
+                setError(e instanceof Error ? e.message : String(e))
+              } finally {
+                setBusy(null)
+              }
+            }}
+          >
+            {busy === 'bond' ? 'Saving…' : 'Save it as the bond outpoint'}
+          </button>
+        </div>
+      )}
+      {note && <p className="mt-2 text-[0.7rem] text-emerald-700 dark:text-emerald-300">{note}</p>}
+      {error && <p className="mt-2 text-[0.7rem] text-red-600 dark:text-red-400">{error}</p>}
+    </div>
   )
 }

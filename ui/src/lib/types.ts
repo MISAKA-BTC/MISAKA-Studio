@@ -361,6 +361,8 @@ export type NodeView = {
   activity: string[]
   blocker: NodeBlocker | null
   mining: MiningState
+  pay_address: string | null
+  registered_bond: string | null
 }
 
 export type NetworkOverview = {
