@@ -307,7 +307,11 @@ impl Default for NodeSettings {
             class_artifact: None,
             appdir: None,
             extra_args: Vec::new(),
-            install_default_class_artifact: true,
+            // Off since testnet-11 Relaunch 5f (2026-09-03): the dense class's material (~750 MB per
+            // job) is above the gossip cap, so its blocks do not cross the public links and a node that
+            // holds the artifact only pays bandwidth for it. Rewards today come from the floor; the
+            // artifact is a click away in Models → Discover when the transport fix lands.
+            install_default_class_artifact: false,
             pool_url: None,
             pool_slot_id: None,
             pool_slot_token: None,

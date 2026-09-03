@@ -12,9 +12,9 @@
 //!
 //! | class | artifact | share |
 //! |---|---|---|
-//! | `PALW-BASE-0` | none — derived from a seed on every node | 600‰ |
-//! | `PALW-QWEN25-A16` | `qwen25-1.5b-a16.palwart`, 1.7 GiB, downloadable | 200‰ |
-//! | `QWEN36` | `qwen36.palwq36`, 34 GiB, downloadable | 200‰ |
+//! | `PALW-BASE-0` | none — derived from a seed on every node | 22‰ |
+//! | `PALW-QWEN25-A16` | `qwen25-1.5b-a16.palwart`, 1.7 GiB, downloadable (chain id graph-v5@512) | 489‰ |
+//! | `QWEN36` | `qwen36.palwq36`, 34 GiB, downloadable (chain id graph-v3) | 489‰ |
 //!
 //! # What this table is, and is not
 //!
@@ -103,30 +103,31 @@ pub const TESTNET11_CLASSES: &[PalwClassSpec] = &[
         description: "The deterministic integer floor. Its artifact is derived from a seed on every node — no GGUF, \
                       no download, no GPU — and it is exempt from the per-class epoch budget, so it can always \
                       produce. The default class when none is named.",
-        share_permille: 600,
+        share_permille: 22,
         // docs/palw-rc-testnet11-launch-runbook.md prints the first half; the id is computed by
         // the node (`shape_profile_id()`), and the Studio shows the node's own value once one is
         // connected.
-        class_id_hex: "c185df95388739dc549777a9ca43866ddf773f1c84df77479a9eb59ba8d1d2b2",
-        class_id_complete: false,
-        // PALW_RC_GENESIS_ARTIFACT_ROOT is likewise derived per-network from the seed; the node
-        // reports it. Empty here rather than a value this table cannot source.
-        artifact_root_hex: "",
+        // testnet-11 Relaunch 5f (2026-09-03, genesis ad30b5cb…): the id and root the public node
+        // reports through `getPalwProducerFacts`; `palw-class ledger --network testnet-11` prints the same.
+        class_id_hex: "f1c5635c6e47e96e7af864789c94523335dc56584af297cb8cc19021c228b897bee1a50145597e45f8ca2727349bf4aa352a98cc05274b7f059a176642f623c8",
+        class_id_complete: true,
+        artifact_root_hex: "bcf2d9eb7357bd6c267df2df6588393ca71c67d7c802903ca7031948303c793dcb78bfe26488f52d0393be08e0cc0777b080e2dce9355d3576036b734545b8df",
         artifact: PalwArtifactSource::DerivedFromSeed,
         is_base: true,
     },
     PalwClassSpec {
         name: "PALW-QWEN25-A16",
-        description: "Qwen2.5-1.5B-Instruct, W8A16 static-PTQ — the dense tier. The published artifact is the \
-                      conversion of the public weights; rebuilding it yourself takes ~3 s over a 2.9 GiB read and \
-                      lands on the same registered root, which is the only reason downloading it is safe.",
-        share_permille: 200,
-        class_id_hex: "",
-        class_id_complete: false,
-        // PALW_RC_GENESIS_QWEN25_A16_ARTIFACT_ROOT, consensus/core/src/config/params.rs — and
-        // printed verbatim in the artifact repository's own card.
-        artifact_root_hex: "c00faa480f2344d4a737e5b2e87ab6064d8d6e42c1ffeb6aa0a14ed62134299a\
-                            7c9dc08f15342cefca1e29390810e6d2c5879f4c3853ebe43a9e2d47ed57ba17",
+        description: "Qwen2.5-1.5B-Instruct, W8A16 static-PTQ — the dense tier, registered on Relaunch 5f as the \
+                      chain model id Qwen/Qwen2.5-1.5B/graph-v5@512 (a 512-token context, canonical job prefill 63 / \
+                      decode 2). The published artifact is the conversion of the public Instruct weights; rebuilding \
+                      it yourself lands on the same inventory root, which is the only reason downloading it is safe.",
+        share_permille: 489,
+        class_id_hex: "4277d84f7d91528cc04aa366d51ee1c2e4f7902c4f6b16a213dead1c7e227977db732f18ed6183db3d944d44726ebd3feff7b15c48f9dba11cd526684f35f1b7",
+        class_id_complete: true,
+        // The chain pins the artifact's INVENTORY root (what `getPalwProducerFacts.artifactRoot`
+        // reports), not the file's artifact digest (`c00faa48…`, printed in the repository card).
+        // Both name the same 1,795,427,276-byte file.
+        artifact_root_hex: "1a7457f100d9fb0f3406d882b4b5bcd7e2ebcccd54edc5268a08c3a85bc6c8d3adacdf345cde3cb72ffe8ed7fe7a2f729d10f00821f94b1e8562e4e217b72708",
         artifact: PalwArtifactSource::Download {
             filename: "qwen25-1.5b-a16.palwart",
             repo_path: "palw-runtime/qwen25-1.5b-a16.palwart",
@@ -143,10 +144,11 @@ pub const TESTNET11_CLASSES: &[PalwClassSpec] = &[
         description: "Qwen3.6-abliterated-35B-A3B under the hybrid integer runtime. The artifact is a 34 GiB \
                       conversion of the Q4_K_M GGUF — downloadable, or reproducible from the source GGUF; every \
                       route lands on the same registered root or the node refuses it.",
-        share_permille: 200,
+        share_permille: 489,
         // Printed in full in docs/testnet11-join-mining.md §6c.
-        class_id_hex: "ec7bbcbffe13f36f1c2c418c65bdab840dd40b2bc22b217522dae836153078dd\
-                       b77a92fb0645d34f98e9e3a1302e4543448a3924b3cd152fc74774ad3f02fb3f",
+        // Relaunch 5f registers the corrected graph (chain model id Qwen3.6-35B-A3B/graph-v3); the
+        // earlier ec7bbcbf… row is not on this chain.
+        class_id_hex: "5bd9ae3d91df80650caffe3126a38bafb0b4feb9b046a416d353a7c3f71af6eab5aadf9b1ce41650007a980f1cc6044ef218424f4cbb8299ef9e92c97b99ef8e",
         class_id_complete: true,
         // PALW_RC_GENESIS_QWEN36_ARTIFACT_ROOT — what `qwen36-run --root-only` must print.
         artifact_root_hex: "f4aad4fd543928eb2d3a737555b09da9bf685fc515c0f8d4520988efcffacf08\
@@ -276,9 +278,12 @@ mod tests {
 
     #[test]
     fn the_registry_snapshot_is_internally_consistent() {
+        // Relaunch 5f (2026-09-03) seats three classes at genesis: the floor, graph-v5@512 and graph-v3.
         assert_eq!(TESTNET11_CLASSES.len(), 3);
+        // The GENESIS rows split the whole emission. A post-genesis entrant carries 0 here —
+        // its share follows production (ADR-0054) and is the chain's to report, not this table's.
         let total: u16 = TESTNET11_CLASSES.iter().map(|c| c.share_permille).sum();
-        assert_eq!(total, 1000, "shares are permille of the whole emission");
+        assert_eq!(total, 1000, "genesis shares are permille of the whole emission");
 
         let base: Vec<_> = TESTNET11_CLASSES.iter().filter(|c| c.is_base).collect();
         assert_eq!(base.len(), 1, "exactly one floor");

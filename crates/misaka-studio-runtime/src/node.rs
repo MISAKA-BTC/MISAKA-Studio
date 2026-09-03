@@ -631,12 +631,12 @@ mod tests {
     #[test]
     fn class_rows_parse_from_the_dump_lines() {
         let row =
-            parse_class_row("[palw-dump]   class=c185df95388739dc base=true  status=Active share=999  budget=1000").expect("parses");
-        assert_eq!(row.class_id, "c185df95388739dc");
+            parse_class_row("[palw-dump]   class=f1c5635c6e47e96e base=true  status=Active share=22  budget=22").expect("parses");
+        assert_eq!(row.class_id, "f1c5635c6e47e96e");
         assert!(row.base);
         assert_eq!(row.status, "Active");
-        assert_eq!(row.share_permille, Some(999));
-        assert_eq!(row.budget_blocks, Some(1000));
+        assert_eq!(row.share_permille, Some(22));
+        assert_eq!(row.budget_blocks, Some(22));
 
         let none = parse_class_row("[palw-dump]   class=ec7bbcbf base=false status=Pending share=NONE budget=0").expect("parses");
         assert_eq!(none.share_permille, None);

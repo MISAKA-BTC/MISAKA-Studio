@@ -136,29 +136,33 @@ on this network there is no separate miner program: **the thing that runs the mo
 that makes the block.**
 
 * **Mining classes, as a list you can act on.** A block on MISAKA is won by verified LLM
-  inference in one of the chain-registered classes — `PALW-BASE-0` (the deterministic floor,
-  600‰, needs nothing), `PALW-QWEN25-A16` (200‰, a 1.7 GiB W8A16 Qwen2.5-1.5B artifact),
-  `QWEN36` (200‰, a 34 GiB Qwen3.6-35B artifact). Both model classes are downloadable and
-  digest-pinned. The list is the top half of **Models → Discover**, above the free-text search,
+  inference in one of the chain-registered classes — on testnet-11 Relaunch 5f (2026-09-03):
+  `PALW-BASE-0` (the deterministic floor, 22‰ of the epoch's blocks, needs nothing),
+  `PALW-QWEN25-A16` (489‰, chain model id `Qwen/Qwen2.5-1.5B/graph-v5@512`, a 1.7 GiB W8A16
+  artifact), `QWEN36` (489‰, chain model id `Qwen3.6-35B-A3B/graph-v3`, a 34 GiB artifact). Both
+  model classes are downloadable and digest-pinned. The list is the top half of **Models → Discover**, above the free-text search,
   because nobody guesses these repository names; each card shows its share, what installs, this
   machine's readiness — including an honest "this machine cannot run this class" when the
   artifact exceeds RAM — and, when a node is running, the class's **live on-chain status** from
   the node's own `--palw-dump-classes` table. The artifact download reuses the model download
   pipeline, verified against the chain-pinned SHA-256.
-* **The default class arrives on first run.** `PALW-QWEN25-A16` is the Studio's default: the
-  first start fetches `qwen25-1.5b-a16.palwart` (1.7 GiB) into the models directory, verified
-  against the digest testnet-11 registered in genesis, and a producer started with no class
-  artifact configured then mines that class rather than the floor. It is a download and not a
-  file in this repository because it cannot be one — GitHub refuses any file over 100 MB, and
-  LFS's free tier is smaller than this single artifact. It appears in the download list like any
-  other and can be cancelled there; **Network → Install the default class artifact on first run**
-  turns it off for a metered connection, or for a machine that will only ever chat.
+* **What a Studio node mines today is the floor.** A producer started without a class named
+  mines `PALW-BASE-0` — no model file, and its per-class difficulty walks toward the model
+  classes' price at every epoch boundary (it starts hard after a relaunch: about one winning
+  draw in 12,700 on 5f's first day, easing ×4 per epoch). The dense class's artifact
+  (`qwen25-1.5b-a16.palwart`, 1.7 GiB, digest-pinned) is available in **Models → Discover**,
+  but **Network → Install the default class artifact on first run** is now off by default:
+  since Relaunch 5f the dense class's execution material (~750 MB per job) is above the network's
+  gossip cap, so its blocks do not cross the public links and holding the artifact only costs
+  bandwidth until that transport fix ships. It is a download and not a file in this repository
+  because GitHub refuses any file over 100 MB.
 * **Mine via pool — no node at all.** The Network tab can join a hosted producer slot
   (`contrib/minerpool/`, deployed at `misakascan.com/pool`): joining creates a real
   `kaspad --palw-produce` on the pool host, and funding the slot's address with 10 MSK is the
   entire remaining setup — the slot registers its own bond and mines the floor class. Testnet
   MSK comes from the **misakascan faucet** (`misakascan.com/faucet`): one 12 MSK grant per
-  address, sized to cover exactly one bond, requestable from the panel with a button. The trade
+  address, requestable from the panel with a button; the chain's own bond minimum is far below
+  that (a floor claim reserves 38,540 sompi until it is Final), so one grant funds the slot. The trade
   is stated in the panel, not buried: the slot's seed lives on the pool host (that is what "no
   node" means), and a copy is written to this machine so the rewards stay recoverable without
   the pool's cooperation.
