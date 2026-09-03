@@ -425,7 +425,14 @@ impl NodeManager {
                 .producer_key_path
                 .as_ref()
                 .ok_or_else(|| Error::bad_request("producing needs node.producer_key_path — generate one with `misaka key gen`"))?;
-            args.push("--palw-produce".into());
+            // **Two runs, not one.** Without a bond this is the REGISTRATION run: `--palw-panel
+            // --palw-register-bond` waits for funds at the pay address, files the carrier, prints
+            // `registered bond <txid>:<i>` and stops. `--palw-produce` is deliberately absent from
+            // it: on a ConsensusV2 network a producer without a fee outpoint is refused at startup
+            // ("needs a way to carry lifecycle objects"), and a first run has none yet — the
+            // registration carrier's change is what the panel then persists as one. With a bond
+            // this is the PRODUCING run, and the persisted outpoint (or `fee_outpoint`) carries.
+            // The same two phases the hosted pool's `run-slot.sh` runs.
             args.push("--palw-panel".into());
             args.push(format!("--palw-producer-key={}", key.display()));
             // Optional since the node derives the key's own address when the flag is absent
@@ -436,10 +443,10 @@ impl NodeManager {
                 args.push(format!("--palw-producer-pay-address={pay}"));
             }
             match &settings.producer_bond {
-                Some(bond) => args.push(format!("--palw-producer-bond={bond}")),
-                // On the public network a first run registers the bond; the node prints the
-                // outpoint to keep. On devnet the genesis registry seats the initial set, so a
-                // bond outpoint may legitimately be absent.
+                Some(bond) => {
+                    args.push("--palw-produce".into());
+                    args.push(format!("--palw-producer-bond={bond}"));
+                }
                 None => args.push("--palw-register-bond".into()),
             }
             if let Some(outpoint) = &settings.fee_outpoint {
@@ -734,6 +741,11 @@ mod tests {
         let register = NodeManager::build_args(&settings, 28210).expect("builds").join(" ");
         assert!(register.contains("--palw-register-bond"));
         assert!(!register.contains("--palw-producer-bond="));
+        // The registration run must not produce: a ConsensusV2 node refuses `--palw-produce`
+        // without a fee outpoint, and a first run has none until its own carrier confirms.
+        // As a whole token: `--palw-producer-key=…` also starts with these bytes.
+        assert!(!register.split(' ').any(|a| a == "--palw-produce"), "{register}");
+        assert!(register.contains("--palw-panel"));
 
         settings.producer_bond = Some("abc123:0".into());
         settings.fee_outpoint = Some("abc123:1".into());
