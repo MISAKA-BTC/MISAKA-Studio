@@ -2148,7 +2148,7 @@ dependencies = [
 
 [[package]]
 name = "misaka-studio-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "blake2b_simd",
  "hex",
@@ -2162,7 +2162,7 @@ dependencies = [
 
 [[package]]
 name = "misaka-studio-desktop"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -2173,7 +2173,7 @@ dependencies = [
 
 [[package]]
 name = "misaka-studio-runtime"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
