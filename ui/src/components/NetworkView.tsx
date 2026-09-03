@@ -730,6 +730,8 @@ function RolesPanel({ role, supervised }: { role: string; supervised: boolean })
 
 function NodeSettingsPanel({ settings, save }: { settings: Settings; save: (s: Settings) => Promise<void> }) {
   const [draft, setDraft] = useState(settings.node)
+  const [keyBusy, setKeyBusy] = useState(false)
+  const [keyError, setKeyError] = useState<string | null>(null)
   useEffect(() => setDraft(settings.node), [settings.node])
   const dirty = JSON.stringify(draft) !== JSON.stringify(settings.node)
 
@@ -767,10 +769,32 @@ function NodeSettingsPanel({ settings, save }: { settings: Settings; save: (s: S
 
       {draft.role === 'producer' && (
         <>
-          <Field label="Producer key file" hint="32-byte ML-DSA-87 seed — generate with `misaka key gen`. The Studio passes the path; it never reads the key.">
-            <input className="input mt-1" placeholder="~/.misaka/miner.seed" value={draft.producer_key_path ?? ''} onChange={(e) => set('producer_key_path', text(e.target.value))} />
+          <Field label="Producer key file" hint="32-byte ML-DSA-87 seed. Generate one here (written 0600 under the Studio's data directory, never shown), or bring your own (`misaka key gen`). The Studio passes the path; it never reads the file after writing it.">
+            <div className="mt-1 flex gap-2">
+              <input className="input flex-1" placeholder="~/.misaka/miner.seed" value={draft.producer_key_path ?? ''} onChange={(e) => set('producer_key_path', text(e.target.value))} />
+              <button
+                type="button"
+                className="btn-secondary whitespace-nowrap"
+                disabled={keyBusy}
+                onClick={async () => {
+                  setKeyBusy(true)
+                  setKeyError(null)
+                  try {
+                    const r = await api.producerKey()
+                    set('producer_key_path', r.producer_key_path)
+                  } catch (e) {
+                    setKeyError(e instanceof Error ? e.message : String(e))
+                  } finally {
+                    setKeyBusy(false)
+                  }
+                }}
+              >
+                {keyBusy ? 'Generating…' : 'Generate a key here'}
+              </button>
+            </div>
+            {keyError && <p className="mt-1 text-[0.7rem] text-red-600 dark:text-red-400">{keyError}</p>}
           </Field>
-          <Field label="Pay address" hint="Where rewards are paid, and where collateral returns when the bond retires.">
+          <Field label="Pay address" hint="Optional. Empty = the key's own address, which the node derives and prints at start (fund THAT address for the bond). Set it only to send rewards elsewhere.">
             <input className="input mt-1" placeholder="misakatest:…" value={draft.mining_address ?? ''} onChange={(e) => set('mining_address', text(e.target.value))} />
           </Field>
           <Field label="Bond outpoint" hint="txid:index, printed once by the registration run. Empty = the next start registers a bond and prints it.">

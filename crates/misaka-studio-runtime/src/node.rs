@@ -396,13 +396,16 @@ impl NodeManager {
                 .producer_key_path
                 .as_ref()
                 .ok_or_else(|| Error::bad_request("producing needs node.producer_key_path — generate one with `misaka key gen`"))?;
-            let pay = settings.mining_address.as_ref().ok_or_else(|| {
-                Error::bad_request("producing needs node.mining_address — the ML-DSA-87 address rewards are paid to")
-            })?;
             args.push("--palw-produce".into());
             args.push("--palw-panel".into());
             args.push(format!("--palw-producer-key={}", key.display()));
-            args.push(format!("--palw-producer-pay-address={pay}"));
+            // Optional since the node derives the key's own address when the flag is absent
+            // (kaspad, 2026-09-04): rewards and the panel's carrier funding then share one
+            // address, which is the only arrangement that works without a second tool. A value
+            // here is an operator sending rewards elsewhere on purpose.
+            if let Some(pay) = settings.mining_address.as_ref() {
+                args.push(format!("--palw-producer-pay-address={pay}"));
+            }
             match &settings.producer_bond {
                 Some(bond) => args.push(format!("--palw-producer-bond={bond}")),
                 // On the public network a first run registers the bond; the node prints the

@@ -26,6 +26,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/node/reset", post(reset_node))
         .route("/node/stop", post(stop_node))
         .route("/node/log", get(node_log))
+        .route("/producer-key", post(producer_key))
 }
 
 /// The whole network picture in one response — what the UI's Network tab renders.
@@ -258,4 +259,45 @@ mod tests {
 
         assert_eq!(default_class_artifact(dir.path()).await, Some(path));
     }
+}
+
+/// `POST /api/v1/network/producer-key` — mint the producer's ML-DSA-87 seed on this machine.
+///
+/// A bonded producer is a key: the seed derives the verification key a bond is registered under,
+/// signs every attempt, and — since the node derives the pay address from it — is the address
+/// rewards land at. The Studio writes 32 bytes from the OS random source as hex into a 0600 file
+/// under the data directory (the node refuses any looser mode) and points `node.producer_key_path`
+/// at it. It never reads the file back and never returns the seed: the response names the path,
+/// and the address appears in the node's own log once it starts. Refuses to overwrite an existing
+/// seed — a producer key that is replaced silently is a bond that can no longer sign.
+async fn producer_key(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>> {
+    let settings = state.settings.read().await.clone();
+    let path = state.data_dir.join("producer.seed");
+    if path.exists() {
+        return Err(Error::bad_request(format!(
+            "a producer seed already exists at {} — remove it yourself if you mean to replace the key",
+            path.display()
+        )));
+    }
+    // Two v4 UUIDs are 32 bytes from the OS random source (`getrandom`), which is the same well
+    // `misaka key gen` draws from; the version/variant nibbles cost 6 bits of the 256, which is
+    // why this is not a UUID and is not shown as one.
+    let mut seed = [0u8; 32];
+    seed[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    seed[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    let hex = hex::encode(seed);
+    std::fs::create_dir_all(&state.data_dir).map_err(|e| Error::io(state.data_dir.display(), e))?;
+    std::fs::write(&path, format!("{hex}\n")).map_err(|e| Error::io(path.display(), e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| Error::io(path.display(), e))?;
+    }
+    let mut new = settings.clone();
+    new.node.producer_key_path = Some(path.clone());
+    state.apply_settings(new).await?;
+    Ok(Json(serde_json::json!({
+        "producer_key_path": path.display().to_string(),
+        "next": "start the node as a producer: it registers a bond under this key and prints the address to fund",
+    })))
 }

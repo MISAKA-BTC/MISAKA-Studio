@@ -251,11 +251,14 @@ pub struct NodeSettings {
     pub rpc_url: Option<String>,
     pub network: NodeNetwork,
     pub role: NetworkRole,
-    /// Coinbase payout address for producing. An address, not a key — the Studio never holds
-    /// wallet key material.
+    /// Coinbase payout address for producing. `None` = the producer key's own address, which the
+    /// node derives and prints at start (`[palw] producer pay address …`); set it only to send
+    /// rewards elsewhere. An address, not a key — the Studio never holds wallet key material.
     pub mining_address: Option<String>,
-    /// Path to the producer's 32-byte ML-DSA-87 seed file (`misaka key gen`). A path the node
-    /// reads — the Studio passes it on the command line and never opens the file.
+    /// Path to the producer's 32-byte ML-DSA-87 seed file — `POST /api/v1/network/producer-key`
+    /// writes one (0600) under the data directory, or bring your own (`misaka key gen`). A path
+    /// the node reads — the Studio passes it on the command line and never opens the file after
+    /// writing it.
     pub producer_key_path: Option<PathBuf>,
     /// The bond outpoint (`<txid>:<index>`) printed once by the registration run. Absent means
     /// the next producer start registers a bond instead of mining with one.
