@@ -166,6 +166,16 @@ that makes the block.**
   is stated in the panel, not buried: the slot's seed lives on the pool host (that is what "no
   node" means), and a copy is written to this machine so the rewards stay recoverable without
   the pool's cooperation.
+* **Your own node, your own key — no CLI.** Network → Producer: **Generate a key here** writes a
+  32-byte ML-DSA-87 seed (0600, under the Studio's data directory, never shown) and points the
+  producer at it. Start the node: with no pay address set it derives the key's own address and
+  prints it (`[palw] producer pay address …`), registers a bond under that key once the address
+  holds funds (the faucet's 12 MSK is enough), and mines the floor. The seed file is the bond —
+  back it up; the Studio never reads it again. This needs a `kaspad` the Studio can find: beside
+  `misaka-studiod`, on `PATH`, or named in **Network → Node configuration → kaspad path** — built
+  from the [misakas](https://github.com/MISAKA-BTC/misakas) repository at the chain's current
+  release (`cargo build --release -p kaspad`), or a release binary dropped in place. A node built
+  from another chain's genesis is refused at the handshake, not merely slow.
 * **Observer** — point the tab at any reachable node RPC and read the chain.
 * **Verifier** — run a full node; on this chain syncing *is* verifying, no bond required. With a
   bonded key the same node takes panel duty and files receipts on producers' claims.
