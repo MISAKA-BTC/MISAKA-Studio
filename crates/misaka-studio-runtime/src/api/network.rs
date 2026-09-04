@@ -273,6 +273,18 @@ mod tests {
 /// seed — a producer key that is replaced silently is a bond that can no longer sign.
 async fn producer_key(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>> {
     let settings = state.settings.read().await.clone();
+    // **Never mint a key while a node is running under the old one.** The seed IS the bond: a
+    // supervised producer signs its attempts with the key it started with, and a bond registered
+    // by that key cannot be signed for by any other. Minting here would leave the running node
+    // producing under a key the settings no longer name, and the failure surfaces much later as
+    // the node's own "the local signing key is not the one this bond registered" — which is
+    // exactly what a rehearsal hit on 2026-09-04 after its data directory was recreated under a
+    // still-running daemon.
+    if state.node.is_supervising().await {
+        return Err(Error::bad_request(
+            "a node is running under the current producer key — stop it before minting another, or its bond becomes unsignable",
+        ));
+    }
     let path = state.data_dir.join("producer.seed");
     if path.exists() {
         return Err(Error::bad_request(format!(
