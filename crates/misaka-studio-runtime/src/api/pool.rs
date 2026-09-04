@@ -30,8 +30,15 @@ const DEFAULT_POOL_URL: &str = "https://misakascan.com/pool";
 /// `POST /api/v1/network/faucet` `{ "address": "misakatest:…" }` — the faucet at the pool's origin,
 /// for an address that is not a slot's: the own-node path's, which the node prints at start.
 /// Same pass-through as [`faucet`]: the faucet's answer is the answer.
-pub async fn faucet_for_address(State(state): State<Arc<AppState>>, Json(body): Json<serde_json::Value>) -> Result<Json<serde_json::Value>> {
-    let address = body.get("address").and_then(|v| v.as_str()).filter(|a| a.contains(':')).ok_or_else(|| Error::bad_request("faucet needs an address"))?;
+pub async fn faucet_for_address(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>> {
+    let address = body
+        .get("address")
+        .and_then(|v| v.as_str())
+        .filter(|a| a.contains(':'))
+        .ok_or_else(|| Error::bad_request("faucet needs an address"))?;
     let url = state.settings.read().await.node.pool_url.clone().unwrap_or_else(|| DEFAULT_POOL_URL.to_string());
     let origin = pool_origin(&url);
     let response = http()
