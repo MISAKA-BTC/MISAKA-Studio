@@ -8,7 +8,7 @@ import { useEffect, useState } from 'react'
 import logo from '../assets/misaka-logo.png'
 import { api } from '../lib/api'
 import { relativeTime } from '../lib/format'
-import type { MiningState } from '../lib/types'
+import type { Effort, MiningState } from '../lib/types'
 import { useStudio, type View } from '../store/studio'
 import { Icon, type IconName } from './common'
 
@@ -23,13 +23,17 @@ import { Icon, type IconName } from './common'
  */
 function MiningLight() {
   const [mining, setMining] = useState<MiningState | null>(null)
+  const [effort, setEffort] = useState<Effort | null>(null)
 
   useEffect(() => {
     let live = true
     const read = async () => {
       try {
         const overview = await api.network()
-        if (live) setMining(overview.node.mining)
+        if (live) {
+          setMining(overview.node.mining)
+          setEffort(overview.node.effort)
+        }
       } catch {
         if (live) setMining(null)
       }
@@ -63,7 +67,11 @@ function MiningLight() {
         <span className="size-2 shrink-0 rounded-full bg-amber-500" />
       )}
       <span className="min-w-0 flex-1 truncate">
-        {producing ? `Mining · ${mining.blocks} block${mining.blocks === 1 ? '' : 's'}` : 'Producer running · nothing won yet'}
+        {producing
+          ? `Mining · ${mining.blocks} block${mining.blocks === 1 ? '' : 's'}`
+          : effort && effort.draws > 0
+            ? `Mining · ${effort.draws.toLocaleString()} draw${effort.draws === 1 ? '' : 's'}`
+            : 'Producer running · nothing won yet'}
       </span>
     </div>
   )
