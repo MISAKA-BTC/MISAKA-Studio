@@ -335,6 +335,9 @@ export type NodeStatus = {
   peer_count: number | null
   mempool_size: number | null
   sink: string | null
+  sink_timestamp_ms: number | null
+  sink_algo_id: number | null
+  sink_stand_down_secs: number | null
   error: string | null
 }
 

@@ -16,7 +16,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { PromptMiningPanel } from './PromptMiningPanel'
 import { api } from '../lib/api'
 import { bytes, count, shortHash } from '../lib/format'
-import type { Effort, MiningState, NetworkOverview, NodeClassRow, NodeView, PalwClassStatus, PoolStatus, Settings } from '../lib/types'
+import type { Effort, MiningState, NetworkOverview, NodeClassRow, NodeStatus, NodeView, PalwClassStatus, PoolStatus, Settings } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { CopyButton, EmptyState, Field, Icon, Section, Spinner, Toggle } from './common'
 
@@ -197,6 +197,40 @@ function effortLine(effort: Effort): string {
   return `Working: ${draws}. One draw in ${one_in} wins this class's ticket, and a ticket still has to beat the network's difficulty.`
 }
 
+/** How long since the newest block, and whether a still chain right now is normal. */
+function ChainClock({ status }: { status: NodeStatus }) {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [])
+  if (status.sink_timestamp_ms === null) return null
+  const age = Math.max(0, Math.round((now - status.sink_timestamp_ms) / 1000))
+  const ago = age < 90 ? `${age}s` : age < 5400 ? `${Math.round(age / 60)} min` : `${(age / 3600).toFixed(1)} h`
+  const standDown = status.sink_stand_down_secs
+  // The heartbeat lane is the chain's clock and it runs at two speeds. After a BONDED block it
+  // stands down for an hour, so the score can sit unchanged while the network is perfectly
+  // healthy — the state this node was in for most of an hour after it won its first block, with
+  // nothing on screen to say so.
+  const quietByDesign = standDown !== null && standDown > 600
+  return (
+    <div className="mt-2 rounded-lg bg-ink-100 p-2 text-[0.7rem] dark:bg-ink-800/60">
+      <span className="text-ink-700 dark:text-ink-200">Newest block {ago} ago</span>
+      {quietByDesign && (
+        <span className="text-ink-500 dark:text-ink-400">
+          {' '}— and it is a block someone won, so the heartbeat lane stands down for an hour. Until then the
+          chain only moves when a block is won: a still score here is the network producing, not a stalled node.
+        </span>
+      )}
+      {standDown !== null && !quietByDesign && (
+        <span className="text-ink-500 dark:text-ink-400">
+          {' '}— the newest block is a heartbeat, so the chain is running on its own clock at {standDown}s.
+        </span>
+      )}
+    </div>
+  )
+}
+
 function MiningBanner({ mining, effort }: { mining: MiningState; effort: Effort | null; pool: null }) {
   if (mining.state === 'producing') {
     return (
@@ -332,6 +366,7 @@ function NodePanel({
           <StatRow label="Difficulty" value={status.difficulty ? count(status.difficulty) : '—'} />
         </dl>
       )}
+      {status.sink_timestamp_ms !== null && <ChainClock status={status} />}
       {status.sink && (
         <p className="mono mt-2 truncate text-[0.65rem] text-ink-500 dark:text-ink-400" title={status.sink}>
           sink {shortHash(status.sink, 16, 8)}

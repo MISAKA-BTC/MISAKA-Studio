@@ -137,6 +137,15 @@ pub struct NodeStatus {
     pub peer_count: Option<usize>,
     pub mempool_size: Option<u64>,
     pub sink: Option<String>,
+    /// The sink block's header timestamp, ms. With the wall clock this says how long the chain has
+    /// been still — the one number that separates "quiet by design" from "stopped".
+    pub sink_timestamp_ms: Option<u64>,
+    /// The sink block's lane (`powAlgoId`). It decides how long the heartbeat lane will wait
+    /// before it moves the chain on its own: see [`heartbeat_stand_down_secs`].
+    pub sink_algo_id: Option<u8>,
+    /// How long the heartbeat lane will hold off, given that lane — the consensus rule resolved
+    /// here rather than re-spelled in the UI, so there is one copy of it.
+    pub sink_stand_down_secs: Option<u64>,
     /// Why the node is unreachable, when it is.
     pub error: Option<String>,
 }
@@ -169,6 +178,18 @@ pub async fn query_status(url: &str) -> NodeStatus {
         status.header_count = dag.get("headerCount").and_then(Value::as_u64);
         status.difficulty = dag.get("difficulty").and_then(Value::as_f64);
         status.sink = dag.get("sink").and_then(Value::as_str).map(str::to_string);
+    }
+    // The sink's own header, for its timestamp and lane. A second call because getBlockDagInfo
+    // names the sink and says nothing else about it.
+    if let Some(sink) = status.sink.clone() {
+        if let Ok(answer) =
+            wrpc_call(url, "getBlock", json!({ "hash": sink, "includeTransactions": false }), timeout).await
+        {
+            let header = answer.get("block").unwrap_or(&answer).get("header").cloned().unwrap_or(Value::Null);
+            status.sink_timestamp_ms = header.get("timestamp").and_then(Value::as_u64);
+            status.sink_algo_id = header.get("powAlgoId").and_then(Value::as_u64).map(|id| id as u8);
+            status.sink_stand_down_secs = status.sink_algo_id.and_then(heartbeat_stand_down_secs);
+        }
     }
     if let Ok(peers) = wrpc_call(url, "getConnectedPeerInfo", json!({}), timeout).await {
         status.peer_count = peers.get("peerInfo").and_then(Value::as_array).map(Vec::len);
@@ -348,6 +369,27 @@ pub(crate) fn rewards_from_utxos(value: &Value, virtual_daa: u64) -> Rewards {
         }
     }
     rewards
+}
+
+/// **How long the heartbeat lane will stay out of the way, given the lane of the newest block.**
+///
+/// The heartbeat lane is the chain's clock, and it deliberately runs at two speeds
+/// (`palw_heartbeat_v1.rs`): when the newest block is a BONDED one — an attempt block (algo 6 or
+/// 9) or a receipt (7) — the chain is demonstrably producing and the lane stands down for a full
+/// hour; when the newest block is itself a heartbeat, the chain is running on the clock alone and
+/// the lane returns to the 120 s cadence.
+///
+/// This matters to a person watching a miner far more than it looks. After this node won its first
+/// block on 2026-09-04 the DAA score sat unchanged for the best part of an hour, and nothing said
+/// that a still chain right then was the network working exactly as designed rather than a node
+/// that had died. `None` for a lane this does not know, so the app says nothing rather than
+/// guessing.
+pub(crate) fn heartbeat_stand_down_secs(sink_algo_id: u8) -> Option<u64> {
+    match sink_algo_id {
+        6 | 7 | 9 => Some(3_600), // HEARTBEAT_NOMINAL_INTERVAL_MS
+        8 => Some(120),           // HEARTBEAT_RECOVERY_INTERVAL_MS
+        _ => None,
+    }
 }
 
 pub(crate) fn stale_chain_line(log: &VecDeque<String>) -> Option<String> {
@@ -900,6 +942,18 @@ mod tests {
         // A line with no odds is still a draw count — the odds are absent, not zero.
         assert_eq!(parse_effort("[palw-producer] 7 draws this run, 0 produced").map(|e| (e.draws, e.ticket_one_in)), Some((7, None)));
         assert!(parse_effort("[palw-producer] holding: no bond").is_none(), "no report, no claim");
+    }
+
+    #[test]
+    fn the_stand_down_follows_the_newest_block_s_lane() {
+        // A bonded block — attempt (6, 9) or receipt (7) — buys the chain an hour of quiet.
+        for bonded in [6u8, 7, 9] {
+            assert_eq!(heartbeat_stand_down_secs(bonded), Some(3_600), "lane {bonded} is bonded");
+        }
+        // A heartbeat parent means the chain is running on its clock, at cadence.
+        assert_eq!(heartbeat_stand_down_secs(8), Some(120));
+        // Anything else: no claim. Genesis (1) is not a lane this rule speaks about.
+        assert_eq!(heartbeat_stand_down_secs(1), None);
     }
 
     #[test]
