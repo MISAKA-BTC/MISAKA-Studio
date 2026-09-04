@@ -165,7 +165,9 @@ that makes the block.**
   that (a floor claim reserves 38,540 sompi until it is Final), so one grant funds the slot. The trade
   is stated in the panel, not buried: the slot's seed lives on the pool host (that is what "no
   node" means), and a copy is written to this machine so the rewards stay recoverable without
-  the pool's cooperation.
+  the pool's cooperation. **A won block's reward is escrowed until its claim is Final** — a panel of
+  bonded seats licenses it and a challenge window passes (bind + receipt + challenge, ≈ 2,400 DAA);
+  a voided claim burns its reward instead of paying it. The panel says so beside the count.
 * **Your own node, your own key — no CLI.** Network → Producer: **Generate a key here** writes a
   32-byte ML-DSA-87 seed (0600, under the Studio's data directory, never shown) and points the
   producer at it. Start the node: with no pay address set it derives the key's own address and

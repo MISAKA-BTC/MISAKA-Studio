@@ -198,7 +198,7 @@ function MiningBanner({ mining }: { mining: MiningState; pool: null }) {
           <span className="relative inline-flex size-3 rounded-full bg-emerald-500" />
         </span>
         <div className="min-w-0 flex-1">
-          <p className="text-sm font-semibold text-emerald-900 dark:text-emerald-200">Mining — this machine is producing blocks</p>
+          <p className="text-sm font-semibold text-emerald-900 dark:text-emerald-200">Mining — this machine is producing blocks (pay is escrowed until each claim is Final)</p>
           <p className="mt-0.5 text-xs text-emerald-800 dark:text-emerald-300">
             {mining.blocks} block{mining.blocks === 1 ? '' : 's'} since this node started
             {mining.latest_number !== null && <> · latest is the chain&apos;s #{mining.latest_number}</>}
@@ -633,6 +633,14 @@ function PoolPanel() {
             <div className="tabular-nums">{pool.blocks_won}</div>
           </div>
         </div>
+        {pool.blocks_won > 0 && (
+          <p className="mt-2 text-[0.7rem] leading-relaxed text-ink-500 dark:text-ink-400">
+            A won block's reward is <strong>held in escrow until its claim is Final</strong> — the panel of bonded seats
+            has to license it and the challenge window has to pass (bind + receipt + challenge, about 2,400 DAA on this
+            network). Until then the balance above is the funding you sent, not pay; a claim that is voided burns its
+            reward rather than paying it.
+          </p>
+        )}
         {pool.phase === 'awaiting_funds' && (
           <div className="rounded-lg bg-amber-50 p-2 dark:bg-amber-950/40">
             <p className="text-[0.7rem] text-amber-800 dark:text-amber-300">
