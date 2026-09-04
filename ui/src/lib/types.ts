@@ -346,7 +346,9 @@ export type NodeClassRow = {
   budget_blocks: number | null
 }
 
-export type NodeBlocker = { kind: 'stale_chain_data'; said: string }
+export type NodeBlocker =
+  | { kind: 'stale_chain_data'; said: string }
+  | { kind: 'refused_arguments'; said: string }
 
 export type MiningState =
   | { state: 'not_mining' }

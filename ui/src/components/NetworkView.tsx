@@ -296,6 +296,7 @@ function NodePanel({
       {/* Before the "no kaspad" hint: this node HAS a binary and it ran — it stopped for a reason
           it stated, and the reason has a remedy. Leaving it under a connection-refused line was
           how a re-minted testnet looked like a broken install. */}
+      {overview.node.blocker?.kind === 'refused_arguments' && <RefusedArgumentsPanel said={overview.node.blocker.said} />}
       {overview.node.blocker?.kind === 'stale_chain_data' && <StaleChainPanel said={overview.node.blocker.said} busy={busy} onReset={onReset} />}
 
       {!overview.kaspad_found && !status.reachable && (
@@ -336,6 +337,22 @@ function NodePanel({
  * asked it in. The action is separate from Start for the same reason — no field left unset can
  * reach it by accident.
  */
+/** The node parsed nothing and exited. Every value on that line came from this app, so the person
+ *  who can fix it is the one reading this — the node's own sentence, and where to change it. */
+function RefusedArgumentsPanel({ said }: { said: string }) {
+  return (
+    <div className="card mb-4 border border-red-200 p-4 dark:border-red-900/60">
+      <h3 className="text-sm font-semibold text-red-700 dark:text-red-300">The node refused its command line</h3>
+      <p className="mono mt-2 break-all rounded-lg bg-ink-900 p-2 text-[0.7rem] text-ink-200 dark:bg-black/50">{said}</p>
+      <p className="mt-2 text-[0.7rem] leading-relaxed text-ink-500 dark:text-ink-400">
+        It exited before opening its RPC, which is why nothing answered. Every flag on that line comes from
+        <strong> Node configuration</strong> below — most often <strong>Extra arguments</strong> repeating a flag the
+        producer role already passes (the exact command is shown there; copy it and read the pair).
+      </p>
+    </div>
+  )
+}
+
 function StaleChainPanel({ said, busy, onReset }: { said: string; busy: boolean; onReset: () => void }) {
   return (
     <div className="mt-3 rounded-lg bg-amber-50 p-3 dark:bg-amber-950/40">

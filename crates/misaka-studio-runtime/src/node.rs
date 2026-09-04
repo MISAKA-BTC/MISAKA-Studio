@@ -274,6 +274,22 @@ pub(crate) fn stale_chain_line(log: &VecDeque<String>) -> Option<String> {
     log.iter().rev().find(|line| line.contains("Genesis not found in active consensus DB")).cloned()
 }
 
+/// The argument the node refused, from the clap error it printed before exiting.
+///
+/// Matched on clap's own prefix rather than on any flag name: the set of ways a command line can
+/// be wrong is the node's to define, and a list here would go stale the first time a flag is
+/// added. A usage banner alone is not evidence — the `error:` line is.
+pub(crate) fn refused_arguments_line(log: &VecDeque<String>) -> Option<String> {
+    log.iter()
+        .rev()
+        .find(|line| {
+            let l = line.trim_start();
+            l.starts_with("error: ")
+                && (l.contains("argument") || l.contains("unexpected") || l.contains("value") || l.contains("required"))
+        })
+        .cloned()
+}
+
 /// How many log lines the supervisor keeps, and how many activity lines.
 const LOG_CAPACITY: usize = 600;
 const ACTIVITY_CAPACITY: usize = 120;
@@ -364,6 +380,17 @@ pub enum NodeBlocker {
     StaleChainData {
         /// The line the node printed, verbatim — the remedy is destructive, so the evidence for
         /// it is shown rather than summarised.
+        said: String,
+    },
+    /// The node refused the command line and exited before it opened anything. Every value on
+    /// that line came from this app's settings, so the person who can fix it is looking at the
+    /// screen — but the RPC poll only ever reported "nothing answered", and the reason sat in a
+    /// log nobody opens. Seen for real on 2026-09-04: an operator's `extra_args` repeated a flag
+    /// the producer role already passes (`--palw-panel`), kaspad answered "the argument
+    /// '--palw-panel' cannot be used multiple times", and the tab showed a node that simply
+    /// never came up.
+    RefusedArguments {
+        /// The node's own words, verbatim.
         said: String,
     },
 }
@@ -607,7 +634,12 @@ impl NodeManager {
         let blocker = (!status.reachable)
             .then(|| {
                 let logs = self.logs.lock().expect("log lock");
-                stale_chain_line(&logs.log).map(|said| NodeBlocker::StaleChainData { said })
+                // A refused command line is checked first: it is the more specific fact, and a
+                // node that never parsed its arguments never reached the chain it would have
+                // called stale.
+                refused_arguments_line(&logs.log)
+                    .map(|said| NodeBlocker::RefusedArguments { said })
+                    .or_else(|| stale_chain_line(&logs.log).map(|said| NodeBlocker::StaleChainData { said }))
             })
             .flatten();
         Ok(NodeView { status, role, command_line, classes_from_node, activity, blocker, mining, pay_address, registered_bond })
@@ -666,6 +698,24 @@ async fn drain_node<R: tokio::io::AsyncRead + Unpin>(stream: R, logs: Arc<Mutex<
 mod tests {
     use super::*;
     use misaka_studio_core::settings::NodeSettings;
+
+    #[test]
+    fn a_refused_command_line_is_a_blocker_with_the_nodes_own_words() {
+        let mut log = VecDeque::new();
+        log.push_back("error: the argument '--palw-panel' cannot be used multiple times".to_string());
+        log.push_back(String::new());
+        log.push_back("Usage: kaspad [OPTIONS]".to_string());
+        assert_eq!(
+            refused_arguments_line(&log).as_deref(),
+            Some("error: the argument '--palw-panel' cannot be used multiple times")
+        );
+        // A usage banner without the error line is not evidence of which argument was wrong.
+        let banner: VecDeque<String> = ["Usage: kaspad [OPTIONS]".to_string()].into_iter().collect();
+        assert_eq!(refused_arguments_line(&banner), None);
+        // An ordinary runtime error is not an argument refusal.
+        let runtime: VecDeque<String> = ["error: cannot write /var/lib/misaka/liveness.json".to_string()].into_iter().collect();
+        assert_eq!(refused_arguments_line(&runtime), None);
+    }
 
     #[test]
     fn the_pay_address_and_the_registered_bond_are_read_off_the_node_lines() {
