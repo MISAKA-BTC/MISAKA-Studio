@@ -265,6 +265,13 @@ pub(crate) fn mining_state(log: &VecDeque<String>, role: NetworkRole, reachable:
             }
         } else if let Some(rest) = line.split("[palw-producer] holding: ").nth(1) {
             holding = Some(rest.trim().to_string());
+        } else if line.contains("[palw-producer]") && line.contains(" draws this run") {
+            // **A draw clears a hold.** The producer prints its holds and, since the node learned
+            // to count (2026-09-04), a periodic "N draws this run, M produced …" line while it is
+            // drawing. Without this, the hold a node announced in its first seconds — usually
+            // `peers=false` before the anchors answer — stayed on the app's face for the rest of
+            // the run, telling a person their machine was stopped while it was mining.
+            holding = None;
         }
     }
     if blocks > 0 { MiningState::Producing { blocks, latest_number } } else { MiningState::Starting { holding } }
@@ -698,6 +705,29 @@ async fn drain_node<R: tokio::io::AsyncRead + Unpin>(stream: R, logs: Arc<Mutex<
 mod tests {
     use super::*;
     use misaka_studio_core::settings::NodeSettings;
+
+    #[test]
+    fn a_draw_after_a_hold_clears_it() {
+        let mut log = VecDeque::new();
+        log.push_back(
+            "[palw-producer] holding: the mining rule engine says this node should not mine [enable_unsynced_mining=false peers=false participation_allowed=true]".to_string(),
+        );
+        assert!(
+            matches!(mining_state(&log, NetworkRole::Producer, true), MiningState::Starting { holding: Some(_) }),
+            "a hold with nothing after it stands"
+        );
+        log.push_back(
+            "[palw-producer] 12 draws this run, 0 produced, 0 won the class ticket and lost the network draw against bits; class ticket p = 7.896e-5 per draw".to_string(),
+        );
+        assert_eq!(
+            mining_state(&log, NetworkRole::Producer, true),
+            MiningState::Starting { holding: None },
+            "a draw after the hold means the node is drawing, whatever it said a minute ago"
+        );
+        // A hold AFTER the draws is the current state again.
+        log.push_back("[palw-producer] holding: the named bond is not registered on this chain".to_string());
+        assert!(matches!(mining_state(&log, NetworkRole::Producer, true), MiningState::Starting { holding: Some(_) }));
+    }
 
     #[test]
     fn a_refused_command_line_is_a_blocker_with_the_nodes_own_words() {
