@@ -347,6 +347,11 @@ pub struct NodeView {
     /// The bond outpoint the node printed when its registration carrier confirmed. `None` until
     /// the node says it; the settings' `producer_bond` should be set to it before the next start.
     pub registered_bond: Option<String>,
+    /// What the chain holds at the pay address, in sompi, read from the node's own utxo index
+    /// (`getBalanceByAddress`). `None` when there is no address yet or the node did not answer.
+    /// This is the number a person means by "have I been paid" — it includes the funds they sent
+    /// to register the bond, and it grows by a block's reward only once that claim is Final.
+    pub pay_balance_sompi: Option<u64>,
 }
 
 /// **Is this machine mining?** — one question, answered from the node's own output.
@@ -628,6 +633,19 @@ impl NodeManager {
             let logs = self.logs.lock().expect("log lock");
             (logs.pay_address.clone(), logs.registered_bond.clone())
         };
+        // Asked of the node the Studio is already talking to, not of an explorer: the answer is the
+        // one this machine's own chain view holds, and it is absent rather than wrong when the node
+        // is unreachable or has no utxo index.
+        let pay_balance_sompi = match (&pay_address, status.reachable) {
+            (Some(address), true) => {
+                let url = normalize_rpc_url(settings.rpc_url.as_deref().unwrap_or(""), settings.network);
+                wrpc_call(&url, "getBalanceByAddress", serde_json::json!({ "address": address }), Duration::from_secs(4))
+                    .await
+                    .ok()
+                    .and_then(|v| v.get("balance").and_then(serde_json::Value::as_u64))
+            }
+            _ => None,
+        };
         let (classes_from_node, activity) = {
             let logs = self.logs.lock().expect("log lock");
             (logs.classes.clone(), logs.activity.iter().cloned().collect())
@@ -649,7 +667,18 @@ impl NodeManager {
                     .or_else(|| stale_chain_line(&logs.log).map(|said| NodeBlocker::StaleChainData { said }))
             })
             .flatten();
-        Ok(NodeView { status, role, command_line, classes_from_node, activity, blocker, mining, pay_address, registered_bond })
+        Ok(NodeView {
+            status,
+            role,
+            command_line,
+            classes_from_node,
+            activity,
+            blocker,
+            mining,
+            pay_address,
+            registered_bond,
+            pay_balance_sompi,
+        })
     }
 
     pub async fn is_supervising(&self) -> bool {

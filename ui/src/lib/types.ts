@@ -365,6 +365,7 @@ export type NodeView = {
   mining: MiningState
   pay_address: string | null
   registered_bond: string | null
+  pay_balance_sompi: number | null
 }
 
 export type NetworkOverview = {

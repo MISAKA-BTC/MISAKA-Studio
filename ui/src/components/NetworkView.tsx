@@ -890,6 +890,12 @@ function ProducerIdentityCard({ node }: { node: NodeView }) {
             Derived by the node from the producer key. Rewards land here and the bond's collateral is spent from
             here; the <strong>misakascan faucet</strong> hands out 12 MSK once per address, which is enough.
           </p>
+          {node.pay_balance_sompi !== null && (
+            <p className="mt-1 text-[0.7rem] text-ink-600 dark:text-ink-300">
+              The chain holds <strong>{msk(node.pay_balance_sompi)}</strong> at this address — what you sent, plus
+              the reward of every block whose claim has gone Final.
+            </p>
+          )}
           <div className="mt-2 flex flex-wrap gap-2">
             <button type="button" className="btn-secondary" onClick={() => void navigator.clipboard?.writeText(node.pay_address ?? '')}>
               Copy the address
