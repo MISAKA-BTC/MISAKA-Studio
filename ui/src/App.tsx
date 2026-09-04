@@ -85,7 +85,7 @@ function Toasts() {
   if (toasts.length === 0) return null
 
   return (
-    <div className="pointer-events-none fixed bottom-4 right-4 z-50 flex w-80 flex-col gap-2">
+    <div className="pointer-events-none fixed bottom-4 right-4 z-50 flex max-h-[calc(100vh-2rem)] w-80 flex-col justify-end gap-2 overflow-y-auto">
       {toasts.map((toast) => (
         <div
           key={toast.id}
@@ -98,8 +98,12 @@ function Toasts() {
           }`}
         >
           {toast.kind === 'error' && <Icon name="warning" className="mt-0.5 size-4 shrink-0" />}
-          <span className="min-w-0 flex-1">{toast.text}</span>
-          <button type="button" className="btn-ghost px-1 py-0.5" onClick={() => dismiss(toast.id)}>
+          {/* The message scrolls inside the toast, and keeps its line breaks. An error stays until
+              it is dismissed, so the dismiss button is the only way off the screen — and a fifteen
+              line engine log grew the toast taller than the window, carried that button off the top
+              edge, and left the user with a notification that could not be closed at all. */}
+          <span className="max-h-40 min-w-0 flex-1 overflow-y-auto whitespace-pre-wrap break-words">{toast.text}</span>
+          <button type="button" className="btn-ghost shrink-0 px-1 py-0.5" onClick={() => dismiss(toast.id)}>
             <Icon name="x" className="size-3.5" />
           </button>
         </div>
