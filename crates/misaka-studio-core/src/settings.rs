@@ -36,6 +36,13 @@ pub enum BackendKind {
     /// The deterministic integer runtime (`misaka-palw-serve`), driven as a child process. Its
     /// arithmetic is the class a chain registers, so two machines running one artifact agree.
     Misaka,
+    /// The free-prompt gateway (`misaka-palw-gateway`), over HTTP — not a child process.
+    ///
+    /// The same integer runtime, run under the lane that PRICES the work: one execution answers the
+    /// user and produces the commitment a panel seat can re-execute. Chatting through it is how a
+    /// chat becomes adjudicable — and, once a submitter beside that gateway signs and sends the
+    /// commitment, mined. `node.palw_gateway_url` says which gateway.
+    Gateway,
     /// A built-in fake that streams a canned reply. For UI work and tests with no model.
     Mock,
 }

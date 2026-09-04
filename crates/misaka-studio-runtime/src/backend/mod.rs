@@ -28,11 +28,13 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub mod gateway;
 pub mod llamacpp;
 pub mod misaka;
 pub mod mlx;
 pub mod mock;
 pub mod openai_child;
+pub(crate) use openai_child::SseParser;
 
 /// One turn in a conversation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

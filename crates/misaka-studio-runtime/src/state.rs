@@ -515,6 +515,9 @@ pub fn build_backend(settings: &Settings, hardware: &HardwareSnapshot) -> Shared
         // The integer runtime, driven through the same child-engine supervisor as the others. It
         // refuses rather than substituting when its server is missing: a record naming MISAKA must
         // come from the MISAKA runtime.
+        BackendKind::Gateway => Arc::new(crate::backend::gateway::GatewayBackend::new(
+            settings.node.palw_gateway_url.clone().unwrap_or_else(|| "http://127.0.0.1:8790".to_string()),
+        )),
         BackendKind::Misaka => Arc::new(MisakaBackend::new(
             settings.backend.misaka_serve_path.clone(),
             settings.backend.misaka_tokenizer_path.clone(),
@@ -582,7 +585,11 @@ pub fn plan_gpu_layers(model: &LocalModel, hardware: &HardwareSnapshot, context:
 /// stderr.
 fn engine_pairing_refusal(model_id: &str, file_name: Option<&str>, backend: &str) -> Option<String> {
     let is_artifact = file_name.is_some_and(palw::is_artifact_filename);
-    match (is_artifact, backend == MisakaBackend::NAME) {
+    // Two engines read a class artifact: the integer runtime directly, and the free-prompt gateway,
+    // which runs that same runtime under the lane that prices the work. Spelled as a set because a
+    // third one arriving must not have to be remembered in a comparison written as `==`.
+    let reads_artifacts = [MisakaBackend::NAME, crate::backend::gateway::NAME].contains(&backend);
+    match (is_artifact, reads_artifacts) {
         (true, false) => Some(format!(
             "{model_id} is a PALW class artifact, not a GGUF. Mining does not load it here — the node runs it, \
              and the Network tab is where it is named to the node. Chatting with it needs the `{misaka}` engine: \
@@ -591,10 +598,9 @@ fn engine_pairing_refusal(model_id: &str, file_name: Option<&str>, backend: &str
             misaka = MisakaBackend::NAME,
         )),
         (false, true) => Some(format!(
-            "{model_id} is a GGUF, and the `{misaka}` engine runs PALW class artifacts — the integer runtime a \
+            "{model_id} is a GGUF, and the `{backend}` engine runs PALW class artifacts — the integer runtime a \
              class registers, not llama.cpp's format. Set the engine back to `auto` under Settings → Backend to \
-             chat with this model.",
-            misaka = MisakaBackend::NAME,
+             chat with this model."
         )),
         _ => None,
     }

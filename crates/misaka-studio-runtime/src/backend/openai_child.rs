@@ -423,7 +423,7 @@ fn parse_version(text: &str) -> (Option<String>, Option<u64>) {
 /// semantics this never needs. The one thing it must get right is that **a chunk boundary can
 /// land anywhere** — including inside a UTF-8 character or halfway through `data:` — so bytes
 /// accumulate in a buffer and only whole lines are parsed.
-struct SseParser {
+pub(crate) struct SseParser {
     buffer: Vec<u8>,
     chat: bool,
     text_len: u64,
@@ -432,11 +432,11 @@ struct SseParser {
 }
 
 impl SseParser {
-    fn new(chat: bool) -> Self {
+    pub(crate) fn new(chat: bool) -> Self {
         SseParser { buffer: Vec::new(), chat, text_len: 0, usage: None, finish_reason: None }
     }
 
-    fn push(&mut self, bytes: &[u8]) -> Vec<StreamEvent> {
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> Vec<StreamEvent> {
         self.buffer.extend_from_slice(bytes);
         let mut events = Vec::new();
         while let Some(idx) = self.buffer.iter().position(|&b| b == b'\n') {
@@ -478,7 +478,7 @@ impl SseParser {
     /// The terminating event, with the engine's usage when it sent one and an estimate when it
     /// did not — a blank tokens/sec readout is a worse answer than an approximate one, as long
     /// as it is never presented as exact.
-    fn finish(self, fallback_prompt_tokens: u64) -> StreamEvent {
+    pub(crate) fn finish(self, fallback_prompt_tokens: u64) -> StreamEvent {
         let usage = self.usage.unwrap_or_else(|| {
             let completion = self.text_len.div_ceil(4);
             Usage {

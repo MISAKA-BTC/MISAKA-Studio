@@ -210,7 +210,7 @@ async fn backends(State(state): State<Arc<AppState>>) -> Json<Vec<BackendInfo>> 
     let mut out = Vec::new();
     // `Auto` is not listed: it is a rule for choosing among these, not a backend, and showing it
     // beside them would invite "is Auto available?" — a question with no answer.
-    for kind in [BackendKind::LlamaCpp, BackendKind::Mlx, BackendKind::Misaka, BackendKind::Mock] {
+    for kind in [BackendKind::LlamaCpp, BackendKind::Mlx, BackendKind::Misaka, BackendKind::Gateway, BackendKind::Mock] {
         let probe = Settings { backend: BackendSettings { kind, ..settings.backend.clone() }, ..settings.clone() };
         let backend = crate::state::build_backend(&probe, &state.hardware);
         out.push(BackendInfo {

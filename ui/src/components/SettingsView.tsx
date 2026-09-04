@@ -60,6 +60,8 @@ export function SettingsView() {
               {/* The engine that reads a `.palwart`. It was missing from this list while the load
                   error for one told people to select it here. */}
               <option value="misaka">MISAKA integer runtime — the engine a PALW class registers</option>
+              {/* The lane that prices the work: one execution answers you and commits a claim. */}
+              <option value="gateway">MISAKA free-prompt gateway — the answer is the mining work</option>
               <option value="mock">Mock — canned replies, no model needed</option>
             </select>
           </Field>
