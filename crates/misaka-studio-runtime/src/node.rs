@@ -248,54 +248,75 @@ pub(crate) fn is_activity_line(line: &str) -> bool {
 /// Read the producer's own lines. `produced block #N` is the only line that proves a block was
 /// made, so it is the only line that flips this to `Producing`; `holding: <reason>` is what the
 /// node says instead, and it carries the reason the operator needs.
-/// Read the producer's own draw counter — the newest line wins, because it is cumulative.
+/// Read the producer's own draw counter off one log line, as it arrives.
 ///
 /// The line reads `[palw-producer] 12 draws this run, 0 produced, 0 won the class ticket …;
 /// class ticket p = 3.159e-4 per draw (1 in 3.166e3)`. Anything it cannot parse is left out rather
 /// than guessed: a missing odds figure is `None`, not a zero that reads as "certain".
-pub(crate) fn producer_effort(log: &VecDeque<String>) -> Option<Effort> {
-    let line = log.iter().rev().find(|l| l.contains("[palw-producer]") && l.contains(" draws this run"))?;
+pub(crate) fn parse_effort(line: &str) -> Option<Effort> {
+    if !(line.contains("[palw-producer]") && line.contains(" draws this run")) {
+        return None;
+    }
     let number_before = |marker: &str| -> Option<u64> {
         let head = line.split(marker).next()?;
         head.split_whitespace().last()?.replace(',', "").parse().ok()
     };
     let draws = number_before(" draws this run")?;
     let produced = number_before(" produced").unwrap_or(0);
-    let ticket_one_in = line
-        .split("(1 in ")
-        .nth(1)
-        .and_then(|rest| rest.split(')').next())
-        .and_then(|n| n.trim().parse::<f64>().ok());
+    let ticket_one_in = line.split("(1 in ").nth(1).and_then(|rest| rest.split(')').next()).and_then(|n| n.trim().parse::<f64>().ok());
     Some(Effort { draws, produced, ticket_one_in })
 }
 
-pub(crate) fn mining_state(log: &VecDeque<String>, role: NetworkRole, reachable: bool) -> MiningState {
-    if role != NetworkRole::Producer || !reachable {
-        return MiningState::NotMining;
-    }
-    let mut blocks = 0u64;
-    let mut latest_number = None;
-    let mut holding = None;
-    for line in log {
+/// **What the log has said about mining, folded as the lines arrive.**
+///
+/// This used to be a scan of the retained log window, and the window holds 600 lines — under a
+/// minute of a chatty node. A block produced, or a draw report printed every five minutes, would
+/// scroll out and the app would forget both: a machine that had just won a block went back to
+/// saying it had won nothing. Folding at ingest keeps a fact once it has been observed, which is
+/// the only reading that does not depend on how talkative the node happens to be.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MiningFacts {
+    /// `produced block #N` lines seen in this supervision.
+    pub blocks: u64,
+    /// The `#N` of the newest of them: the node's own count, which a restart does not reset.
+    pub latest_number: Option<u64>,
+    /// The last `holding: <reason>`, cleared by any evidence of work after it.
+    pub holding: Option<String>,
+}
+
+impl MiningFacts {
+    /// Fold one log line in. Ordering is the log's, so the last statement wins.
+    pub(crate) fn observe(&mut self, line: &str) {
         if let Some(rest) = line.split("produced block #").nth(1) {
-            blocks += 1;
-            // Last line wins: the field names the LATEST block, and the log is in order. A line
-            // whose number will not parse leaves the previous one standing rather than blanking it.
+            self.blocks += 1;
+            // A line whose number will not parse leaves the previous one standing rather than
+            // blanking it.
             if let Some(n) = rest.split_whitespace().next().and_then(|n| n.parse::<u64>().ok()) {
-                latest_number = Some(n);
+                self.latest_number = Some(n);
             }
+            self.holding = None;
         } else if let Some(rest) = line.split("[palw-producer] holding: ").nth(1) {
-            holding = Some(rest.trim().to_string());
+            self.holding = Some(rest.trim().to_string());
         } else if line.contains("[palw-producer]") && line.contains(" draws this run") {
             // **A draw clears a hold.** The producer prints its holds and, since the node learned
             // to count (2026-09-04), a periodic "N draws this run, M produced …" line while it is
             // drawing. Without this, the hold a node announced in its first seconds — usually
             // `peers=false` before the anchors answer — stayed on the app's face for the rest of
             // the run, telling a person their machine was stopped while it was mining.
-            holding = None;
+            self.holding = None;
         }
     }
-    if blocks > 0 { MiningState::Producing { blocks, latest_number } } else { MiningState::Starting { holding } }
+}
+
+pub(crate) fn mining_state(facts: &MiningFacts, role: NetworkRole, reachable: bool) -> MiningState {
+    if role != NetworkRole::Producer || !reachable {
+        return MiningState::NotMining;
+    }
+    if facts.blocks > 0 {
+        MiningState::Producing { blocks: facts.blocks, latest_number: facts.latest_number }
+    } else {
+        MiningState::Starting { holding: facts.holding.clone() }
+    }
 }
 
 /// Split a `getUtxosByAddresses` answer into the pay a producer has, and the pay it is waiting for.
@@ -304,8 +325,7 @@ pub(crate) fn mining_state(log: &VecDeque<String>, role: NetworkRole, reachable:
 /// address and are not earnings, and calling them earnings is the one mistake this panel exists to
 /// avoid.
 pub(crate) fn rewards_from_utxos(value: &Value, virtual_daa: u64) -> Rewards {
-    let mut rewards =
-        Rewards { blocks_paid: 0, total_sompi: 0, spendable_sompi: 0, maturing_sompi: 0, next_mature_daa: None };
+    let mut rewards = Rewards { blocks_paid: 0, total_sompi: 0, spendable_sompi: 0, maturing_sompi: 0, next_mature_daa: None };
     let Some(entries) = value.get("entries").and_then(Value::as_array) else { return rewards };
     for entry in entries {
         let Some(utxo) = entry.get("utxoEntry") else { continue };
@@ -365,6 +385,14 @@ struct NodeLogState {
     /// `[palw-panel] registered bond <txid>:<index> …` — printed once by the registration run;
     /// the value `node.producer_bond` must carry from then on.
     registered_bond: Option<String>,
+    /// What the log has said about mining, folded as lines arrive rather than scanned back out
+    /// of a 600-line window that rotates in under a minute.
+    mining: MiningFacts,
+    /// The producer's newest draw report. Kept HERE rather than re-read from `log` because the
+    /// node prints it once every five minutes and the retained window is far shorter than that
+    /// under a chatty node: scanning the window made the app forget it was mining between
+    /// reports, and flicker back to "nothing won yet" while the machine was working.
+    effort: Option<Effort>,
 }
 
 struct SupervisedNode {
@@ -762,7 +790,7 @@ impl NodeManager {
         // blocker, and a stale banner on a healthy node is its own kind of lie.
         let (mining, effort) = {
             let logs = self.logs.lock().expect("log lock");
-            (mining_state(&logs.log, role, status.reachable), producer_effort(&logs.log))
+            (mining_state(&logs.mining, role, status.reachable), logs.effort.clone())
         };
         let blocker = (!status.reachable)
             .then(|| {
@@ -831,6 +859,10 @@ async fn drain_node<R: tokio::io::AsyncRead + Unpin>(stream: R, logs: Arc<Mutex<
         if let Some(outpoint) = parse_registered_bond(&line) {
             state.registered_bond = Some(outpoint);
         }
+        if let Some(effort) = parse_effort(&line) {
+            state.effort = Some(effort);
+        }
+        state.mining.observe(&line);
         if is_activity_line(&line) {
             if state.activity.len() == ACTIVITY_CAPACITY {
                 state.activity.pop_front();
@@ -843,27 +875,31 @@ async fn drain_node<R: tokio::io::AsyncRead + Unpin>(stream: R, logs: Arc<Mutex<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fold a test's log lines the way the ingest does, so the tests exercise the real path.
+    fn folded(log: &VecDeque<String>) -> MiningFacts {
+        let mut facts = MiningFacts::default();
+        for line in log {
+            facts.observe(line);
+        }
+        facts
+    }
     use misaka_studio_core::settings::NodeSettings;
 
     #[test]
     fn the_draw_counter_is_read_from_the_newest_line() {
-        let mut log = VecDeque::new();
-        log.push_back("[palw-producer] 1 draws this run, 0 produced, 0 won the class ticket".to_string());
-        log.push_back(
+        let effort = parse_effort(
             "2026-09-04 [INFO ] [palw-producer] 4,210 draws this run, 2 produced, 3 won the class ticket and \
-             lost the network draw against bits; class ticket p = 3.159e-4 per draw (1 in 3.166e3)"
-                .to_string(),
-        );
-        let effort = producer_effort(&log).expect("the newest line parses");
+             lost the network draw against bits; class ticket p = 3.159e-4 per draw (1 in 3.166e3)",
+        )
+        .expect("the report line parses");
         assert_eq!(effort.draws, 4210, "thousands separators are not a parse failure");
         assert_eq!(effort.produced, 2);
         assert_eq!(effort.ticket_one_in, Some(3.166e3));
 
         // A line with no odds is still a draw count — the odds are absent, not zero.
-        let mut bare = VecDeque::new();
-        bare.push_back("[palw-producer] 7 draws this run, 0 produced".to_string());
-        assert_eq!(producer_effort(&bare).map(|e| (e.draws, e.ticket_one_in)), Some((7, None)));
-        assert!(producer_effort(&VecDeque::new()).is_none(), "no line, no claim");
+        assert_eq!(parse_effort("[palw-producer] 7 draws this run, 0 produced").map(|e| (e.draws, e.ticket_one_in)), Some((7, None)));
+        assert!(parse_effort("[palw-producer] holding: no bond").is_none(), "no report, no claim");
     }
 
     #[test]
@@ -888,26 +924,42 @@ mod tests {
     }
 
     #[test]
+    fn a_block_stays_won_after_the_log_window_has_rotated_past_it() {
+        // The retained window is 600 lines and a busy node fills it in minutes. Folding at ingest
+        // is what makes this hold; scanning the window did not, and the app forgot a won block.
+        let mut facts = MiningFacts::default();
+        facts.observe("[palw-producer] produced block #7 abcd (class ticket + Layer-0 both under target)");
+        for i in 0..(LOG_CAPACITY * 3) {
+            facts.observe(&format!("[validator-fanout] daa={i} rewarding 0 attestation(s)"));
+        }
+        assert_eq!(
+            mining_state(&facts, NetworkRole::Producer, true),
+            MiningState::Producing { blocks: 1, latest_number: Some(7) },
+            "a block won is a fact, not a line that can scroll away"
+        );
+    }
+
+    #[test]
     fn a_draw_after_a_hold_clears_it() {
         let mut log = VecDeque::new();
         log.push_back(
             "[palw-producer] holding: the mining rule engine says this node should not mine [enable_unsynced_mining=false peers=false participation_allowed=true]".to_string(),
         );
         assert!(
-            matches!(mining_state(&log, NetworkRole::Producer, true), MiningState::Starting { holding: Some(_) }),
+            matches!(mining_state(&folded(&log), NetworkRole::Producer, true), MiningState::Starting { holding: Some(_) }),
             "a hold with nothing after it stands"
         );
         log.push_back(
             "[palw-producer] 12 draws this run, 0 produced, 0 won the class ticket and lost the network draw against bits; class ticket p = 7.896e-5 per draw".to_string(),
         );
         assert_eq!(
-            mining_state(&log, NetworkRole::Producer, true),
+            mining_state(&folded(&log), NetworkRole::Producer, true),
             MiningState::Starting { holding: None },
             "a draw after the hold means the node is drawing, whatever it said a minute ago"
         );
         // A hold AFTER the draws is the current state again.
         log.push_back("[palw-producer] holding: the named bond is not registered on this chain".to_string());
-        assert!(matches!(mining_state(&log, NetworkRole::Producer, true), MiningState::Starting { holding: Some(_) }));
+        assert!(matches!(mining_state(&folded(&log), NetworkRole::Producer, true), MiningState::Starting { holding: Some(_) }));
     }
 
     #[test]
@@ -916,10 +968,7 @@ mod tests {
         log.push_back("error: the argument '--palw-panel' cannot be used multiple times".to_string());
         log.push_back(String::new());
         log.push_back("Usage: kaspad [OPTIONS]".to_string());
-        assert_eq!(
-            refused_arguments_line(&log).as_deref(),
-            Some("error: the argument '--palw-panel' cannot be used multiple times")
-        );
+        assert_eq!(refused_arguments_line(&log).as_deref(), Some("error: the argument '--palw-panel' cannot be used multiple times"));
         // A usage banner without the error line is not evidence of which argument was wrong.
         let banner: VecDeque<String> = ["Usage: kaspad [OPTIONS]".to_string()].into_iter().collect();
         assert_eq!(refused_arguments_line(&banner), None);
@@ -936,8 +985,11 @@ mod tests {
         .expect("parses");
         assert!(addr.starts_with("misakadev:qg3fzu3x"));
         assert!(parse_pay_address("[palw-panel] no bond yet; registering one").is_none());
-        let bond = parse_registered_bond(&format!("[palw-panel] registered bond {}:0 with 400000 sompi collateral. Restart with …", "ab".repeat(64)))
-            .expect("parses");
+        let bond = parse_registered_bond(&format!(
+            "[palw-panel] registered bond {}:0 with 400000 sompi collateral. Restart with …",
+            "ab".repeat(64)
+        ))
+        .expect("parses");
         assert_eq!(bond, format!("{}:0", "ab".repeat(64)));
         assert!(parse_registered_bond("[palw-panel] registered bond nothing").is_none());
         assert!(is_activity_line("[palw] producer pay address misakadev:qq (derived)"));
@@ -1070,11 +1122,11 @@ mod tests {
         log.push_back("Consensus params fingerprint: f3bf86b4… (network testnet-11)".to_string());
 
         // Configured and up, nothing produced: not mining, and no reason offered yet.
-        assert_eq!(mining_state(&log, NetworkRole::Producer, true), MiningState::Starting { holding: None });
+        assert_eq!(mining_state(&folded(&log), NetworkRole::Producer, true), MiningState::Starting { holding: None });
 
         // The reason, when the node gives one, is the answer the operator actually needs.
         log.push_back("[palw-producer] holding: this class's epoch budget is already spent [budget=0]".to_string());
-        match mining_state(&log, NetworkRole::Producer, true) {
+        match mining_state(&folded(&log), NetworkRole::Producer, true) {
             MiningState::Starting { holding: Some(h) } => assert!(h.contains("epoch budget"), "{h}"),
             other => panic!("expected a held producer, got {other:?}"),
         }
@@ -1084,7 +1136,10 @@ mod tests {
         log.push_back("[palw-producer] produced block #692 b86b4cfb186feb1c393f85bf79a389530d8".to_string());
         // The LATEST number, not the first: the log is in order and the field names the newest
         // block this supervision saw.
-        assert_eq!(mining_state(&log, NetworkRole::Producer, true), MiningState::Producing { blocks: 2, latest_number: Some(692) });
+        assert_eq!(
+            mining_state(&folded(&log), NetworkRole::Producer, true),
+            MiningState::Producing { blocks: 2, latest_number: Some(692) }
+        );
     }
 
     /// A verifier is not mining however healthy it looks, and neither is a producer whose node is
@@ -1093,7 +1148,7 @@ mod tests {
     fn a_verifier_and_an_unreachable_producer_are_both_not_mining() {
         let mut log = VecDeque::new();
         log.push_back("[palw-producer] produced block #1 aa".to_string());
-        assert_eq!(mining_state(&log, NetworkRole::Verifier, true), MiningState::NotMining);
-        assert_eq!(mining_state(&log, NetworkRole::Producer, false), MiningState::NotMining);
+        assert_eq!(mining_state(&folded(&log), NetworkRole::Verifier, true), MiningState::NotMining);
+        assert_eq!(mining_state(&folded(&log), NetworkRole::Producer, false), MiningState::NotMining);
     }
 }
