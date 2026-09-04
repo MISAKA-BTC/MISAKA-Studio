@@ -68,7 +68,17 @@ pub fn health_check(port: u16, timeout: Duration) -> bool {
             break;
         }
     }
-    response.starts_with("HTTP/1.1 200") && response.contains(RUNTIME_NAME)
+    // **The status line answers in the version we ASKED in.** The request above is HTTP/1.0, and a
+    // conforming server replies `HTTP/1.0 200 OK` — so demanding "HTTP/1.1 200" here made this
+    // check false against our own healthy runtime, every time. The shell then took the other
+    // branch and spawned a rival runtime on a random port: two Studios, two model loads, and a
+    // window pointed at the one that had just started rather than the one already working.
+    // Measured on 2026-09-04 against a runtime that answered `HTTP/1.0 200 OK` in 3 ms.
+    let status_ok = response
+        .lines()
+        .next()
+        .is_some_and(|line| line.starts_with("HTTP/") && line.split_whitespace().nth(1) == Some("200"));
+    status_ok && response.contains(RUNTIME_NAME)
 }
 
 /// True when nothing holds the port.
@@ -226,6 +236,45 @@ mod tests {
             RuntimeSource::Spawn(chosen) => assert_ne!(chosen, port, "it must move to a free port"),
             other => panic!("expected a spawn on another port, got {other:?}"),
         }
+    }
+
+    /// The runtime answers in the version the check asks in, and the check asks in 1.0.
+    #[test]
+    fn health_check_accepts_the_version_it_asked_in() {
+        for version in ["HTTP/1.0", "HTTP/1.1"] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+            let port = listener.local_addr().expect("addr").port();
+            let body = format!("{{\"status\":\"ok\",\"name\":\"{RUNTIME_NAME}\"}}");
+            let response = format!(
+                "{version} 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let server = std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut sink = [0u8; 1024];
+                    let _ = stream.read(&mut sink);
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            });
+            assert!(health_check(port, Duration::from_millis(500)), "{version} must be accepted");
+            let _ = server.join();
+        }
+    }
+
+    /// A 200 from something that is not the runtime is still not the runtime.
+    #[test]
+    fn health_check_is_false_for_a_stranger_answering_200() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut sink = [0u8; 1024];
+                let _ = stream.read(&mut sink);
+                let _ = stream.write_all(b"HTTP/1.0 200 OK\r\ncontent-length: 2\r\n\r\nhi");
+            }
+        });
+        assert!(!health_check(port, Duration::from_millis(500)));
+        let _ = server.join();
     }
 
     #[test]
