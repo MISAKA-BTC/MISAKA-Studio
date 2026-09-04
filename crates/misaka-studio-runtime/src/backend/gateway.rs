@@ -228,14 +228,26 @@ impl InferenceBackend for GatewayBackend {
                             ),
                         });
                     }
-                    // **Room is not a target.** A decode ceiling is what the model is ALLOWED to
-                    // generate, and this one does not reliably stop early: given the whole
-                    // remaining context it produced 438 of 438 tokens and took 6.7 minutes for a
-                    // two-line question. So when the caller's number does not fit this class — the
-                    // app's default is 2048, meant for a 32K GGUF — the answer is sized like an
-                    // answer instead of like the context. A smaller explicit ask is still honoured.
-                    const ANSWER_CEILING: u64 = 256;
-                    if request.params.max_tokens <= room { request.params.max_tokens } else { room.min(ANSWER_CEILING) }
+                    // **256 is the lane's own ceiling today, not a preference.**
+                    //
+                    // A free-prompt result is validated with
+                    // `trace_chunk_count == ceil(decode_tokens_executed / PALW_FP_TRACE_CHUNK_EVENTS_V3)`,
+                    // and that constant is 256 — while the producer hardcodes ONE chunk
+                    // (`misaka-palw-base0/src/produce.rs`, the attempt lane's rule under ADR-0072
+                    // Decision 8). So a run of more than 256 tokens is refused by the gateway's own
+                    // binding check and its resident worker is dropped as if the transport had
+                    // failed. Measured against the live gateway, one token apart:
+                    //
+                    //     decode=256/256 … ok
+                    //     decode=257/257 … the retained-trace chunk count is not the executed shape's
+                    //
+                    // Asking for more cannot succeed, so it is clamped rather than sent — an
+                    // opaque failure four minutes in is worse than a shorter answer now. When the
+                    // producer learns the free-prompt manifest, this line is what should move.
+                    const LANE_CHUNK_EVENTS: u64 = 256;
+                    // Room is not a target either: given the whole remaining context this model
+                    // produced 438 of 438 tokens and took 6.7 minutes for a two-line question.
+                    request.params.max_tokens.min(room).min(LANE_CHUNK_EVENTS)
                 }
                 None => request.params.max_tokens,
             };
