@@ -248,6 +248,27 @@ pub(crate) fn is_activity_line(line: &str) -> bool {
 /// Read the producer's own lines. `produced block #N` is the only line that proves a block was
 /// made, so it is the only line that flips this to `Producing`; `holding: <reason>` is what the
 /// node says instead, and it carries the reason the operator needs.
+/// Read the producer's own draw counter — the newest line wins, because it is cumulative.
+///
+/// The line reads `[palw-producer] 12 draws this run, 0 produced, 0 won the class ticket …;
+/// class ticket p = 3.159e-4 per draw (1 in 3.166e3)`. Anything it cannot parse is left out rather
+/// than guessed: a missing odds figure is `None`, not a zero that reads as "certain".
+pub(crate) fn producer_effort(log: &VecDeque<String>) -> Option<Effort> {
+    let line = log.iter().rev().find(|l| l.contains("[palw-producer]") && l.contains(" draws this run"))?;
+    let number_before = |marker: &str| -> Option<u64> {
+        let head = line.split(marker).next()?;
+        head.split_whitespace().last()?.replace(',', "").parse().ok()
+    };
+    let draws = number_before(" draws this run")?;
+    let produced = number_before(" produced").unwrap_or(0);
+    let ticket_one_in = line
+        .split("(1 in ")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .and_then(|n| n.trim().parse::<f64>().ok());
+    Some(Effort { draws, produced, ticket_one_in })
+}
+
 pub(crate) fn mining_state(log: &VecDeque<String>, role: NetworkRole, reachable: bool) -> MiningState {
     if role != NetworkRole::Producer || !reachable {
         return MiningState::NotMining;
@@ -379,6 +400,9 @@ pub struct NodeView {
     /// The bond outpoint the node printed when its registration carrier confirmed. `None` until
     /// the node says it; the settings' `producer_bond` should be set to it before the next start.
     pub registered_bond: Option<String>,
+    /// How hard the producer is working right now, from its own draw counter. `None` before it
+    /// has printed one.
+    pub effort: Option<Effort>,
     /// The blocks this producer has been paid for, as the chain holds them. `None` when there is
     /// no address yet or the node did not answer.
     pub rewards: Option<Rewards>,
@@ -411,6 +435,23 @@ pub enum MiningState {
     /// The node has produced blocks. `blocks` counts what this supervision has seen — the chain's
     /// own `#N` is carried separately because a restart resets the first and not the second.
     Producing { blocks: u64, latest_number: Option<u64> },
+}
+
+/// **The work a producer is doing while it has won nothing** — which is the whole of mining most
+/// of the time, and was invisible.
+///
+/// A person watching a miner that has produced no block wants to know whether it is trying. The
+/// node counts its own draws and prints the class ticket's odds; this carries those numbers up so
+/// the app can say "it is drawing, at these odds" instead of only "nothing won yet".
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct Effort {
+    /// Draws since this run of the producer started. Resets on restart, like the node's counter.
+    pub draws: u64,
+    /// Blocks produced in this run.
+    pub produced: u64,
+    /// One in how many draws wins the class ticket, from the node's own `1 in N`. The ticket is
+    /// the first of two gates: a winner still has to beat the network's bits.
+    pub ticket_one_in: Option<f64>,
 }
 
 /// **The pay a producer has actually received**, split the way a person asks about it.
@@ -719,9 +760,9 @@ impl NodeManager {
         };
         // Only when nothing is answering: a running node's old log lines are history, not a
         // blocker, and a stale banner on a healthy node is its own kind of lie.
-        let mining = {
+        let (mining, effort) = {
             let logs = self.logs.lock().expect("log lock");
-            mining_state(&logs.log, role, status.reachable)
+            (mining_state(&logs.log, role, status.reachable), producer_effort(&logs.log))
         };
         let blocker = (!status.reachable)
             .then(|| {
@@ -744,6 +785,7 @@ impl NodeManager {
             mining,
             pay_address,
             registered_bond,
+            effort,
             rewards,
             pay_balance_sompi,
         })
@@ -802,6 +844,27 @@ async fn drain_node<R: tokio::io::AsyncRead + Unpin>(stream: R, logs: Arc<Mutex<
 mod tests {
     use super::*;
     use misaka_studio_core::settings::NodeSettings;
+
+    #[test]
+    fn the_draw_counter_is_read_from_the_newest_line() {
+        let mut log = VecDeque::new();
+        log.push_back("[palw-producer] 1 draws this run, 0 produced, 0 won the class ticket".to_string());
+        log.push_back(
+            "2026-09-04 [INFO ] [palw-producer] 4,210 draws this run, 2 produced, 3 won the class ticket and \
+             lost the network draw against bits; class ticket p = 3.159e-4 per draw (1 in 3.166e3)"
+                .to_string(),
+        );
+        let effort = producer_effort(&log).expect("the newest line parses");
+        assert_eq!(effort.draws, 4210, "thousands separators are not a parse failure");
+        assert_eq!(effort.produced, 2);
+        assert_eq!(effort.ticket_one_in, Some(3.166e3));
+
+        // A line with no odds is still a draw count — the odds are absent, not zero.
+        let mut bare = VecDeque::new();
+        bare.push_back("[palw-producer] 7 draws this run, 0 produced".to_string());
+        assert_eq!(producer_effort(&bare).map(|e| (e.draws, e.ticket_one_in)), Some((7, None)));
+        assert!(producer_effort(&VecDeque::new()).is_none(), "no line, no claim");
+    }
 
     #[test]
     fn rewards_count_coinbase_outputs_and_split_them_by_maturity() {

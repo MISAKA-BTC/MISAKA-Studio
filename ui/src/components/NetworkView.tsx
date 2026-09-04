@@ -16,7 +16,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { PromptMiningPanel } from './PromptMiningPanel'
 import { api } from '../lib/api'
 import { bytes, count, shortHash } from '../lib/format'
-import type { MiningState, NetworkOverview, NodeClassRow, NodeView, PalwClassStatus, PoolStatus, Settings } from '../lib/types'
+import type { Effort, MiningState, NetworkOverview, NodeClassRow, NodeView, PalwClassStatus, PoolStatus, Settings } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { CopyButton, EmptyState, Field, Icon, Section, Spinner, Toggle } from './common'
 
@@ -111,7 +111,7 @@ export function NetworkView() {
 
   return (
     <div className="h-full overflow-y-auto p-4">
-      <MiningBanner mining={node.mining} pool={null} />
+      <MiningBanner mining={node.mining} effort={node.effort} pool={null} />
       {(node.pay_address || node.registered_bond) && <ProducerIdentityCard node={node} />}
       <div className="grid gap-4 xl:grid-cols-3">
         <div className="space-y-4 xl:col-span-2">
@@ -189,7 +189,15 @@ export function NetworkView() {
  * only the producer's own `produced block #N`, states the answer in one word, and when the answer
  * is no it carries the node's own reason rather than making the user go looking for it.
  */
-function MiningBanner({ mining }: { mining: MiningState; pool: null }) {
+/** One draw is one complete inference the node ran to buy a ticket. */
+function effortLine(effort: Effort): string {
+  const draws = `${effort.draws.toLocaleString()} draw${effort.draws === 1 ? '' : 's'} this run`
+  if (effort.ticket_one_in === null) return `Working: ${draws}.`
+  const one_in = Math.round(effort.ticket_one_in).toLocaleString()
+  return `Working: ${draws}. One draw in ${one_in} wins this class's ticket, and a ticket still has to beat the network's difficulty.`
+}
+
+function MiningBanner({ mining, effort }: { mining: MiningState; effort: Effort | null; pool: null }) {
   if (mining.state === 'producing') {
     return (
       <div className="mb-4 flex flex-wrap items-center gap-3 rounded-xl border border-emerald-300 bg-emerald-50 p-4 dark:border-emerald-900 dark:bg-emerald-950/40">
@@ -213,14 +221,18 @@ function MiningBanner({ mining }: { mining: MiningState; pool: null }) {
       <div className="mb-4 flex flex-wrap items-center gap-3 rounded-xl border border-amber-300 bg-amber-50 p-4 dark:border-amber-900 dark:bg-amber-950/40">
         <Spinner className="size-4 shrink-0 text-amber-700 dark:text-amber-400" />
         <div className="min-w-0 flex-1">
-          <p className="text-sm font-semibold text-amber-900 dark:text-amber-200">Not mining yet — the producer is running but has won nothing</p>
+          <p className="text-sm font-semibold text-amber-900 dark:text-amber-200">
+            {effort && effort.draws > 0
+              ? 'Mining — drawing, nothing won yet'
+              : 'Not mining yet — the producer is running but has won nothing'}
+          </p>
           <p className="mt-0.5 text-xs leading-relaxed text-amber-800 dark:text-amber-300">
             {mining.holding ? (
               <>
                 The node says: <span className="mono">{mining.holding}</span>
               </>
             ) : (
-              <>Syncing, or waiting for its first win. The node states a reason here as soon as it has one.</>
+              <>{effort && effort.draws > 0 ? effortLine(effort) : 'Syncing, or waiting for its first win. The node states a reason here as soon as it has one.'}</>
             )}
           </p>
         </div>

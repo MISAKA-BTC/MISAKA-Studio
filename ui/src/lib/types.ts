@@ -367,6 +367,14 @@ export type NodeView = {
   registered_bond: string | null
   pay_balance_sompi: number | null
   rewards: Rewards | null
+  effort: Effort | null
+}
+
+/** What the producer is doing while it has won nothing: its own draw counter. */
+export type Effort = {
+  draws: number
+  produced: number
+  ticket_one_in: number | null
 }
 
 /** What the chain has actually paid this producer, from the node's own utxo index. */
