@@ -517,6 +517,9 @@ pub fn build_backend(settings: &Settings, hardware: &HardwareSnapshot) -> Shared
         // come from the MISAKA runtime.
         BackendKind::Gateway => Arc::new(crate::backend::gateway::GatewayBackend::new(
             settings.node.palw_gateway_url.clone().unwrap_or_else(|| "http://127.0.0.1:8790".to_string()),
+            // A pool-hosted gateway is the slot's, and the slot's token is what says so — the same
+            // token the Network tab already holds. There is one slot, not one per feature.
+            settings.node.pool_slot_token.clone(),
         )),
         BackendKind::Misaka => Arc::new(MisakaBackend::new(
             settings.backend.misaka_serve_path.clone(),
