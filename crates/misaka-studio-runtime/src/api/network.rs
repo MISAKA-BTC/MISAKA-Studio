@@ -26,6 +26,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/node/reset", post(reset_node))
         .route("/node/stop", post(stop_node))
         .route("/node/log", get(node_log))
+        .route("/blocks", get(produced_blocks))
         .route("/producer-key", post(producer_key))
         .route("/faucet", post(super::pool::faucet_for_address))
 }
@@ -260,6 +261,17 @@ mod tests {
 
         assert_eq!(default_class_artifact(dir.path()).await, Some(path));
     }
+}
+
+/// `GET /api/v1/network/blocks` — **the blocks this machine has produced**, newest first.
+///
+/// Its own route rather than a field on the overview: each row costs a `getBlock` against the
+/// node, and the overview is polled every few seconds by every open tab. The explorer card asks
+/// for this when it is looked at.
+pub async fn produced_blocks(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>> {
+    let settings = state.settings.read().await.node.clone();
+    let blocks = state.node.produced_blocks(&settings, 50).await;
+    Ok(Json(serde_json::json!({ "blocks": blocks })))
 }
 
 /// `POST /api/v1/network/producer-key` — mint the producer's ML-DSA-87 seed on this machine.

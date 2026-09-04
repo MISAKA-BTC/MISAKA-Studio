@@ -16,7 +16,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { PromptMiningPanel } from './PromptMiningPanel'
 import { api } from '../lib/api'
 import { bytes, count, shortHash } from '../lib/format'
-import type { Effort, MiningState, NetworkOverview, NodeClassRow, NodeStatus, NodeView, PalwClassStatus, PoolStatus, Settings } from '../lib/types'
+import type { Effort, MiningState, NetworkOverview, NodeClassRow, NodeStatus, NodeView, PalwClassStatus, PoolStatus, ProducedBlock, Settings } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { CopyButton, EmptyState, Field, Icon, Section, Spinner, Toggle } from './common'
 
@@ -140,6 +140,8 @@ export function NetworkView() {
             </div>
           </section>
 
+          <ProducedBlocksCard />
+
           {node.activity.length > 0 && (
             <section className="card p-5">
               <h3 className="text-sm font-semibold">Node activity</h3>
@@ -195,6 +197,114 @@ function effortLine(effort: Effort): string {
   if (effort.ticket_one_in === null) return `Working: ${draws}.`
   const one_in = Math.round(effort.ticket_one_in).toLocaleString()
   return `Working: ${draws}. One draw in ${one_in} wins this class's ticket, and a ticket still has to beat the network's difficulty.`
+}
+
+const LANE_NAMES: Record<number, string> = {
+  6: 'attempt',
+  7: 'receipt',
+  8: 'heartbeat',
+  9: 'attempt (exec)',
+}
+
+/** Every block this machine has won, described by the chain and linked to the public explorer. */
+function ProducedBlocksCard() {
+  const [blocks, setBlocks] = useState<ProducedBlock[] | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [failed, setFailed] = useState<string | null>(null)
+  const load = useCallback(async () => {
+    setBusy(true)
+    try {
+      const answer = await api.producedBlocks()
+      setBlocks(answer.blocks)
+      setFailed(null)
+    } catch (error) {
+      setFailed(error instanceof Error ? error.message : String(error))
+    } finally {
+      setBusy(false)
+    }
+  }, [])
+  useEffect(() => {
+    void load()
+    const id = setInterval(() => void load(), 60_000)
+    return () => clearInterval(id)
+  }, [load])
+
+  return (
+    <section className="card p-5">
+      <div className="flex items-baseline justify-between gap-2">
+        <h3 className="text-sm font-semibold">Blocks you have won</h3>
+        <button type="button" className="btn-ghost text-[0.7rem]" onClick={() => void load()} disabled={busy}>
+          {busy ? 'Reading the chain…' : 'Refresh'}
+        </button>
+      </div>
+      <p className="mt-1 text-xs text-ink-500 dark:text-ink-400">
+        Kept by this Studio, because nothing else can: the node&apos;s own counter resets every restart, and the chain
+        holds no index of which miner won what. Every other column here is read back from your node, so a row is what
+        the chain says about the block now — not what the log said when it was made.
+      </p>
+      {failed && <p className="mt-3 text-xs text-rose-600 dark:text-rose-400">Could not read the blocks: {failed}</p>}
+      {blocks !== null && blocks.length === 0 && (
+        <p className="mt-3 text-xs text-ink-500 dark:text-ink-400">
+          No block yet. One appears here the moment your node announces it.
+        </p>
+      )}
+      {blocks !== null && blocks.length > 0 && (
+        <div className="mt-3 overflow-x-auto">
+          <table className="w-full min-w-[34rem] text-left text-xs">
+            <thead className="text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">
+              <tr>
+                <th className="pb-1 pr-3 font-medium">When</th>
+                <th className="pb-1 pr-3 font-medium">DAA</th>
+                <th className="pb-1 pr-3 font-medium">Lane</th>
+                <th className="pb-1 pr-3 font-medium">On chain</th>
+                <th className="pb-1 pr-3 font-medium">Paid you</th>
+                <th className="pb-1 font-medium">Block</th>
+              </tr>
+            </thead>
+            <tbody>
+              {blocks.map(b => (
+                <tr key={b.hash} className="border-t border-ink-200/60 dark:border-ink-800/60">
+                  <td className="py-1 pr-3 tabular-nums">
+                    {new Date(b.timestamp_ms ?? b.seen_at_ms).toLocaleTimeString()}
+                  </td>
+                  <td className="py-1 pr-3 tabular-nums">{b.daa_score ?? '—'}</td>
+                  <td className="py-1 pr-3">{b.algo_id === null ? '—' : (LANE_NAMES[b.algo_id] ?? `algo ${b.algo_id}`)}</td>
+                  <td className="py-1 pr-3">
+                    {!b.found ? (
+                      <span className="text-amber-700 dark:text-amber-400">your node cannot find it</span>
+                    ) : b.is_chain_block ? (
+                      <span className="text-emerald-700 dark:text-emerald-400">chain block</span>
+                    ) : (
+                      <span className="text-ink-500 dark:text-ink-400">accepted, off the selected chain</span>
+                    )}
+                  </td>
+                  <td className="py-1 pr-3 tabular-nums">
+                    {b.paid_to_me_sompi === null ? '—' : b.paid_to_me_sompi > 0 ? msk(b.paid_to_me_sompi) : 'escrowed'}
+                  </td>
+                  <td className="py-1">
+                    <a
+                      className="mono text-[0.7rem] underline decoration-dotted underline-offset-2"
+                      href={`https://misakascan.com/#/block/${b.hash}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      title={b.hash}
+                    >
+                      {shortHash(b.hash, 10, 6)}
+                    </a>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <p className="mt-2 text-[0.7rem] text-ink-500 dark:text-ink-400">
+        &quot;Paid you&quot; is what that block&apos;s own coinbase sent to your address. An attempt block&apos;s reward
+        is escrowed until its claim is Final, so this reads <em>escrowed</em> at first — and the coinbase outputs your
+        block does carry are other producers&apos; matured claims riding in it.
+      </p>
+    </section>
+  )
 }
 
 /** How long since the newest block, and whether a still chain right now is normal. */

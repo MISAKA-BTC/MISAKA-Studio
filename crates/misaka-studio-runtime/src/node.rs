@@ -41,10 +41,10 @@
 use crate::{Error, Result};
 use futures_util::{SinkExt, StreamExt};
 use misaka_studio_core::settings::{NetworkRole, NodeNetwork, NodeSettings};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -274,6 +274,20 @@ pub(crate) fn is_activity_line(line: &str) -> bool {
 /// The line reads `[palw-producer] 12 draws this run, 0 produced, 0 won the class ticket …;
 /// class ticket p = 3.159e-4 per draw (1 in 3.166e3)`. Anything it cannot parse is left out rather
 /// than guessed: a missing odds figure is `None`, not a zero that reads as "certain".
+/// The hash out of `[palw-producer] produced block #3 <hash> (class ticket + Layer-0 both …)`.
+///
+/// The hash is taken by SHAPE, not by position: 128 lowercase hex characters, which is this
+/// network's 64-byte block hash. A reworded line keeps working; a line that carries no such token
+/// yields nothing rather than a truncated string.
+pub(crate) fn parse_produced_block(line: &str) -> Option<String> {
+    if !line.contains("produced block #") {
+        return None;
+    }
+    line.split_whitespace()
+        .find(|token| token.len() == 128 && token.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+        .map(str::to_string)
+}
+
 pub(crate) fn parse_effort(line: &str) -> Option<Effort> {
     if !(line.contains("[palw-producer]") && line.contains(" draws this run")) {
         return None;
@@ -416,6 +430,20 @@ pub(crate) fn refused_arguments_line(log: &VecDeque<String>) -> Option<String> {
 const LOG_CAPACITY: usize = 600;
 const ACTIVITY_CAPACITY: usize = 120;
 
+/// **One line per block this machine has ever produced**, kept on disk.
+///
+/// The node's `produced block #N` counter is per-process: it resets on every restart, and the
+/// retained log window is 600 lines, which this node fills in minutes. Neither survives, and the
+/// chain offers no way to ask "which blocks did this miner win" — a block carries a claim, not a
+/// miner's name. So the one place that can remember is here, written the moment the line arrives.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProducedBlockRecord {
+    pub hash: String,
+    /// When this Studio saw the node announce it, ms since the epoch. The chain's own timestamp is
+    /// read back from the block itself; this is only the local record's ordering.
+    pub seen_at_ms: u64,
+}
+
 #[derive(Default)]
 struct NodeLogState {
     log: VecDeque<String>,
@@ -430,6 +458,10 @@ struct NodeLogState {
     /// What the log has said about mining, folded as lines arrive rather than scanned back out
     /// of a 600-line window that rotates in under a minute.
     mining: MiningFacts,
+    /// Where to append produced blocks. `None` in tests and before a data dir is known.
+    journal: Option<PathBuf>,
+    /// Every block this machine has produced, oldest first — the journal, in memory.
+    produced: Vec<ProducedBlockRecord>,
     /// The producer's newest draw report. Kept HERE rather than re-read from `log` because the
     /// node prints it once every five minutes and the retained window is far shorter than that
     /// under a chatty node: scanning the window made the app forget it was mining between
@@ -524,6 +556,23 @@ pub struct Effort {
     pub ticket_one_in: Option<f64>,
 }
 
+/// One row of the Studio's own block explorer: a block this machine produced, described by the
+/// chain rather than by the log that first named it.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ProducedBlockView {
+    pub hash: String,
+    pub seen_at_ms: u64,
+    /// Whether the node still holds this block. False is a real answer, not an error.
+    pub found: bool,
+    pub daa_score: Option<u64>,
+    pub algo_id: Option<u8>,
+    pub is_chain_block: Option<bool>,
+    pub timestamp_ms: Option<u64>,
+    /// What this block's own coinbase paid to this producer's address, in sompi. Zero is the
+    /// normal answer while the claim is escrowed.
+    pub paid_to_me_sompi: Option<u64>,
+}
+
 /// **The pay a producer has actually received**, split the way a person asks about it.
 ///
 /// Every field comes from the node's own utxo index over the pay address; nothing is inferred from
@@ -574,9 +623,153 @@ pub enum NodeBlocker {
     },
 }
 
+impl NodeLogState {
+    /// **Forget the last run, keep what the machine owns.**
+    ///
+    /// Starting a node clears the log window, the class table and the per-run mining facts: a new
+    /// run's face must not carry the old run's holds, and the `produced block #N` counter is
+    /// per-process by the node's own design. What must NOT be cleared is the journal — its path
+    /// and the blocks already written to it are this machine's record of its own work, and the
+    /// first version of this cleared them with everything else, so the explorer came up empty
+    /// after every restart.
+    fn reset_for_new_run(&mut self) {
+        let journal = self.journal.take();
+        let produced = std::mem::take(&mut self.produced);
+        *self = NodeLogState { journal, produced, ..Default::default() };
+    }
+
+    /// Append a produced block, once. Re-reading the same log line — a restart replaying, a
+    /// duplicate emit — must not grow the record, so the hash is the identity.
+    fn remember_produced(&mut self, hash: String) {
+        if self.produced.iter().any(|b| b.hash == hash) {
+            return;
+        }
+        let record = ProducedBlockRecord {
+            hash,
+            seen_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        };
+        self.produced.push(record.clone());
+        // Best effort: a miner's record of its own work must never be able to stop the miner, so a
+        // failed append is dropped rather than propagated. It stays in memory for this run.
+        if let Some(path) = &self.journal
+            && let Ok(line) = serde_json::to_string(&record)
+        {
+            use std::io::Write;
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .and_then(|mut f| writeln!(f, "{line}"));
+        }
+    }
+}
+
+#[cfg(test)]
+impl NodeLogState {
+    fn observe_line_for_test(&mut self, line: &str) {
+        self.mining.observe(line);
+    }
+}
+
+/// Read the journal back. A line that will not parse is skipped, not fatal: a half-written last
+/// line after a kill must not cost the miner the whole record.
+fn read_journal(path: &Path) -> Vec<ProducedBlockRecord> {
+    let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
+    text.lines().filter_map(|l| serde_json::from_str::<ProducedBlockRecord>(l).ok()).collect()
+}
+
 impl NodeManager {
     pub fn new() -> Self {
-        NodeManager { supervised: RwLock::new(None), logs: Arc::new(Mutex::new(NodeLogState::default())) }
+        Self::with_journal(None)
+    }
+
+    /// With a journal, produced blocks survive restarts — see [`ProducedBlockRecord`].
+    pub fn with_journal(journal: Option<PathBuf>) -> Self {
+        let mut state = NodeLogState::default();
+        if let Some(path) = &journal {
+            state.produced = read_journal(path);
+        }
+        state.journal = journal;
+        NodeManager { supervised: RwLock::new(None), logs: Arc::new(Mutex::new(state)) }
+    }
+
+    /// **The blocks this machine won, as the chain describes them now.**
+    ///
+    /// The hashes come from this Studio's own journal — nothing else knows them — and every other
+    /// field is read back from the node, so a row is the chain's answer about a block, not the
+    /// log's memory of it. A block the chain cannot find comes back with `found: false` rather
+    /// than being hidden: a produced block that the network never accepted is exactly the thing an
+    /// operator needs to see.
+    pub async fn produced_blocks(&self, settings: &NodeSettings, limit: usize) -> Vec<ProducedBlockView> {
+        let records = {
+            let logs = self.logs.lock().expect("log lock");
+            logs.produced.clone()
+        };
+        let url = normalize_rpc_url(settings.rpc_url.as_deref().unwrap_or(""), settings.network);
+        let pay_address = {
+            let logs = self.logs.lock().expect("log lock");
+            logs.pay_address.clone()
+        };
+        let mut out = Vec::new();
+        for record in records.iter().rev().take(limit) {
+            let mut view = ProducedBlockView {
+                hash: record.hash.clone(),
+                seen_at_ms: record.seen_at_ms,
+                found: false,
+                daa_score: None,
+                algo_id: None,
+                is_chain_block: None,
+                timestamp_ms: None,
+                paid_to_me_sompi: None,
+            };
+            let answer = wrpc_call(
+                &url,
+                "getBlock",
+                serde_json::json!({ "hash": record.hash, "includeTransactions": true }),
+                Duration::from_secs(4),
+            )
+            .await;
+            if let Ok(value) = answer {
+                let block = value.get("block").unwrap_or(&value);
+                if let Some(header) = block.get("header") {
+                    view.found = true;
+                    view.daa_score = header.get("daaScore").and_then(Value::as_u64);
+                    view.algo_id = header.get("powAlgoId").and_then(Value::as_u64).map(|id| id as u8);
+                    view.timestamp_ms = header.get("timestamp").and_then(Value::as_u64);
+                    view.is_chain_block =
+                        block.get("verboseData").and_then(|v| v.get("isChainBlock")).and_then(Value::as_bool);
+                    // What THIS block paid to THIS producer. Usually nothing: an attempt block's
+                    // own reward is escrowed until its claim is Final, and the coinbase outputs a
+                    // block does carry are other producers' matured claims riding in it.
+                    if let Some(address) = &pay_address {
+                        let paid: u64 = block
+                            .get("transactions")
+                            .and_then(Value::as_array)
+                            .and_then(|txs| txs.first())
+                            .and_then(|tx| tx.get("outputs"))
+                            .and_then(Value::as_array)
+                            .map(|outs| {
+                                outs.iter()
+                                    .filter(|o| {
+                                        o.get("verboseData")
+                                            .and_then(|v| v.get("scriptPublicKeyAddress"))
+                                            .and_then(Value::as_str)
+                                            == Some(address.as_str())
+                                    })
+                                    .filter_map(|o| o.get("amount").and_then(Value::as_u64))
+                                    .sum()
+                            })
+                            .unwrap_or(0);
+                        view.paid_to_me_sompi = Some(paid);
+                    }
+                }
+            }
+            out.push(view);
+        }
+        out
     }
 
     /// Where the node binary is: the configured path, beside the Studio, or PATH.
@@ -711,7 +904,7 @@ impl NodeManager {
 
         {
             let mut logs = self.logs.lock().expect("log lock");
-            *logs = NodeLogState::default();
+            logs.reset_for_new_run();
         }
 
         tracing::info!(binary = %binary.display(), ?args, "starting MISAKA node");
@@ -905,6 +1098,9 @@ async fn drain_node<R: tokio::io::AsyncRead + Unpin>(stream: R, logs: Arc<Mutex<
             state.effort = Some(effort);
         }
         state.mining.observe(&line);
+        if let Some(hash) = parse_produced_block(&line) {
+            state.remember_produced(hash);
+        }
         if is_activity_line(&line) {
             if state.activity.len() == ACTIVITY_CAPACITY {
                 state.activity.pop_front();
@@ -954,6 +1150,70 @@ mod tests {
         assert_eq!(heartbeat_stand_down_secs(8), Some(120));
         // Anything else: no claim. Genesis (1) is not a lane this rule speaks about.
         assert_eq!(heartbeat_stand_down_secs(1), None);
+    }
+
+    #[test]
+    fn a_produced_block_is_taken_by_shape_and_remembered_once() {
+        let line = "2026-09-04 [INFO ] [palw-producer] produced block #1 \
+                    598b36357c2ff8ee72cc89aba8aa4d045b630f4fdfde545c5e8948890b896d8487102fba502998a94cff7f5\
+                    ea771758a4d81842586e64eff109fac14024586f1 (class ticket + Layer-0 both under target)";
+        let hash = parse_produced_block(line).expect("the 128-hex token is the hash");
+        assert_eq!(hash.len(), 128);
+        assert!(hash.starts_with("598b3635"));
+        // Not every line that mentions a block carries one, and a short token is not a hash.
+        assert!(parse_produced_block("[palw-producer] produced block #2 (pending)").is_none());
+        assert!(parse_produced_block("[palw-producer] 12 draws this run, 0 produced").is_none());
+
+        // The journal records a hash once, however many times the line is seen.
+        let mut state = NodeLogState::default();
+        state.remember_produced(hash.clone());
+        state.remember_produced(hash.clone());
+        state.remember_produced("aa".repeat(64));
+        assert_eq!(state.produced.len(), 2, "the hash is the identity");
+        assert_eq!(state.produced[0].hash, hash);
+    }
+
+    #[test]
+    fn starting_a_node_forgets_the_run_and_keeps_the_blocks() {
+        let mut state = NodeLogState { journal: Some(PathBuf::from("/nonexistent/j.jsonl")), ..Default::default() };
+        state.observe_line_for_test("[palw-producer] holding: no peers");
+        state.pay_address = Some("misakatest:q…".into());
+        state.produced.push(ProducedBlockRecord { hash: "ee".repeat(64), seen_at_ms: 1 });
+
+        state.reset_for_new_run();
+
+        assert_eq!(state.produced.len(), 1, "a block won is not a fact about one run");
+        assert!(state.journal.is_some(), "the journal path must outlive the run that opened it");
+        assert!(state.mining.holding.is_none(), "last run's hold must not stand on the new run's face");
+        assert!(state.pay_address.is_none(), "the new run re-announces its own address");
+    }
+
+    #[test]
+    fn the_journal_survives_a_restart_and_a_torn_last_line() {
+        let dir = std::env::temp_dir().join(format!("misaka-journal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("produced-blocks.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        let mut state = NodeLogState { journal: Some(path.clone()), ..Default::default() };
+        state.remember_produced("bb".repeat(64));
+        state.remember_produced("cc".repeat(64));
+
+        // A kill mid-write leaves a partial line; it costs that line, not the record.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).expect("append");
+            write!(f, "{{\"hash\": \"dd").expect("torn write");
+        }
+        let read_back = read_journal(&path);
+        assert_eq!(read_back.len(), 2, "two whole lines survive the torn third");
+        assert_eq!(read_back[0].hash, "bb".repeat(64));
+        assert_eq!(read_back[1].hash, "cc".repeat(64));
+
+        // And a manager built on it starts with the blocks already known.
+        let manager = NodeManager::with_journal(Some(path.clone()));
+        assert_eq!(manager.logs.lock().expect("lock").produced.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

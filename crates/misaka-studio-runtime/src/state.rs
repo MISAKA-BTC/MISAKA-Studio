@@ -92,6 +92,7 @@ impl AppState {
         let backend = build_backend(&settings, &hardware);
         let metrics = MetricsHub::new(&hardware);
 
+        let node = Arc::new(crate::node::NodeManager::with_journal(Some(data_dir.join("produced-blocks.jsonl"))));
         Arc::new(AppState {
             settings: RwLock::new(settings),
             settings_path,
@@ -100,7 +101,7 @@ impl AppState {
             store,
             downloads: Arc::new(DownloadManager::new()),
             metrics,
-            node: Arc::new(crate::node::NodeManager::new()),
+            node,
             records: RwLock::new(records),
             catalog: RwLock::new(catalog),
             backend: RwLock::new(backend),

@@ -381,6 +381,18 @@ export type Effort = {
 }
 
 /** What the chain has actually paid this producer, from the node's own utxo index. */
+/** A block this machine produced, as the chain describes it now. */
+export type ProducedBlock = {
+  hash: string
+  seen_at_ms: number
+  found: boolean
+  daa_score: number | null
+  algo_id: number | null
+  is_chain_block: boolean | null
+  timestamp_ms: number | null
+  paid_to_me_sompi: number | null
+}
+
 export type Rewards = {
   blocks_paid: number
   total_sompi: number
