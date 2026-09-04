@@ -50,7 +50,7 @@ export function ModelBar() {
 
         {loaded && (
           <div className="hidden min-w-0 items-center gap-2 text-xs text-ink-500 md:flex dark:text-ink-400">
-            <QuantBadge quantization={loaded.quantization} />
+            <QuantBadge quantization={loaded.quantization} architecture={loaded.architecture} />
             <span>{bytes(loaded.size_bytes)}</span>
             {runtime?.context_size && <span>· {tokens(runtime.context_size)} ctx</span>}
             {runtime?.gpu_layers !== null && runtime?.gpu_layers !== undefined && loaded.block_count && (

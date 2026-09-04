@@ -422,6 +422,18 @@ pub struct Settings {
     /// Where GGUF files live. Movable, because models are the largest thing on most people's
     /// disks and the system drive is rarely where they want them.
     pub models_dir: PathBuf,
+    /// A model to load as soon as the runtime is up, so the app opens ready to answer rather than
+    /// ready to be told which engine to start.
+    ///
+    /// It names a MODEL, not an engine: which engine runs is `backend.kind`, and the engine is a
+    /// child process that exists because a model is loaded into it — there is no engine to start on
+    /// its own. Naming the integer runtime's artifact here is what "start the MISAKA engine at
+    /// startup" means in this design, and naming a GGUF is the same sentence for llama.cpp.
+    ///
+    /// A load that fails is a log line, never a refusal to start: an engine that will not come up
+    /// must not be able to keep the Studio from opening, because the Settings page that fixes it is
+    /// inside the Studio.
+    pub load_on_start: Option<String>,
     pub server: ServerSettings,
     pub backend: BackendSettings,
     pub node: NodeSettings,
@@ -435,6 +447,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             models_dir: default_models_dir(),
+            load_on_start: None,
             server: ServerSettings::default(),
             backend: BackendSettings::default(),
             node: NodeSettings::default(),

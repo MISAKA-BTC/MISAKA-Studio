@@ -19,6 +19,7 @@ export function SettingsView() {
   const settings = useStudio((s) => s.settings)
   const save = useStudio((s) => s.saveSettings)
   const system = useStudio((s) => s.system)
+  const models = useStudio((s) => s.models)
   const [draft, setDraft] = useState<Settings | null>(settings)
   const [backends, setBackends] = useState<BackendInfo[]>([])
 
@@ -56,6 +57,9 @@ export function SettingsView() {
               <option value="auto">Auto — MLX on Apple Silicon, llama.cpp elsewhere</option>
               <option value="llama_cpp">llama.cpp (llama-server)</option>
               <option value="mlx">MLX (Apple Silicon)</option>
+              {/* The engine that reads a `.palwart`. It was missing from this list while the load
+                  error for one told people to select it here. */}
+              <option value="misaka">MISAKA integer runtime — the engine a PALW class registers</option>
               <option value="mock">Mock — canned replies, no model needed</option>
             </select>
           </Field>
@@ -87,6 +91,48 @@ export function SettingsView() {
               value={draft.backend.llama_server_path ?? ''}
               onChange={(e) => set('backend', { ...draft.backend, llama_server_path: e.target.value || null })}
             />
+          </Field>
+
+          <Field
+            label="misaka-palw-serve path"
+            hint="The integer runtime, for PALW class artifacts (.palwart). Build it with `cargo build --release -p misaka-palw-base0 --bin misaka-palw-serve`. Empty looks beside the app and on PATH."
+          >
+            <input
+              className="input mt-1"
+              placeholder="/path/to/misaka-palw-serve"
+              value={draft.backend.misaka_serve_path ?? ''}
+              onChange={(e) => set('backend', { ...draft.backend, misaka_serve_path: e.target.value || null })}
+            />
+          </Field>
+
+          <Field
+            label="Tokenizer for the integer runtime"
+            hint="A .palwart commits to what the ids MEAN and never ships the tokenizer, so the file comes from here. Empty looks for tokenizer.json beside the artifact."
+          >
+            <input
+              className="input mt-1"
+              placeholder="/path/to/tokenizer.json"
+              value={draft.backend.misaka_tokenizer_path ?? ''}
+              onChange={(e) => set('backend', { ...draft.backend, misaka_tokenizer_path: e.target.value || null })}
+            />
+          </Field>
+
+          <Field
+            label="Load at startup"
+            hint="Loaded as soon as the runtime is up, so the app opens ready to answer. The engine is a child process of a loaded model — naming one here is how an engine starts on its own."
+          >
+            <select
+              className="input mt-1"
+              value={draft.load_on_start ?? ''}
+              onChange={(e) => set('load_on_start', e.target.value || null)}
+            >
+              <option value="">Nothing — load a model when I ask</option>
+              {models.map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.id}
+                </option>
+              ))}
+            </select>
           </Field>
 
           <Field label="GPU offload">

@@ -68,6 +68,39 @@ pub enum PalwArtifactSource {
     },
 }
 
+impl PalwArtifactSource {
+    /// The extension this artifact carries on disk, or `None` for a class that has no file.
+    ///
+    /// Read off the class table rather than written out again. Three places have to agree about
+    /// what an artifact looks like — the model scan, the network tab's artifact scan, and the gate
+    /// that keeps one out of an inference engine — and a list spelled three times is a list that a
+    /// new class updates in one of them.
+    pub fn file_extension(&self) -> Option<&'static str> {
+        let filename = match self {
+            PalwArtifactSource::DerivedFromSeed => return None,
+            PalwArtifactSource::ConvertLocally { extension, .. } => return Some(extension),
+            PalwArtifactSource::Download { filename, .. } => *filename,
+        };
+        // `rfind`, not `find`: every artifact filename in the table carries a version dot
+        // (`qwen2.5-…`), and the first dot would name `.5-1` as the extension.
+        filename.rfind('.').map(|dot| &filename[dot..])
+    }
+}
+
+/// Whether a file in the models directory is a PALW execution artifact — something a class is
+/// produced with — rather than a model an inference engine can load.
+///
+/// The two live in one directory on purpose, so this is the question that separates them. It is
+/// asked by name, not by content: a scan that opened every file to read a magic number would read
+/// 34 GiB of artifact to list a directory.
+///
+/// A partially downloaded artifact (`qwen36.palwq36.part`) is deliberately **not** one: it is not
+/// an artifact until the download finishes, and offering half a file is offering a failure.
+pub fn is_artifact_filename(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    TESTNET11_CLASSES.iter().filter_map(|class| class.artifact.file_extension()).any(|ext| lower.ends_with(ext))
+}
+
 /// One chain-registered execution class.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PalwClassSpec {
@@ -416,5 +449,58 @@ mod tests {
         assert!(note.contains("cannot run"), "{note}");
         let qwen25 = statuses.iter().find(|s| s.spec.name == "PALW-QWEN25-A16").expect("class");
         assert!(qwen25.memory_note.is_none(), "1.7 GiB fits a 16 GiB machine");
+    }
+
+    /// The extension comes off the filename's LAST dot. Every artifact in the table is named after
+    /// a model with a version in it, so the first dot answers `.5-1.5b-a16` and the scan then finds
+    /// nothing at all.
+    #[test]
+    fn an_extension_is_read_from_the_last_dot_of_the_filename() {
+        let download = PalwArtifactSource::Download {
+            filename: "qwen2.5-1.5b-a16.palwart",
+            repo_path: "palw-runtime/qwen2.5-1.5b-a16.palwart",
+            sha256: "00",
+            size_bytes: 1,
+            hf_repo: "example/repo",
+            convert_command: "convert",
+        };
+        assert_eq!(download.file_extension(), Some(".palwart"));
+        assert_eq!(
+            PalwArtifactSource::ConvertLocally {
+                extension: ".palwq36",
+                approx_size_bytes: 1,
+                source_repo: "example/weights",
+                convert_command: "convert",
+            }
+            .file_extension(),
+            Some(".palwq36")
+        );
+        // The floor has no file, and a class with no file must not contribute an extension that
+        // would make every name in the directory an artifact.
+        assert_eq!(PalwArtifactSource::DerivedFromSeed.file_extension(), None);
+    }
+
+    /// Every registered class that has a file must be recognisable from its name. A class whose
+    /// filename lost its extension would be invisible to the scan and, worse, invisible to the gate
+    /// that keeps artifacts out of an inference engine.
+    #[test]
+    fn every_registered_artifact_is_recognised_by_its_own_filename() {
+        for class in TESTNET11_CLASSES {
+            let PalwArtifactSource::Download { filename, .. } = class.artifact else { continue };
+            assert!(is_artifact_filename(filename), "{}: {filename} is not recognised as an artifact", class.name);
+        }
+    }
+
+    /// The two file kinds share one directory, so this predicate is the only thing between a PALW
+    /// artifact and `llama-server`, which reads four bytes, finds `PALW` where `GGUF` should be and
+    /// aborts. A `.part` is not an artifact yet: offering half a file is offering that same failure.
+    #[test]
+    fn a_gguf_and_a_half_downloaded_artifact_are_not_artifacts() {
+        assert!(is_artifact_filename("qwen25-1.5b-a16.palwart"));
+        assert!(is_artifact_filename("qwen36.palwq36"));
+        assert!(is_artifact_filename("QWEN36.PALWQ36"), "the models directory is not case-sensitive everywhere");
+        assert!(!is_artifact_filename("qwen2.5-1.5b-instruct-q4_k_m.gguf"));
+        assert!(!is_artifact_filename("qwen36.palwq36.part"));
+        assert!(!is_artifact_filename("qwen25-1.5b-a16.palwart.misaka.json"));
     }
 }

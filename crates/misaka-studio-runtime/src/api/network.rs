@@ -12,6 +12,7 @@ use crate::{Error, Result};
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use misaka_studio_core::palw;
 use misaka_studio_core::palw::{PalwArtifactSource, PalwClassStatus, TESTNET11_CLASSES, assess_classes};
 use misaka_studio_core::settings::{NetworkRole, NodeNetwork};
 use serde::{Deserialize, Serialize};
@@ -43,10 +44,12 @@ struct NetworkOverview {
     kaspad_path: String,
 }
 
-/// Scan the models directory for PALW artifacts (`.palwq36`, `.palwart`).
+/// Scan the models directory for PALW artifacts.
 ///
-/// The same directory models live in, on purpose: it is the one place users already know, and
-/// the GGUF scanner ignores these extensions so the two lists cannot contaminate each other.
+/// The same directory models live in, on purpose: it is the one place users already know. What
+/// counts as an artifact is [`palw::is_artifact_filename`], the same question the model scan and
+/// the load gate ask — the model list does show artifacts, and it is the gate, not this scan, that
+/// keeps one from reaching an inference engine.
 async fn artifact_scan(state: &AppState) -> Vec<(String, String, u64)> {
     let dir = state.settings.read().await.models_dir.clone();
     tokio::task::spawn_blocking(move || {
@@ -54,7 +57,7 @@ async fn artifact_scan(state: &AppState) -> Vec<(String, String, u64)> {
         let Ok(entries) = std::fs::read_dir(&dir) else { return out };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !(name.ends_with(".palwq36") || name.ends_with(".palwart")) {
+            if !palw::is_artifact_filename(&name) {
                 continue;
             }
             if let Ok(meta) = entry.metadata()

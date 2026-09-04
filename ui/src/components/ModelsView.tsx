@@ -140,14 +140,27 @@ function InstalledList() {
     <div className="space-y-3 p-4">
       {models.map((model) => {
         const isLoaded = runtime?.model_id === model.id
+        // Only the MISAKA runtime reads a class artifact; every other engine aborts on its magic.
+        const isMiningArtifact = model.architecture === 'palw' && runtime?.backend !== 'misaka'
         return (
           <div key={model.id} className={`card p-4 ${isLoaded ? 'ring-1 ring-arc-500' : ''}`}>
             <div className="flex flex-wrap items-start gap-3">
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
                   <h3 className="truncate text-sm font-semibold">{model.id}</h3>
-                  <QuantBadge quantization={model.quantization} />
+                  <QuantBadge quantization={model.quantization} architecture={model.architecture} />
                   {isLoaded && <span className="badge bg-arc-600 text-white">loaded</span>}
+                  {/* A class artifact sits in the models directory beside the GGUFs and is not one:
+                      the node mines with it, no inference engine here can read it, and pressing Load
+                      on it is how people found that out. */}
+                  {isMiningArtifact && (
+                    <span
+                      className="badge bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300"
+                      title="A PALW class artifact: the node mines with this file. It is not a chat model."
+                    >
+                      mining artifact
+                    </span>
+                  )}
                   {model.expert_count && <span className="badge bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300">MoE · {model.expert_count} experts</span>}
                 </div>
 
@@ -185,6 +198,16 @@ function InstalledList() {
                   <button type="button" className="btn-outline" onClick={() => void unloadModel()}>
                     <Icon name="power" className="size-3.5" />
                     Unload
+                  </button>
+                ) : isMiningArtifact ? (
+                  <button
+                    type="button"
+                    className="btn-outline"
+                    title="This file is mined with, not chatted with. The Network tab is where a class artifact is named to the node."
+                    onClick={() => setView('network')}
+                  >
+                    <Icon name="globe" className="size-3.5" />
+                    Mining
                   </button>
                 ) : (
                   <button

@@ -165,6 +165,8 @@ async fn main() -> anyhow::Result<()> {
     // Before the listener binds, so a first run is already fetching the default class artifact
     // by the time the window has finished opening.
     state.spawn_default_class_install();
+    // Same reason, one step later: the model named for startup is loaded while the window opens.
+    state.spawn_startup_load();
 
     let models = state.store.list().await.len();
     let app = api::router(state.clone(), ui_dir.clone(), cors_origins);

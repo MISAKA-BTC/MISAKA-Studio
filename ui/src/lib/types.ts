@@ -189,11 +189,15 @@ export type DownloadProgress = {
 
 export type Settings = {
   models_dir: string
+  /** A model id to load as soon as the runtime is up; null loads nothing. */
+  load_on_start: string | null
   server: { host: string; port: number; api_key: string | null; cors_origins: string[] }
   backend: {
     kind: 'auto' | 'llama_cpp' | 'mlx' | 'misaka' | 'mock'
     llama_server_path: string | null
     mlx_server_path: string | null
+    misaka_serve_path: string | null
+    misaka_tokenizer_path: string | null
     gpu_layers: { mode: 'auto' } | { mode: 'all' } | { mode: 'none' } | { mode: 'fixed'; layers: number }
     threads: number | null
     flash_attention: 'auto' | 'on' | 'off'

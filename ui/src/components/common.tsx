@@ -138,7 +138,13 @@ export function CopyButton({ text, label = 'Copy', className = 'btn-ghost' }: { 
   )
 }
 
-export function QuantBadge({ quantization }: { quantization: Quantization | null }) {
+export function QuantBadge({ quantization, architecture }: { quantization: Quantization | null; architecture?: string | null }) {
+  // A PALW class artifact reaches here with every shape field null ON PURPOSE: the Studio has no
+  // decoder for that format and refuses to put a number nobody measured where a user decides
+  // whether a model fits. "unquantized?" is exactly such a number — and a wrong one, since the
+  // published A16 artifact is W8A16 static-PTQ. Nothing is the honest badge; the row already says
+  // `palw`, and the engine reports the real shape at load.
+  if (architecture === 'palw') return quantization ? <QuantBadge quantization={quantization} /> : null
   if (!quantization) return <span className="badge bg-ink-100 text-ink-500 dark:bg-ink-800 dark:text-ink-400">unquantized?</span>
   const tone: Record<Quantization['tier'], string> = {
     lossless: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300',

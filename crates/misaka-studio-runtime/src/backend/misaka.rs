@@ -47,6 +47,11 @@ pub struct MisakaBackend {
 }
 
 impl MisakaBackend {
+    /// The name this backend answers to, everywhere. The load gate in `state.rs` compares against
+    /// it to decide whether a PALW artifact has an engine that can read it, and a gate comparing
+    /// against a second copy of the string is a gate that opens the day one of them is renamed.
+    pub const NAME: &'static str = "misaka";
+
     /// `serve` is `backend.misaka_serve_path` and `tokenizer` is `backend.misaka_tokenizer_path`;
     /// both `None` fall back to the resolutions documented on the settings fields.
     pub fn new(serve: Option<PathBuf>, tokenizer: Option<PathBuf>, startup_timeout: Duration) -> Self {
@@ -131,7 +136,7 @@ fn build_args(request: &LoadRequest, port: u16, tokenizer: Option<&std::path::Pa
 
 impl InferenceBackend for MisakaBackend {
     fn name(&self) -> &'static str {
-        "misaka"
+        MisakaBackend::NAME
     }
 
     fn descriptor(&self) -> BoxFuture<'_, RuntimeDescriptor> {

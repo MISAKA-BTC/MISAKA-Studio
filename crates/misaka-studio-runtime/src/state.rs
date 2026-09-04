@@ -20,6 +20,7 @@ use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use misaka_studio_core::HardwareSnapshot;
 use misaka_studio_core::model::LocalModel;
+use misaka_studio_core::palw;
 use misaka_studio_core::provenance::{
     InferenceInputs, InferenceRecord, ModelIdentity, RuntimeIdentity, SamplingCommitment, canonical_prompt_bytes,
     canonical_raw_prompt_bytes,
@@ -126,6 +127,32 @@ impl AppState {
     /// down: each of those leaves a working Studio with the Install button exactly where it was.
     /// Called by the binary rather than from `new` so that constructing state in a test does not
     /// reach the network.
+    /// **Have the engine up before anyone asks.** Loads [`Settings::load_on_start`], if set.
+    ///
+    /// In the background and after the listener binds its own task, because a 1.7 GiB artifact is
+    /// tens of seconds of mapping and an app that shows nothing until then looks broken. The
+    /// outcome is logged either way: a startup load that silently did not happen is
+    /// indistinguishable, from the chat box, from an engine that is merely slow.
+    pub fn spawn_startup_load(self: &Arc<Self>) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let Some(model_id) = state.settings.read().await.load_on_start.clone() else { return };
+            tracing::info!(model = %model_id, "loading at startup");
+            match state.load(&model_id, None).await {
+                Ok(status) => tracing::info!(
+                    model = %model_id,
+                    backend = %status.backend,
+                    ms = status.load_ms.unwrap_or(0),
+                    "loaded at startup"
+                ),
+                // Named, not swallowed: the two reasons this fails — the model is gone, or the
+                // engine for it is not installed — are both fixed from the Settings page, and the
+                // person reading the log is the person who has to fix them.
+                Err(e) => tracing::warn!(model = %model_id, "startup load failed: {e}"),
+            }
+        });
+    }
+
     pub fn spawn_default_class_install(self: &Arc<Self>) {
         let state = self.clone();
         tokio::spawn(async move {
@@ -239,6 +266,24 @@ impl AppState {
         let model = self.store.require(model_id).await?;
         let settings = self.settings.read().await.clone();
         let backend = self.backend().await;
+
+        // A PALW artifact is not a GGUF. `llama-server` reads its first four bytes, finds `PALW`
+        // where `GGUF` should be, and aborts — and what the user got for a file the Studio already
+        // knew was unloadable was fifteen lines of another program's stderr, in a notification that
+        // stays until it is dismissed. The check is here, above every backend, because the model
+        // list deliberately carries artifacts (the MISAKA runtime loads them; nothing else can) and
+        // the backend is a global setting, so the pairing can only be judged at the load.
+        //
+        // Before the availability check on purpose: `llamacpp is not available, install it` is a
+        // true sentence that sends someone to build an engine which still could not read this
+        // file. The pairing is wrong whether or not the engine is installed.
+        //
+        // The pairing runs BOTH ways. An engine handed the other kind of file does not decline it:
+        // it starts, reads a header it cannot parse, and aborts, and what the user gets for a
+        // mismatch the Studio could see coming is fifteen lines of that program's stderr.
+        if let Some(message) = engine_pairing_refusal(&model.id, model.path.file_name().and_then(|n| n.to_str()), backend.name()) {
+            return Err(Error::BadRequest { message });
+        }
 
         let availability = backend.availability().await;
         if let crate::backend::Availability::Unavailable { reason, remedy } = availability {
@@ -529,9 +574,60 @@ pub fn plan_gpu_layers(model: &LocalModel, hardware: &HardwareSnapshot, context:
     Some(((for_weights / per_layer) as u32).min(total_layers))
 }
 
+/// **The file and the engine, checked against each other.**
+///
+/// Returns why a load cannot work, or `None` when the pair is fine. A free function, and pure, so
+/// both directions are tested without a store, an engine, or a machine that has either installed —
+/// the pairing IS the decision, and it is the part that was getting answered by another program's
+/// stderr.
+fn engine_pairing_refusal(model_id: &str, file_name: Option<&str>, backend: &str) -> Option<String> {
+    let is_artifact = file_name.is_some_and(palw::is_artifact_filename);
+    match (is_artifact, backend == MisakaBackend::NAME) {
+        (true, false) => Some(format!(
+            "{model_id} is a PALW class artifact, not a GGUF. Mining does not load it here — the node runs it, \
+             and the Network tab is where it is named to the node. Chatting with it needs the `{misaka}` engine: \
+             build `misaka-palw-serve`, set it under Settings → Backend, and choose `{misaka}` as the engine. \
+             The {backend} backend cannot read this file.",
+            misaka = MisakaBackend::NAME,
+        )),
+        (false, true) => Some(format!(
+            "{model_id} is a GGUF, and the `{misaka}` engine runs PALW class artifacts — the integer runtime a \
+             class registers, not llama.cpp's format. Set the engine back to `auto` under Settings → Backend to \
+             chat with this model.",
+            misaka = MisakaBackend::NAME,
+        )),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both directions of the same mistake. On 2026-09-04 only the first existed as a check, and
+    /// only after a `.palwart` reached `llama-server`, which read `PALW` where `GGUF` should be and
+    /// aborted with fifteen lines of stderr that landed in a notification the window was too short
+    /// to close. The second direction is the one a user reaches by FOLLOWING the first message:
+    /// switch to the integer runtime, and now every GGUF in the list is the wrong file.
+    #[test]
+    fn each_engine_refuses_the_other_kind_of_file_and_says_where_to_go() {
+        let artifact_on_llamacpp = engine_pairing_refusal("qwen25-1.5b-a16", Some("qwen25-1.5b-a16.palwart"), "llamacpp")
+            .expect("llama.cpp cannot read a class artifact");
+        assert!(artifact_on_llamacpp.contains("Network tab"), "{artifact_on_llamacpp}");
+        assert!(artifact_on_llamacpp.contains("misaka"), "{artifact_on_llamacpp}");
+        assert_eq!(artifact_on_llamacpp.lines().count(), 1, "a notification has to hold it");
+
+        let gguf_on_misaka =
+            engine_pairing_refusal("qwen2.5-1.5b-instruct-q4_k_m", Some("qwen2.5-1.5b-instruct-q4_k_m.gguf"), "misaka")
+                .expect("the integer runtime cannot read a GGUF");
+        assert!(gguf_on_misaka.contains("auto"), "the way back has to be named: {gguf_on_misaka}");
+
+        // The two pairings that work are silent.
+        assert!(engine_pairing_refusal("a", Some("class.palwart"), "misaka").is_none());
+        assert!(engine_pairing_refusal("b", Some("model.gguf"), "llamacpp").is_none());
+        // An MLX model is a directory: no file name, and no artifact, so no refusal from here.
+        assert!(engine_pairing_refusal("c", None, "mlx").is_none());
+    }
     use misaka_studio_core::hardware::{Accelerator, AcceleratorKind};
     use misaka_studio_core::model::ModelSource;
 

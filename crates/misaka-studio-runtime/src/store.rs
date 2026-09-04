@@ -21,6 +21,7 @@
 
 use crate::{Error, Result};
 use misaka_studio_core::model::{LocalModel, ModelSource};
+use misaka_studio_core::palw;
 use misaka_studio_core::quant::Quantization;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -250,7 +251,7 @@ fn scan_dir(dir: &Path, depth: usize, found: &mut HashMap<String, LocalModel>) {
         // would put a guess in a record. The engine reports the real shape at `/health` when it
         // loads the file.
         let lower = name.to_ascii_lowercase();
-        if lower.ends_with(".palwart") {
+        if palw::is_artifact_filename(&lower) {
             let sidecar = Sidecar::load(&path);
             if let Some(model) = inspect_palw_artifact(&path, sidecar) {
                 found.entry(model.id.clone()).or_insert(model);
