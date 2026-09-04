@@ -31,9 +31,13 @@ are implemented and tested. The llama.cpp backend has been run end to end agains
 spawns its runtime and takes it down again. The Network tab joins the MISAKA network: it has
 **mined real PALW blocks** — a Studio-supervised bonded producer on a locally minted
 `ConsensusV2` chain, with a second bonded node verifying and filing receipts (see
-*Joining the MISAKA network*). Not yet done: MLX is wired but has never run on a Mac, no CUDA or
-Metal machine has executed a model here, and the public-testnet join is unexercised from the
-build environment (no P2P egress).
+*Joining the MISAKA network*). **On the public testnet (testnet-11, Relaunch 5f) the hosted-slot
+path runs end to end from the app**: join, take the faucet's grant, and the slot registers its own
+bond and produces — measured 2026-09-04, bond `56b6bfbd…` from a 12 tMSK grant the app requested,
+with no node on this machine. Not yet done: MLX is wired but has never run on a Mac, no CUDA or
+Metal machine has executed a model here, and a Studio-supervised node has produced on a local
+chain rather than on the public one (that path needs a `kaspad` built for the current release
+beside the app).
 
 ## Quick start
 
