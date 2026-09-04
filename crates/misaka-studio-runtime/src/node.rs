@@ -277,6 +277,38 @@ pub(crate) fn mining_state(log: &VecDeque<String>, role: NetworkRole, reachable:
     if blocks > 0 { MiningState::Producing { blocks, latest_number } } else { MiningState::Starting { holding } }
 }
 
+/// Split a `getUtxosByAddresses` answer into the pay a producer has, and the pay it is waiting for.
+///
+/// Only coinbase outputs count: the funds an operator sent to register the bond sit at the same
+/// address and are not earnings, and calling them earnings is the one mistake this panel exists to
+/// avoid.
+pub(crate) fn rewards_from_utxos(value: &Value, virtual_daa: u64) -> Rewards {
+    let mut rewards =
+        Rewards { blocks_paid: 0, total_sompi: 0, spendable_sompi: 0, maturing_sompi: 0, next_mature_daa: None };
+    let Some(entries) = value.get("entries").and_then(Value::as_array) else { return rewards };
+    for entry in entries {
+        let Some(utxo) = entry.get("utxoEntry") else { continue };
+        if !utxo.get("isCoinbase").and_then(Value::as_bool).unwrap_or(false) {
+            continue;
+        }
+        let amount = utxo.get("amount").and_then(Value::as_u64).unwrap_or(0);
+        let daa = utxo.get("blockDaaScore").and_then(Value::as_u64).unwrap_or(0);
+        let matures_at = daa.saturating_add(misaka_studio_core::palw::TESTNET11_COINBASE_MATURITY_DAA);
+        rewards.blocks_paid += 1;
+        rewards.total_sompi = rewards.total_sompi.saturating_add(amount);
+        if virtual_daa >= matures_at {
+            rewards.spendable_sompi = rewards.spendable_sompi.saturating_add(amount);
+        } else {
+            rewards.maturing_sompi = rewards.maturing_sompi.saturating_add(amount);
+            rewards.next_mature_daa = Some(match rewards.next_mature_daa {
+                Some(soonest) => soonest.min(matures_at),
+                None => matures_at,
+            });
+        }
+    }
+    rewards
+}
+
 pub(crate) fn stale_chain_line(log: &VecDeque<String>) -> Option<String> {
     log.iter().rev().find(|line| line.contains("Genesis not found in active consensus DB")).cloned()
 }
@@ -347,6 +379,9 @@ pub struct NodeView {
     /// The bond outpoint the node printed when its registration carrier confirmed. `None` until
     /// the node says it; the settings' `producer_bond` should be set to it before the next start.
     pub registered_bond: Option<String>,
+    /// The blocks this producer has been paid for, as the chain holds them. `None` when there is
+    /// no address yet or the node did not answer.
+    pub rewards: Option<Rewards>,
     /// What the chain holds at the pay address, in sompi, read from the node's own utxo index
     /// (`getBalanceByAddress`). `None` when there is no address yet or the node did not answer.
     /// This is the number a person means by "have I been paid" — it includes the funds they sent
@@ -376,6 +411,27 @@ pub enum MiningState {
     /// The node has produced blocks. `blocks` counts what this supervision has seen — the chain's
     /// own `#N` is carried separately because a restart resets the first and not the second.
     Producing { blocks: u64, latest_number: Option<u64> },
+}
+
+/// **The pay a producer has actually received**, split the way a person asks about it.
+///
+/// Every field comes from the node's own utxo index over the pay address; nothing is inferred from
+/// the log. `blocks_paid` counts COINBASE outputs — one per block whose reward has landed — so it
+/// is the number of blocks this machine has actually been paid for, which is not the same as the
+/// number it has produced: an attempt-lane block's reward is escrowed until its claim is Final,
+/// and a voided claim burns it rather than paying it.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct Rewards {
+    /// Coinbase outputs at this address: one per paid block.
+    pub blocks_paid: u64,
+    /// Their total, in sompi.
+    pub total_sompi: u64,
+    /// The part that is spendable now (older than the maturity window).
+    pub spendable_sompi: u64,
+    /// The part still maturing.
+    pub maturing_sompi: u64,
+    /// The DAA at which the next maturing reward becomes spendable, when one is waiting.
+    pub next_mature_daa: Option<u64>,
 }
 
 /// **A startup the node refused, named rather than left as "connection refused".**
@@ -636,6 +692,17 @@ impl NodeManager {
         // Asked of the node the Studio is already talking to, not of an explorer: the answer is the
         // one this machine's own chain view holds, and it is absent rather than wrong when the node
         // is unreachable or has no utxo index.
+        let rewards = match (&pay_address, status.reachable) {
+            (Some(address), true) => {
+                let url = normalize_rpc_url(settings.rpc_url.as_deref().unwrap_or(""), settings.network);
+                let virtual_daa = status.virtual_daa_score.unwrap_or(0);
+                wrpc_call(&url, "getUtxosByAddresses", serde_json::json!({ "addresses": [address] }), Duration::from_secs(4))
+                    .await
+                    .ok()
+                    .map(|value| rewards_from_utxos(&value, virtual_daa))
+            }
+            _ => None,
+        };
         let pay_balance_sompi = match (&pay_address, status.reachable) {
             (Some(address), true) => {
                 let url = normalize_rpc_url(settings.rpc_url.as_deref().unwrap_or(""), settings.network);
@@ -677,6 +744,7 @@ impl NodeManager {
             mining,
             pay_address,
             registered_bond,
+            rewards,
             pay_balance_sompi,
         })
     }
@@ -734,6 +802,27 @@ async fn drain_node<R: tokio::io::AsyncRead + Unpin>(stream: R, logs: Arc<Mutex<
 mod tests {
     use super::*;
     use misaka_studio_core::settings::NodeSettings;
+
+    #[test]
+    fn rewards_count_coinbase_outputs_and_split_them_by_maturity() {
+        // Two coinbase rewards and the operator's own funding transfer at the same address.
+        let answer = serde_json::json!({"entries": [
+            {"utxoEntry": {"amount": 100, "blockDaaScore": 10, "isCoinbase": true}},
+            {"utxoEntry": {"amount": 250, "blockDaaScore": 900, "isCoinbase": true}},
+            {"utxoEntry": {"amount": 1_200_000_000u64, "blockDaaScore": 830, "isCoinbase": false}},
+        ]});
+        let rewards = rewards_from_utxos(&answer, 1000);
+        assert_eq!(rewards.blocks_paid, 2, "the transfer is not a reward");
+        assert_eq!(rewards.total_sompi, 350);
+        assert_eq!(rewards.spendable_sompi, 100, "daa 10 + 601 is long past");
+        assert_eq!(rewards.maturing_sompi, 250);
+        assert_eq!(rewards.next_mature_daa, Some(1501));
+
+        // Nothing paid yet is not an error, and not a zero-with-a-blank.
+        let empty = rewards_from_utxos(&serde_json::json!({"entries": []}), 1000);
+        assert_eq!(empty.blocks_paid, 0);
+        assert_eq!(empty.next_mature_daa, None);
+    }
 
     #[test]
     fn a_draw_after_a_hold_clears_it() {

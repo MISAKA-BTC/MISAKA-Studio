@@ -94,6 +94,15 @@ pub struct PalwClassSpec {
 /// GiB, binary.
 const GIB: u64 = 1 << 30;
 
+/// **How long a block's pay sits before it can be spent, in DAA**, on testnet-11.
+///
+/// A coinbase output matures one block after acceptance and then waits out the settlement window
+/// the network runs (600 DAA), so a reward is spendable at `block DAA + 601`. The node does not
+/// publish the window over RPC — it is a consensus parameter — so it is pinned here beside the
+/// class table, with the same rule: if the network changes it, this is the line that must change.
+/// It is used only to SAY when a reward becomes spendable; nothing in the app spends.
+pub const TESTNET11_COINBASE_MATURITY_DAA: u64 = 601;
+
 /// The testnet-11 genesis classes.
 ///
 /// Order is the order a newcomer should read them in: the one that needs nothing first.

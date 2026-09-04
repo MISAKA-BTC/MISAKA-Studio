@@ -890,6 +890,43 @@ function ProducerIdentityCard({ node }: { node: NodeView }) {
             Derived by the node from the producer key. Rewards land here and the bond's collateral is spent from
             here; the <strong>misakascan faucet</strong> hands out 12 MSK once per address, which is enough.
           </p>
+          {node.rewards && (
+            <div className="mt-3 rounded-lg bg-ink-100 p-2 dark:bg-ink-800/60">
+              <div className="text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">Rewards</div>
+              {node.rewards.blocks_paid === 0 ? (
+                <p className="mt-0.5 text-[0.7rem] text-ink-600 dark:text-ink-300">
+                  No block has paid yet. A block's reward is escrowed until its claim is Final, so this stays at
+                  zero through the windows even after the first win.
+                </p>
+              ) : (
+                <>
+                  <div className="mt-0.5 grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+                    <div>
+                      <div className="text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">Blocks paid</div>
+                      <div className="tabular-nums">{node.rewards.blocks_paid}</div>
+                    </div>
+                    <div>
+                      <div className="text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">Total</div>
+                      <div className="tabular-nums">{msk(node.rewards.total_sompi)}</div>
+                    </div>
+                    <div>
+                      <div className="text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">Spendable now</div>
+                      <div className="tabular-nums">{msk(node.rewards.spendable_sompi)}</div>
+                    </div>
+                    <div>
+                      <div className="text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">Still maturing</div>
+                      <div className="tabular-nums">{msk(node.rewards.maturing_sompi)}</div>
+                    </div>
+                  </div>
+                  {node.rewards.next_mature_daa !== null && (
+                    <p className="mt-1 text-[0.7rem] text-ink-500 dark:text-ink-400">
+                      The next one is spendable at DAA {node.rewards.next_mature_daa.toLocaleString()}.
+                    </p>
+                  )}
+                </>
+              )}
+            </div>
+          )}
           {node.pay_balance_sompi !== null && (
             <p className="mt-1 text-[0.7rem] text-ink-600 dark:text-ink-300">
               The chain holds <strong>{msk(node.pay_balance_sompi)}</strong> at this address — what you sent, plus

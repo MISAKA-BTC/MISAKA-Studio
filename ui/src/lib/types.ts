@@ -366,6 +366,16 @@ export type NodeView = {
   pay_address: string | null
   registered_bond: string | null
   pay_balance_sompi: number | null
+  rewards: Rewards | null
+}
+
+/** What the chain has actually paid this producer, from the node's own utxo index. */
+export type Rewards = {
+  blocks_paid: number
+  total_sompi: number
+  spendable_sompi: number
+  maturing_sompi: number
+  next_mature_daa: number | null
 }
 
 export type NetworkOverview = {
