@@ -347,6 +347,7 @@ export type NodeClassRow = {
   status: string
   share_permille: number | null
   budget_blocks: number | null
+  canonical_leaves: number | null
 }
 
 export type NodeBlocker =

@@ -126,17 +126,25 @@ export function NetworkView() {
           <section className="card p-5">
             <div className="flex items-baseline justify-between">
               <h3 className="text-sm font-semibold">Mining classes</h3>
-              <span className="text-[0.7rem] text-ink-500 dark:text-ink-400">testnet-11 genesis registry</span>
+              <span className="text-[0.7rem] text-ink-500 dark:text-ink-400">
+                {node.classes_from_node.length > 0 ? "your node's class table" : 'testnet-11 genesis registry'}
+              </span>
             </div>
             <p className="mt-1 text-xs text-ink-500 dark:text-ink-400">
               A block on this network is won by verified inference in one of these chain-registered classes. The floor needs
               nothing; the model classes need their converted artifact — and the node refuses any file that does not verify to
-              the registered root.
+              the registered root. The list is the chain&apos;s, not the app&apos;s: a class someone registers after genesis
+              appears here as soon as your node sees it, whether or not this Studio ships a description for it.
             </p>
             <div className="mt-4 space-y-3">
               {overview.classes.map((cls) => (
                 <ClassCard key={cls.spec.name} cls={cls} nodeRows={node.classes_from_node} onDownload={downloadArtifact} />
               ))}
+              {node.classes_from_node
+                .filter((row) => !overview.classes.some((cls) => matchesSpec(cls.spec, row)))
+                .map((row) => (
+                  <ChainClassCard key={row.class_id} row={row} />
+                ))}
             </div>
           </section>
 
@@ -546,6 +554,67 @@ function StatRow({ label, value }: { label: string; value: string }) {
   )
 }
 
+/** Does this node row belong to that built-in spec? The one place the rule is written.
+ *
+ * The floor is matched by its base flag — every ConsensusV2 chain has exactly one, and its id is
+ * chain-specific (a locally minted chain's floor differs from live testnet-11's). Everything else
+ * matches by id prefix: the node prints the full id, the snapshot may only know a prefix. A row no
+ * spec claims is a class registered after genesis, and gets a card of its own.
+ */
+function matchesSpec(spec: PalwClassStatus['spec'], row: NodeClassRow): boolean {
+  return spec.is_base ? row.base : spec.class_id_hex ? row.class_id.startsWith(spec.class_id_hex.slice(0, 16)) : false
+}
+
+/** A class this chain carries that the Studio ships no description for — registered after genesis. */
+function ChainClassCard({ row }: { row: NodeClassRow }) {
+  const active = row.status === 'Active'
+  const registered = row.status.startsWith('Registered')
+  const activationDaa = registered ? row.status.match(/activation_daa:\s*(\d+)/)?.[1] : undefined
+  return (
+    <div className="rounded-xl border border-ink-200 p-4 dark:border-ink-800">
+      <div className="flex flex-wrap items-center gap-2">
+        <h4 className="mono text-sm font-semibold">{row.class_id.slice(0, 12)}…</h4>
+        <span className="rounded-full bg-ink-100 px-2 py-0.5 text-[0.65rem] dark:bg-ink-800">registered after genesis</span>
+        <span
+          className={`rounded-full px-2 py-0.5 text-[0.65rem] ${
+            active
+              ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
+              : 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300'
+          }`}
+        >
+          on chain: {active ? 'Active' : registered ? 'Registered' : row.status.split(' ')[0]}
+          {row.share_permille !== null && ` · ${row.share_permille}‰`}
+        </span>
+      </div>
+      <p className="mt-2 text-xs text-ink-600 dark:text-ink-300">
+        {active ? (
+          <>
+            Live and carrying share: this class can win blocks now. The Studio ships no artifact for it, so whether THIS
+            machine can produce for it is the node&apos;s answer, not the app&apos;s — point <span className="mono">--palw-producer-class</span> at
+            it with the artifact its registration commits to.
+          </>
+        ) : registered ? (
+          <>
+            On the chain and adjudicable, holding no share yet
+            {activationDaa ? <> until DAA {Number(activationDaa).toLocaleString()}</> : null}. Until then the network
+            refuses its attempts — this is the soak a new class serves before it can take cadence from the incumbents.
+          </>
+        ) : (
+          <>
+            The node reports <span className="mono">{row.status}</span>. A class that is not Active holds no share and
+            wins no blocks; its past work stays adjudicable.
+          </>
+        )}
+      </p>
+      <p className="mono mt-2 text-[0.7rem] text-ink-500 dark:text-ink-400">
+        {row.budget_blocks !== null && <>budget {row.budget_blocks} blocks/epoch&nbsp;&nbsp;</>}
+        {row.canonical_leaves !== null && <>leaves {row.canonical_leaves.toLocaleString()}&nbsp;&nbsp;</>}
+        class {row.class_id.slice(0, 16)}…
+      </p>
+    </div>
+  )
+}
+
 function ClassCard({
   cls,
   nodeRows,
@@ -560,9 +629,7 @@ function ClassCard({
   // ConsensusV2 chain has exactly one, and its id is chain-specific (a locally minted chain's
   // floor differs from live testnet-11's). Everything else matches by id prefix: the node
   // prints the full id, the snapshot may only know a prefix.
-  const live = spec.is_base
-    ? nodeRows.find((row) => row.base)
-    : nodeRows.find((row) => (spec.class_id_hex ? row.class_id.startsWith(spec.class_id_hex.slice(0, 16)) : false))
+  const live = nodeRows.find((row) => matchesSpec(spec, row))
 
   const readiness = cls.readiness
   const badge =

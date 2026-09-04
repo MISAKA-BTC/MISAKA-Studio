@@ -207,9 +207,15 @@ pub async fn query_status(url: &str) -> NodeStatus {
 pub struct NodeClassRow {
     pub class_id: String,
     pub base: bool,
+    /// `Active`, `Dormant { since_daa: N }`, `Frozen { .. }`, or
+    /// `Registered { activation_daa: N, pending_share_permille: N }` — a chain-registered class
+    /// that is on the chain but not yet carrying share. Free text, and it CONTAINS SPACES for
+    /// every variant but `Active`, which is why it is not read as a whitespace token.
     pub status: String,
     pub share_permille: Option<u16>,
     pub budget_blocks: Option<u64>,
+    /// The class's canonical job in step leaves — the chain's own price for one inference of it.
+    pub canonical_leaves: Option<u64>,
 }
 
 pub(crate) fn parse_class_row(line: &str) -> Option<NodeClassRow> {
@@ -217,12 +223,24 @@ pub(crate) fn parse_class_row(line: &str) -> Option<NodeClassRow> {
         return None;
     }
     let field = |key: &str| line.split_whitespace().find_map(|word| word.strip_prefix(key)).map(str::to_string);
+    // **`status` is the one field that is not a word.** Every variant but `Active` is formatted
+    // with its payload — `Registered { activation_daa: 1200, pending_share_permille: 100 }` — so
+    // reading it as a whitespace token silently threw away the activation score, which is exactly
+    // the number a person waiting for their class to go live wants. It is taken as the span up to
+    // the next key instead, and falls back to the token when the line does not carry that key.
+    let status = line
+        .split_once("status=")
+        .and_then(|(_, rest)| rest.split_once(" share="))
+        .map(|(status, _)| status.trim().to_string())
+        .or_else(|| field("status="))
+        .unwrap_or_default();
     Some(NodeClassRow {
         class_id: field("class=")?,
         base: field("base=").is_some_and(|v| v == "true"),
-        status: field("status=").unwrap_or_default(),
+        status,
         share_permille: field("share=").and_then(|v| v.parse().ok()),
         budget_blocks: field("budget=").and_then(|v| v.parse().ok()),
+        canonical_leaves: field("leaves=").and_then(|v| v.parse().ok()),
     })
 }
 
@@ -1150,6 +1168,28 @@ mod tests {
         assert_eq!(heartbeat_stand_down_secs(8), Some(120));
         // Anything else: no claim. Genesis (1) is not a lane this rule speaks about.
         assert_eq!(heartbeat_stand_down_secs(1), None);
+    }
+
+    #[test]
+    fn a_class_row_keeps_a_status_that_has_spaces_in_it() {
+        // The shape the node prints for a class registered after genesis and not yet live.
+        let line = "2026-09-04 [INFO ] [palw-dump]   class=2705b8f6 base=false \
+                    status=Registered { activation_daa: 1400, pending_share_permille: 100 } share=NONE \
+                    budget=0 leaves=2685360";
+        let row = parse_class_row(line).expect("the row parses");
+        assert_eq!(row.class_id, "2705b8f6");
+        assert!(row.status.starts_with("Registered {"), "the payload is the answer, not noise: {}", row.status);
+        assert!(row.status.contains("activation_daa: 1400"), "the score a person is waiting for survives");
+        assert_eq!(row.share_permille, None, "NONE is not zero");
+        assert_eq!(row.budget_blocks, Some(0));
+        assert_eq!(row.canonical_leaves, Some(2_685_360));
+
+        // And the common case still reads as one word.
+        let active = parse_class_row("[palw-dump]   class=f1c5635c base=true status=Active share=144 budget=227 leaves=7708")
+            .expect("active row");
+        assert_eq!(active.status, "Active");
+        assert_eq!(active.share_permille, Some(144));
+        assert_eq!(active.canonical_leaves, Some(7_708));
     }
 
     #[test]
