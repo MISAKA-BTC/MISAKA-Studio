@@ -641,6 +641,15 @@ function PoolPanel() {
             reward rather than paying it.
           </p>
         )}
+        {pool.phase === 'drawing' && (
+          <div className="rounded-lg bg-ink-100 p-2 dark:bg-ink-800/60">
+            <p className="text-[0.7rem] text-ink-600 dark:text-ink-300">
+              The slot's producer is up and drawing, and has not won a block yet. On this network a floor draw
+              wins about once in 12,663 tries, so a first block takes a while; if the count stays at zero for
+              hours, the pool's activity lines below are where the node says why.
+            </p>
+          </div>
+        )}
         {pool.phase === 'awaiting_funds' && (
           <div className="rounded-lg bg-amber-50 p-2 dark:bg-amber-950/40">
             <p className="text-[0.7rem] text-amber-800 dark:text-amber-300">

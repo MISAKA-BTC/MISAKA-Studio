@@ -89,8 +89,16 @@ def derive_status(d, state, active):
             if "holding" in l:
                 phase = "holding"
                 break
-            if "phase 2: producing" in l or "[palw-producer]" in l:
+            # **"producing" must mean blocks, not a thread that started.** `[palw-producer]` also
+            # matches the producer's own "starting (bond=…)" line, so a slot that had drawn nothing
+            # for half an hour reported `producing` to the Studio, which showed it to a person as
+            # mining (measured 2026-09-04 on slot-02: producer up, ~5 % CPU, zero draws logged —
+            # the producer holds SILENTLY at trace level when the mining rule engine says no).
+            if "produced block" in l or "produced RECEIPT" in l:
                 phase = "producing"
+                break
+            if "phase 2: producing" in l or "[palw-producer] starting" in l:
+                phase = "drawing"
                 break
         if not active:
             phase = "stopped"
