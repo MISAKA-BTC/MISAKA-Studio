@@ -80,7 +80,18 @@ fn main() {
     tauri::Builder::default()
         .manage(supervised)
         .setup(move |app| {
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
+            // **Load the UI from the runtime, not from the bundle's asset store.** The window is a
+            // view onto a runtime that is already serving this exact UI over HTTP — the same URL a
+            // browser opens — so pointing the webview at it removes a whole class of failure: an
+            // asset store embedded at compile time that does not match (or does not contain) the
+            // `ui/dist` the runtime serves. On 2026-09-04 a window opened blank for exactly that
+            // reason while the same UI rendered fine in a browser at the same address.
+            //
+            // Same origin as the API it calls, so the CSP's `'self'` covers both, and the
+            // initialization script below still names the base for any build that does load local
+            // assets.
+            let window_url = base_url.parse().map(WebviewUrl::External).unwrap_or_else(|_| WebviewUrl::default());
+            WebviewWindowBuilder::new(app, "main", window_url)
                 .title("MISAKA Studio")
                 .inner_size(1280.0, 860.0)
                 .min_inner_size(880.0, 600.0)
