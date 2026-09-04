@@ -104,8 +104,12 @@ export const api = {
   network: () => request<NetworkOverview>('/api/v1/network'),
   producedBlocks: () => request<{ blocks: ProducedBlock[] }>('/api/v1/network/blocks'),
   pool: () => request<PoolStatus>('/api/v1/network/pool'),
-  poolJoin: (url?: string | null) =>
-    request<Record<string, unknown>>('/api/v1/network/pool/join', { method: 'POST', body: JSON.stringify({ url: url ?? null }) }),
+  poolJoin: (url?: string | null, mode?: 'floor' | 'fp') =>
+    request<Record<string, unknown>>('/api/v1/network/pool/join', {
+      method: 'POST',
+      body: JSON.stringify({ url: url ?? null, mode: mode ?? 'floor' }),
+    }),
+  poolFpEnable: () => request<Record<string, unknown>>('/api/v1/network/pool/fp/enable', { method: 'POST' }),
   poolLeave: () => request<Record<string, unknown>>('/api/v1/network/pool/leave', { method: 'POST' }),
   poolFaucet: () => request<Record<string, unknown>>('/api/v1/network/pool/faucet', { method: 'POST' }),
   faucetFor: (address: string) => request<Record<string, unknown>>('/api/v1/network/faucet', { method: 'POST', body: JSON.stringify({ address }) }),

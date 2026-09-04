@@ -432,7 +432,21 @@ export type PoolStatus =
       min_funding_sompi: number
       blocks_won: number
       activity: string[]
+      /** The slot's free-prompt lane, when the pool knows about one. */
+      fp: PoolFpStatus | null
     }
+
+/** What a slot's free-prompt lane is doing: the chat that mines, on that slot's own bond. */
+export type PoolFpStatus = {
+  mode: 'floor' | 'fp' | string
+  class: string
+  gateway_running: boolean
+  submitter_running: boolean
+  claims_submitted: number
+  bond_exposure_ceiling: string | null
+  bond_claim_exposure: string | null
+  fp_certified: boolean | null
+}
 
 /** The gateway's own account of itself: the runtime it runs and the identity it answers for. */
 export type GatewayHealth = {

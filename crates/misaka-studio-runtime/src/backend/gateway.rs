@@ -24,7 +24,10 @@
 //! confirms it is up and reports what it holds. A model picker that appeared to switch the class
 //! would be describing something that did not happen.
 
-use super::{Availability, GenerationRequest, InferenceBackend, LoadRequest, LoadedModel, SseParser, StreamEvent, approximate_tokens};
+use super::{
+    Availability, ChatMessage, GenerationRequest, InferenceBackend, LoadRequest, LoadedModel, SseParser, StreamEvent,
+    approximate_tokens,
+};
 use crate::{Error, Result};
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
@@ -193,31 +196,86 @@ impl InferenceBackend for GatewayBackend {
             // ceiling, and the stream flag. Sampling knobs are not sent because the lane's
             // execution is what a seat re-runs — a temperature the seat does not know about is a
             // claim nobody can reproduce.
-            let body = serde_json::json!({
-                "model": "misaka-palw-fp-v3",
-                "messages": request.messages.iter().map(|m| serde_json::json!({ "role": m.role, "content": m.content })).collect::<Vec<_>>(),
-                "max_tokens": request.params.max_tokens,
-                "stream": true,
-            });
             let fallback_prompt_tokens =
                 approximate_tokens(&request.messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join("\n"));
 
-            let mut request = self.http.post(&url).json(&body);
-            if let Some(token) = &self.token {
-                request = request.header("x-pool-token", token);
-            }
-            let response = request
-                .send()
-                .await
-                .map_err(|e| Error::Engine { backend: NAME, message: format!("the gateway did not accept the request: {e}") })?;
-            if !response.status().is_success() {
-                let status = response.status();
-                let text = response.text().await.unwrap_or_default();
-                return Err(Error::Engine { backend: NAME, message: format!("gateway returned {status}: {}", text.trim()) });
-            }
+            // **The ceiling has to fit the class, not the app's default.**
+            //
+            // A class is registered at a fixed context — 512 tokens for graph-v5@512 — and the
+            // worker checks `prompt + the DECODE CEILING` against it, not `prompt + what is
+            // actually generated`. So a request asking for the Studio's default 2048 is refused
+            // outright however short its answer would have been, and a conversation with any
+            // history behind it never gets past the first turn: "prompt 344 + decode ceiling 1024
+            // exceeds max_context_tokens 512". Measured, on a chat whose second message returned
+            // nothing at all.
+            //
+            // The prompt is estimated rather than tokenized here — the class's tokenizer lives with
+            // the worker — so a margin is left for the estimate being low and for the chat
+            // template's own markers.
+            const TEMPLATE_MARGIN_TOKENS: u64 = 24;
+            let fallback_prompt_tokens = prompt_upper_bound(&request.messages).max(fallback_prompt_tokens);
+            let n_ctx = self.facts.read().await.as_ref().map(|f| f.n_ctx as u64).filter(|n| *n > 0);
+            let ceiling = match n_ctx {
+                Some(n_ctx) => {
+                    let used = fallback_prompt_tokens.saturating_add(TEMPLATE_MARGIN_TOKENS);
+                    let room = n_ctx.saturating_sub(used);
+                    if room == 0 {
+                        return Err(Error::BadRequest {
+                            message: format!(
+                                "this class holds {n_ctx} tokens and the conversation is already about {used}. \
+                                 Start a new chat, or shorten it — the context is the class's, registered on chain, \
+                                 and not something this app can raise."
+                            ),
+                        });
+                    }
+                    // **Room is not a target.** A decode ceiling is what the model is ALLOWED to
+                    // generate, and this one does not reliably stop early: given the whole
+                    // remaining context it produced 438 of 438 tokens and took 6.7 minutes for a
+                    // two-line question. So when the caller's number does not fit this class — the
+                    // app's default is 2048, meant for a 32K GGUF — the answer is sized like an
+                    // answer instead of like the context. A smaller explicit ask is still honoured.
+                    const ANSWER_CEILING: u64 = 256;
+                    if request.params.max_tokens <= room { request.params.max_tokens } else { room.min(ANSWER_CEILING) }
+                }
+                None => request.params.max_tokens,
+            };
 
+            // One request, issued as a closure because it may have to be issued twice — see the
+            // refusal branch below, where the worker's own numbers give the ceiling that fits.
+            let messages: Vec<serde_json::Value> =
+                request.messages.iter().map(|m| serde_json::json!({ "role": m.role, "content": m.content })).collect();
+            let http = self.http.clone();
+            let token = self.token.clone();
+            let send = move |ceiling: u64| {
+                let (http, token, url, messages) = (http.clone(), token.clone(), url.clone(), messages.clone());
+                async move {
+                    let body = serde_json::json!({
+                        "model": "misaka-palw-fp-v3",
+                        "messages": messages,
+                        "max_tokens": ceiling,
+                        "stream": true,
+                    });
+                    let mut request = http.post(&url).json(&body);
+                    if let Some(token) = &token {
+                        request = request.header("x-pool-token", token);
+                    }
+                    let response = request.send().await.map_err(|e| Error::Engine {
+                        backend: NAME,
+                        message: format!("the gateway did not accept the request: {e}"),
+                    })?;
+                    if !response.status().is_success() {
+                        let status = response.status();
+                        let text = response.text().await.unwrap_or_default();
+                        return Err(Error::Engine { backend: NAME, message: format!("gateway returned {status}: {}", text.trim()) });
+                    }
+                    Ok(response)
+                }
+            };
+
+            let response = send(ceiling).await?;
             let claim_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
             Ok(crate::backend::mock::async_stream(move |tx| async move {
+                let mut retried = false;
                 let mut parser = SseParser::new(true);
                 let mut byte_stream = response.bytes_stream();
                 use futures_util::StreamExt;
@@ -247,11 +305,74 @@ impl InferenceBackend for GatewayBackend {
                             return;
                         }
                     }
+                    // The gateway answers 200 and puts a refusal in the stream — a job over the
+                    // class's context, a lane the chain does not certify. Silence would be the
+                    // worst rendering of that.
+                    if let Some(message) = parser.take_error() {
+                        // The worker sized the request for us in the act of refusing it. One retry,
+                        // and only when the numbers are there: a second refusal is a real answer.
+                        if let (false, Some(room)) = (retried, ceiling_from_refusal(&message)) {
+                            retried = true;
+                            match send(room).await {
+                                Ok(next) => {
+                                    tracing::info!(ceiling = room, "retrying at the ceiling the worker named");
+                                    parser = SseParser::new(true);
+                                    byte_stream = next.bytes_stream();
+                                    continue;
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Err(e)).await;
+                                    return;
+                                }
+                            }
+                        }
+                        let _ = tx.send(Err(Error::Engine { backend: NAME, message })).await;
+                        return;
+                    }
                 }
                 let _ = tx.send(Ok(parser.finish(fallback_prompt_tokens))).await;
             }))
         })
     }
+}
+
+/// An UPPER bound on a conversation's tokens — a different job from `approximate_tokens`.
+///
+/// That one is "about four characters per token" and its own doc says it is never for sizing a
+/// context window, which is exactly what this is for. Measured: a two-turn Japanese conversation of
+/// 51 real tokens estimated as 12, the ceiling was computed from the gap, and the worker refused
+/// the whole request — "prompt 51 + decode ceiling 476 exceeds max_context_tokens 512".
+///
+/// So: one token per non-ASCII character (CJK sits at roughly one, sometimes more), a quarter of
+/// the ASCII, and the chat template's markers per message. Over-counting shortens an answer;
+/// under-counting loses the request — and [`ceiling_from_refusal`] repairs the rest.
+fn prompt_upper_bound(messages: &[ChatMessage]) -> u64 {
+    const PER_MESSAGE_MARKERS: u64 = 8;
+    messages
+        .iter()
+        .map(|m| {
+            let ascii = m.content.chars().filter(char::is_ascii).count() as u64;
+            let other = m.content.chars().count() as u64 - ascii;
+            ascii.div_ceil(4) + other + PER_MESSAGE_MARKERS
+        })
+        .sum()
+}
+
+/// **The ceiling the worker's own refusal implies.**
+///
+/// The refusal names all three numbers — "prompt 51 + decode ceiling 476 exceeds
+/// max_context_tokens 512" — so the request that fits is arithmetic, not another guess. Retrying
+/// once with it turns the one failure a person cannot act on (an empty reply) into an answer.
+fn ceiling_from_refusal(message: &str) -> Option<u64> {
+    let after = |mark: &str| -> Option<u64> {
+        let rest = message.split(mark).nth(1)?;
+        let digits: String = rest.trim_start().chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    };
+    let prompt = after("prompt ")?;
+    let ctx = after("max_context_tokens ")?;
+    // One token of slack: the template can add a marker the prompt count did not include.
+    ctx.checked_sub(prompt + 1).filter(|room| *room > 0)
 }
 
 /// The claim id out of whatever of the stream has arrived, once the gateway's final event lands.
@@ -267,6 +388,30 @@ fn claim_id_in(bytes: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The refusal carries the arithmetic that makes the retry exact. Written against the message
+    /// the live worker actually sent, because a parser written against an imagined format is a
+    /// parser that silently declines to fix anything.
+    #[test]
+    fn a_refusal_names_the_ceiling_that_would_have_fit() {
+        let refusal = "the worker refused the job: prompt 51 + decode ceiling 476 exceeds max_context_tokens 512";
+        assert_eq!(ceiling_from_refusal(refusal), Some(460));
+        // Nothing to take from a different failure, and nothing invented.
+        assert_eq!(ceiling_from_refusal("the lane is not certified for this class"), None);
+        // A prompt that fills the context on its own leaves no room, and a retry would only be a
+        // second refusal.
+        assert_eq!(ceiling_from_refusal("prompt 512 + decode ceiling 8 exceeds max_context_tokens 512"), None);
+    }
+
+    /// A Japanese turn is roughly one token per character, and the app's own `approximate_tokens`
+    /// is a quarter of that — the gap that lost a whole request.
+    #[test]
+    fn the_prompt_bound_does_not_undercount_japanese() {
+        let jp = [ChatMessage::new("user", "小林は誰")];
+        assert!(prompt_upper_bound(&jp) >= 4 + 8, "one token per kanji, plus the template's markers");
+        let en = [ChatMessage::new("user", "who is Kobayashi")];
+        assert!(prompt_upper_bound(&en) >= 4, "ascii is cheaper, but never free");
+    }
 
     #[test]
     fn the_claim_id_is_read_out_of_the_gateways_last_event() {

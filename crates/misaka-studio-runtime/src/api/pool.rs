@@ -66,7 +66,12 @@ fn pool_origin(url: &str) -> String {
 }
 
 pub fn router() -> Router<Arc<AppState>> {
-    Router::new().route("/", get(status)).route("/join", post(join)).route("/leave", post(leave)).route("/faucet", post(faucet))
+    Router::new()
+        .route("/", get(status))
+        .route("/join", post(join))
+        .route("/leave", post(leave))
+        .route("/faucet", post(faucet))
+        .route("/fp/enable", post(fp_enable))
 }
 
 fn http() -> reqwest::Client {
@@ -106,7 +111,11 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::V
         return Ok(Json(serde_json::json!({ "joined": false, "default_url": DEFAULT_POOL_URL })));
     };
     let mut body = pool_get(&format!("{url}/v1/slots/{slot_id}"), Some(token)).await?;
+    // Best effort, and separate: a pool too old to know about the lane still answers the slot
+    // route, and the panel should show what it does know rather than nothing.
+    let fp = pool_get(&format!("{url}/v1/slots/{slot_id}/fp"), Some(token)).await.ok();
     if let Some(map) = body.as_object_mut() {
+        map.insert("fp".into(), fp.unwrap_or(serde_json::Value::Null));
         map.insert("joined".into(), true.into());
         map.insert("pool_url".into(), url.clone().into());
         map.insert("seed_path".into(), seed_path(&state, slot_id).display().to_string().into());
@@ -118,6 +127,13 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::V
 struct JoinBody {
     #[serde(default)]
     url: Option<String>,
+    /// `floor` (the default) or `fp`.
+    ///
+    /// It decides how large a bond the slot registers, and a bond's size is fixed the moment it
+    /// registers — so this is not a setting that can be changed afterwards, it is which slot you
+    /// are asking for. A floor slot mines the lottery; an `fp` slot mines what you type.
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 async fn join(State(state): State<Arc<AppState>>, body: Option<Json<JoinBody>>) -> Result<Json<serde_json::Value>> {
@@ -125,7 +141,9 @@ async fn join(State(state): State<Arc<AppState>>, body: Option<Json<JoinBody>>) 
     if settings.node.pool_slot_id.is_some() {
         return Err(Error::bad_request("already joined a pool slot — leave it first if you want a fresh one"));
     }
-    let url = body.and_then(|Json(b)| b.url).or(settings.node.pool_url.clone()).unwrap_or_else(|| DEFAULT_POOL_URL.to_string());
+    let (asked_url, mode) = body.map(|Json(b)| (b.url, b.mode)).unwrap_or((None, None));
+    let mode = mode.unwrap_or_else(|| "floor".to_string());
+    let url = asked_url.or(settings.node.pool_url.clone()).unwrap_or_else(|| DEFAULT_POOL_URL.to_string());
     let url = url.trim_end_matches('/').to_string();
     if !(url.starts_with("https://") || url.starts_with("http://127.0.0.1") || url.starts_with("http://localhost")) {
         // A slot seed travels back over this connection once. Plaintext across a network is not
@@ -135,6 +153,7 @@ async fn join(State(state): State<Arc<AppState>>, body: Option<Json<JoinBody>>) 
 
     let response = http()
         .post(format!("{url}/v1/slots"))
+        .json(&serde_json::json!({ "mode": mode }))
         .send()
         .await
         .map_err(|e| Error::bad_request(format!("the pool did not answer: {url}: {e}")))?;
@@ -173,11 +192,48 @@ async fn join(State(state): State<Arc<AppState>>, body: Option<Json<JoinBody>>) 
     }
 
     let mut new = settings.clone();
-    new.node.pool_url = Some(url);
-    new.node.pool_slot_id = Some(slot_id);
+    new.node.pool_url = Some(url.clone());
+    new.node.pool_slot_id = Some(slot_id.clone());
     new.node.pool_slot_token = Some(token);
+    if mode == "fp" {
+        // **Joining for prompt mining is joining, not joining plus a setup step.** The slot's own
+        // gateway is where this app's chat has to go for a chat to be that slot's work, so the
+        // engine and its address are set here rather than left as two settings a person is
+        // expected to find. Nothing mines until the slot is funded and its lane enabled; what this
+        // decides is only where the chat goes when it is.
+        new.backend.kind = misaka_studio_core::settings::BackendKind::Gateway;
+        new.node.palw_gateway_url = Some(format!("{url}/v1/slots/{slot_id}/fp"));
+    }
     state.apply_settings(new).await?;
 
+    Ok(Json(body))
+}
+
+/// **Turn on the slot's free-prompt lane.**
+///
+/// Separate from joining because it cannot happen at join time: the lane needs the slot's bond,
+/// and the bond needs funding and a block. The pool refuses with a reason of its own — an unfunded
+/// slot, a bond too small to carry a claim — and that reason is passed through rather than
+/// translated, because it is about the chain and not about this app.
+async fn fp_enable(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>> {
+    let node = state.settings.read().await.node.clone();
+    let (Some(url), Some(slot_id), Some(token)) = (&node.pool_url, &node.pool_slot_id, &node.pool_slot_token) else {
+        return Err(Error::bad_request("no pool slot — join one first"));
+    };
+    let response = http()
+        .post(format!("{url}/v1/slots/{slot_id}/fp/enable"))
+        .header("x-pool-token", token)
+        .timeout(Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|e| Error::bad_request(format!("the pool did not answer: {e}")))?;
+    let status = response.status();
+    let body: serde_json::Value =
+        response.json().await.map_err(|e| Error::bad_request(format!("the pool's answer was not JSON: {e}")))?;
+    if !status.is_success() {
+        let msg = body.get("error").and_then(|e| e.as_str()).unwrap_or("unexplained");
+        return Err(Error::bad_request(format!("the pool could not enable the lane: {msg}")));
+    }
     Ok(Json(body))
 }
 

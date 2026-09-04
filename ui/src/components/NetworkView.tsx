@@ -752,11 +752,31 @@ function PoolPanel() {
     return () => clearInterval(timer)
   }, [refresh])
 
-  const join = async () => {
+  const join = async (mode: 'floor' | 'fp') => {
     setBusy(true)
     try {
-      await api.poolJoin(url.trim() === '' ? null : url.trim())
-      toast('success', 'Joined the pool — fund the slot address and it mines by itself')
+      await api.poolJoin(url.trim() === '' ? null : url.trim(), mode)
+      toast(
+        'success',
+        mode === 'fp'
+          ? 'Joined for prompt mining — fund the slot address, then turn the lane on here'
+          : 'Joined the pool — fund the slot address and it mines by itself',
+      )
+      await refresh()
+    } catch (e) {
+      toast('error', (e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  // Separate from joining because it cannot happen at join time: the lane needs the slot's bond,
+  // and a bond needs funding and a block.
+  const enableFp = async () => {
+    setBusy(true)
+    try {
+      await api.poolFpEnable()
+      toast('success', 'Prompt mining is on — every chat now commits a claim under this slot')
       await refresh()
     } catch (e) {
       toast('error', (e as Error).message)
@@ -807,9 +827,24 @@ function PoolPanel() {
           value={url}
           onChange={(e) => setUrl(e.target.value)}
         />
-        <button type="button" className="btn-primary mt-2 w-full justify-center" disabled={busy} onClick={() => void join()}>
+        <button
+          type="button"
+          className="btn-primary mt-2 w-full justify-center"
+          disabled={busy}
+          onClick={() => void join('floor')}
+        >
           {busy ? <Spinner className="size-3.5" /> : <Icon name="globe" className="size-3.5" />}
-          Join the pool
+          Join the pool — mine the floor
+        </button>
+        <p className="mt-3 text-xs leading-relaxed text-ink-500 dark:text-ink-400">
+          Or take a slot that mines <strong>what you type</strong>: the same execution answers you in the Chat tab and commits
+          the claim behind it, under this slot&apos;s own bond. It needs a larger bond than the floor — a model claim reserves
+          several times the exposure — so it is a different slot, chosen now: a bond&apos;s size is fixed when it registers.
+          The faucet&apos;s 12 MSK covers it.
+        </p>
+        <button type="button" className="btn-outline mt-2 w-full justify-center" disabled={busy} onClick={() => void join('fp')}>
+          {busy ? <Spinner className="size-3.5" /> : <Icon name="chat" className="size-3.5" />}
+          Join for prompt mining
         </button>
         {error && <p className="mt-2 text-[0.7rem] text-red-600 dark:text-red-400">{error}</p>}
       </section>
@@ -857,6 +892,42 @@ function PoolPanel() {
             <div className="tabular-nums">{pool.blocks_won}</div>
           </div>
         </div>
+        {pool.fp && pool.fp.mode === 'fp' && (
+          <div className="rounded-lg border border-arc-500/30 bg-arc-500/5 p-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-[0.7rem] font-medium">Prompt mining</span>
+              {pool.fp.gateway_running && pool.fp.submitter_running ? (
+                <span className="badge bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">on</span>
+              ) : (
+                <span className="badge bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300">off</span>
+              )}
+              <span className="text-[0.65rem] text-ink-500 dark:text-ink-400">{pool.fp.claims_submitted} claims submitted</span>
+            </div>
+            {pool.fp.gateway_running && pool.fp.submitter_running ? (
+              <p className="mt-1 text-[0.7rem] leading-relaxed text-ink-500 dark:text-ink-400">
+                Chatting in the <strong>Chat</strong> tab is this slot&apos;s work: one execution answers you and commits the
+                claim behind it, under this slot&apos;s bond. {pool.fp.class}.
+              </p>
+            ) : (
+              <>
+                <p className="mt-1 text-[0.7rem] leading-relaxed text-ink-500 dark:text-ink-400">
+                  Turning it on needs the slot&apos;s bond, so it comes after funding and a block. The pool then runs this
+                  slot&apos;s own gateway and the submitter that carries its claims — and the Chat tab starts mining.
+                </p>
+                <button
+                  type="button"
+                  className="btn-outline mt-2 w-full justify-center"
+                  disabled={busy || !pool.bond_outpoint}
+                  onClick={() => void enableFp()}
+                  title={pool.bond_outpoint ? undefined : 'The slot has no bond yet — fund it and wait for registration'}
+                >
+                  {busy ? <Spinner className="size-3.5" /> : <Icon name="chat" className="size-3.5" />}
+                  Turn on prompt mining
+                </button>
+              </>
+            )}
+          </div>
+        )}
         {pool.blocks_won > 0 && (
           <p className="mt-2 text-[0.7rem] leading-relaxed text-ink-500 dark:text-ink-400">
             A won block's reward is <strong>held in escrow until its claim is Final</strong> — the panel of bonded seats

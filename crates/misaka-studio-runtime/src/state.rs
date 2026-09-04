@@ -261,11 +261,36 @@ impl AppState {
         Ok(new)
     }
 
-    /// Load a model into the current backend.
+    /// **The engine that can read THIS file.**
+    ///
+    /// The configured engine is used whenever it can run the model. When it cannot — a class
+    /// artifact under llama.cpp, or a GGUF under the integer runtime — the other kind is built
+    /// instead, because the pairing is a property of the file and not a preference: a person with
+    /// a GGUF and a `.palwart` in one directory was otherwise told to go and change a setting
+    /// between every message.
+    ///
+    /// For an artifact the pool's gateway wins when one is configured: it is the engine that also
+    /// MINES, and someone who joined a pool slot asked for exactly that.
+    async fn backend_for(&self, model: &LocalModel, settings: &Settings) -> SharedBackend {
+        let configured = self.backend.read().await.clone();
+        let is_artifact = model.path.file_name().and_then(|n| n.to_str()).is_some_and(palw::is_artifact_filename);
+        let reads_artifacts = [MisakaBackend::NAME, crate::backend::gateway::NAME].contains(&configured.name());
+        if is_artifact == reads_artifacts {
+            return configured;
+        }
+        let kind = if is_artifact {
+            if settings.node.palw_gateway_url.is_some() { BackendKind::Gateway } else { BackendKind::Misaka }
+        } else {
+            BackendKind::Auto
+        };
+        build_backend_kind(kind, settings, &self.hardware)
+    }
+
+    /// Load a model into the engine that can run it.
     pub async fn load(&self, model_id: &str, context_override: Option<u32>) -> Result<RuntimeStatus> {
         let model = self.store.require(model_id).await?;
         let settings = self.settings.read().await.clone();
-        let backend = self.backend().await;
+        let backend = self.backend_for(&model, &settings).await;
 
         // A PALW artifact is not a GGUF. `llama-server` reads its first four bytes, finds `PALW`
         // where `GGUF` should be, and aborts — and what the user got for a file the Studio already
@@ -314,6 +339,10 @@ impl AppState {
         // Hashing is deliberately not done here: it would add a minute to every load of a large
         // model. The identity fills in the first time provenance is asked for.
         let identity = model.identity();
+        // The engine that answered this load is the one `generate` has to reach, so the choice is
+        // recorded rather than recomputed. Unloading does not put the configured one back: what
+        // matters is which engine holds the model, and after an unload none does.
+        *self.backend.write().await = backend.clone();
         let state = LoadedState { model, loaded, runtime, identity, backend: backend.name().to_string() };
         *self.loaded.write().await = Some(state.clone());
         Ok(self.status_from(Some(&state), true).await)
@@ -506,9 +535,18 @@ impl AppState {
 
 /// Build the backend a settings value asks for.
 pub fn build_backend(settings: &Settings, hardware: &HardwareSnapshot) -> SharedBackend {
+    build_backend_kind(settings.backend.kind, settings, hardware)
+}
+
+/// Build one particular engine, from the same settings.
+///
+/// Split out because the engine is not only a preference: a `.palwart` can be run by the integer
+/// runtime or a gateway and by nothing else, and a GGUF by neither. The setting says which engine
+/// to prefer FOR THE FILES IT CAN RUN; the file decides the rest.
+pub fn build_backend_kind(kind: BackendKind, settings: &Settings, hardware: &HardwareSnapshot) -> SharedBackend {
     let timeout = Duration::from_secs(settings.backend.startup_timeout_secs);
     let tag = accelerator_tag(hardware);
-    match settings.backend.kind {
+    match kind {
         BackendKind::Mock => Arc::new(MockBackend::default()),
         BackendKind::Mlx => Arc::new(MlxBackend::new(settings.backend.mlx_server_path.clone(), timeout)),
         BackendKind::LlamaCpp => Arc::new(LlamaCppBackend::new(settings.backend.llama_server_path.clone(), tag, timeout)),

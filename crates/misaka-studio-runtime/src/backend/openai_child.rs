@@ -283,6 +283,10 @@ impl ChildEngine {
                         return;
                     }
                 }
+                if let Some(message) = parser.take_error() {
+                    let _ = tx.send(Err(Error::Engine { backend, message })).await;
+                    return;
+                }
             }
             let _ = tx.send(Ok(parser.finish(fallback_prompt_tokens))).await;
         }))
@@ -429,11 +433,19 @@ pub(crate) struct SseParser {
     text_len: u64,
     usage: Option<Usage>,
     finish_reason: Option<String>,
+    /// An error the SERVER put in the stream, which is not the same thing as a failed request.
+    ///
+    /// An OpenAI-shaped server can answer 200 and then say `data: {"error":{...}}` — the
+    /// free-prompt gateway does exactly that when the worker refuses a job. A parser that reads
+    /// only `choices` drops it, the stream ends with no deltas, and the app shows an empty reply
+    /// at 0.0 tok/s: the one failure that looks like nothing happening. Measured on a chat whose
+    /// second turn exceeded the class's context.
+    error: Option<String>,
 }
 
 impl SseParser {
     pub(crate) fn new(chat: bool) -> Self {
-        SseParser { buffer: Vec::new(), chat, text_len: 0, usage: None, finish_reason: None }
+        SseParser { buffer: Vec::new(), chat, text_len: 0, usage: None, finish_reason: None, error: None }
     }
 
     pub(crate) fn push(&mut self, bytes: &[u8]) -> Vec<StreamEvent> {
@@ -449,6 +461,14 @@ impl SseParser {
                 continue;
             }
             let Ok(json) = serde_json::from_str::<serde_json::Value>(payload) else { continue };
+
+            if let Some(message) = json.get("error").and_then(|e| e.get("message").or(Some(e))).map(|m| match m.as_str() {
+                Some(text) => text.to_string(),
+                None => m.to_string(),
+            }) {
+                self.error = Some(message);
+                continue;
+            }
 
             if let Some(usage) = json.get("usage").filter(|u| !u.is_null()) {
                 self.usage = Some(Usage {
@@ -478,6 +498,11 @@ impl SseParser {
     /// The terminating event, with the engine's usage when it sent one and an estimate when it
     /// did not — a blank tokens/sec readout is a worse answer than an approximate one, as long
     /// as it is never presented as exact.
+    /// The server's own error, once, if it sent one.
+    pub(crate) fn take_error(&mut self) -> Option<String> {
+        self.error.take()
+    }
+
     pub(crate) fn finish(self, fallback_prompt_tokens: u64) -> StreamEvent {
         let usage = self.usage.unwrap_or_else(|| {
             let completion = self.text_len.div_ceil(4);
