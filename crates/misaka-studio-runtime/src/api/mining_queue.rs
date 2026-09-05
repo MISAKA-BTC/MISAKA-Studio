@@ -108,8 +108,20 @@ pub struct ModeBody {
 }
 
 async fn set_mode(State(state): State<Arc<AppState>>, Json(body): Json<ModeBody>) -> Result<Json<MiningQueueView>> {
+    // Switching the mode moves the chat between engines, and an engine change unloads the model.
+    // The person flipped one switch; they should not also have to find the model list again. So
+    // whatever was loaded is loaded back — into the engine the new mode picks for it.
+    let loaded = state.loaded().await.map(|l| l.model.id.clone());
     let mut new = state.settings.read().await.clone();
     new.node.mining_mode = body.mode;
     state.apply_settings(new).await?;
+    if let Some(model_id) = loaded
+        && state.loaded().await.is_none()
+        && let Err(e) = state.load(&model_id, None).await
+    {
+        // The mode did change; only the reload did not. Said in the log and left to the model
+        // list, where the reason (an engine not installed, a file gone) is shown with its remedy.
+        tracing::warn!(model = %model_id, "reload after the mining-mode switch failed: {e}");
+    }
     Ok(Json(view(&state).await))
 }

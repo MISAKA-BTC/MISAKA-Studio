@@ -203,6 +203,10 @@ async fn join(State(state): State<Arc<AppState>>, body: Option<Json<JoinBody>>) 
         // decides is only where the chat goes when it is.
         new.backend.kind = misaka_studio_core::settings::BackendKind::Gateway;
         new.node.palw_gateway_url = Some(format!("{url}/v1/slots/{slot_id}/fp"));
+        // And the chat does not wait for the lane. The slot mines every prompt from a queue behind
+        // the chat, which answers from the engine that can answer now; when no local engine can
+        // run the loaded model the runtime keeps the chat inline and says so in the panel.
+        new.node.mining_mode = misaka_studio_core::settings::MiningMode::Background;
     }
     state.apply_settings(new).await?;
 

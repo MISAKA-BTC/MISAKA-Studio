@@ -57,21 +57,24 @@ async fn an_artifact_is_listed_as_a_model_but_refused_by_an_engine_that_cannot_r
     // A half-finished download is not an artifact yet; offering it would offer a failure.
     assert!(!ids.iter().any(|id| id.starts_with("qwen36")), "a .part must not be listed: {ids:?}");
 
-    let error = state.load("qwen25-1.5b-a16", None).await.expect_err("llama.cpp cannot load a PALW artifact");
-
-    // 400, not 500: the request named a real file and a real backend, and the pairing is what is
-    // wrong. A 500 would tell an API client to retry.
-    assert_eq!(error.status(), axum::http::StatusCode::BAD_REQUEST, "{error}");
-    let message = error.to_string();
-    assert!(message.contains("PALW class artifact"), "{message}");
-    // The remedy has to be one that exists. Naming a backend setting alone sent a user to a
-    // Settings menu whose `misaka` entry reads "unavailable" on any machine that has not built the
-    // engine — while the thing they actually wanted, mining, never loads a model here at all.
-    assert!(message.contains("Network tab"), "the message must point at where mining happens: {message}");
-    assert!(message.contains("misaka"), "the message must name the engine that can read it: {message}");
-    // The failure this replaces: another program's stderr, verbatim, in a notification.
-    assert!(!message.contains("gguf_init_from_reader"), "{message}");
-    assert!(message.lines().count() == 1, "one line, so a notification can hold it: {message}");
+    // Since the engine is chosen by the file (`backend_for`), an artifact under a llama.cpp
+    // configuration is never handed to llama.cpp: the integer runtime is chosen for it instead.
+    // So the load either succeeds (the runtime is installed on this machine) or fails as THAT
+    // engine being unavailable — named, with a remedy — and never as llama.cpp's stderr. The
+    // pairing refusal itself is unit-tested where it lives; this test pins the outcome a person
+    // sees, on any machine.
+    match state.load("qwen25-1.5b-a16", None).await {
+        Ok(status) => {
+            assert_ne!(status.backend, "llamacpp", "a PALW artifact must not be loaded by llama.cpp: {status:?}");
+        }
+        Err(error) => {
+            let message = error.to_string();
+            // The failure this replaces: another program's stderr, verbatim, in a notification.
+            assert!(!message.contains("gguf_init_from_reader"), "{message}");
+            assert!(message.contains("misaka"), "the message must name the engine that can read it: {message}");
+            assert!(message.lines().count() == 1, "one line, so a notification can hold it: {message}");
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
