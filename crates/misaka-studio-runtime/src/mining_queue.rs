@@ -181,6 +181,21 @@ impl MiningQueue {
             messages.push(Msg { role: "system".into(), content: system });
         }
         messages.push(Msg { role: "user".into(), content: prompt.clone() });
+        // **The same prompt, still waiting, is the same job.** The lane is deterministic: two
+        // identical jobs produce two identical answers and two claims, six minutes and a fee
+        // apart, for one question. A prompt that is already queued (not yet running — a running
+        // one is the gateway's, and a finished one was a different moment) is answered by the job
+        // that is going to run anyway; the new message's badge simply points at it.
+        {
+            let jobs = self.jobs.read().await;
+            if let Some(existing) = jobs.iter().find(|j| {
+                j.status == JobStatus::Queued
+                    && j.messages.len() == messages.len()
+                    && j.messages.iter().zip(&messages).all(|(a, b)| a.role == b.role && a.content == b.content)
+            }) {
+                return existing.clone();
+            }
+        }
         let job = MiningJob {
             id: uid(),
             conversation_id,
@@ -515,6 +530,25 @@ mod tests {
         assert_eq!(jobs.iter().filter(|j| j.status == JobStatus::Queued).count(), live, "queued jobs are never trimmed");
         assert_eq!(jobs.iter().filter(|j| j.status == JobStatus::Committed).count(), KEEP_FINISHED);
         assert!(!jobs.iter().any(|j| j.id == "j1"), "the oldest finished job went first");
+    }
+
+    #[tokio::test]
+    async fn the_same_prompt_still_waiting_is_the_same_job() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue = MiningQueue::open(dir.path().join("q.json")).await;
+        let first = queue.enqueue("小林って誰".into(), None, Some("c1".into()), Some("m1".into()), "http://gw".into()).await;
+        let again = queue.enqueue("小林って誰".into(), None, Some("c1".into()), Some("m2".into()), "http://gw".into()).await;
+        assert_eq!(again.id, first.id, "a queued twin is answered by the job already waiting");
+        assert_eq!(queue.list().await.len(), 1);
+
+        // Once it runs it is the gateway's; a new ask is a new job — and so is one with a different
+        // system prompt, which is a different job to the lane.
+        queue.update(&first.id, |j| j.status = JobStatus::Running).await;
+        let third = queue.enqueue("小林って誰".into(), None, None, None, "http://gw".into()).await;
+        assert_ne!(third.id, first.id);
+        let fourth = queue.enqueue("小林って誰".into(), Some("日本語で".into()), None, None, "http://gw".into()).await;
+        assert_ne!(fourth.id, third.id, "the system prompt is part of the job");
+        assert_eq!(queue.list().await.len(), 3);
     }
 
     #[tokio::test]
