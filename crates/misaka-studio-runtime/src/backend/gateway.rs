@@ -413,9 +413,9 @@ mod tests {
     /// is a quarter of that — the gap that lost a whole request.
     #[test]
     fn the_prompt_bound_does_not_undercount_japanese() {
-        let jp = [ChatMessage::new("user", "小林は誰")];
-        assert!(prompt_upper_bound(&jp) >= 4 + 8, "one token per kanji, plus the template's markers");
-        let en = [ChatMessage::new("user", "who is Kobayashi")];
+        let jp = [ChatMessage::new("user", "東京の天気は")];
+        assert!(prompt_upper_bound(&jp) >= 6 + 8, "one token per kana or kanji, plus the template's markers");
+        let en = [ChatMessage::new("user", "weather in Tokyo")];
         assert!(prompt_upper_bound(&en) >= 4, "ascii is cheaper, but never free");
     }
 

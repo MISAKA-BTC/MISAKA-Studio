@@ -230,9 +230,16 @@ impl AppState {
         let old = self.settings.read().await.clone();
         new.save(&self.settings_path)?;
 
+        // A gateway engine IS its address and its token: `GatewayBackend::new` copies both at
+        // construction and never reads settings again. Joining a new pool slot (or forgetting one)
+        // rewrites exactly those two fields while the kind stays `Gateway`, so without this the
+        // engine kept answering — and mining — for the slot the person had just left, with that
+        // slot's token, while every status panel named the new one.
         let backend_changed = new.backend.kind != old.backend.kind
             || new.backend.llama_server_path != old.backend.llama_server_path
-            || new.backend.mlx_server_path != old.backend.mlx_server_path;
+            || new.backend.mlx_server_path != old.backend.mlx_server_path
+            || new.node.palw_gateway_url != old.node.palw_gateway_url
+            || new.node.pool_slot_token != old.node.pool_slot_token;
         let models_dir_changed = new.models_dir != old.models_dir;
         let hub_changed = new.huggingface.endpoint != old.huggingface.endpoint || new.huggingface.token != old.huggingface.token;
         let recording_changed = new.provenance.record_inferences != old.provenance.record_inferences

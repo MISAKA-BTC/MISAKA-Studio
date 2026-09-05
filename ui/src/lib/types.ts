@@ -429,6 +429,12 @@ export type PoolStatus =
       bond_outpoint: string | null
       fee_outpoint: string | null
       balance_sompi: number | null
+      /** Coinbase paid to the slot address so far — the mining rewards the chain has already
+       *  handed over (an attempt block's reward is escrowed until its claim is Final, and shows up
+       *  here only then). Null when the pool's node could not be asked. */
+      rewards_sompi: number | null
+      /** The part of `rewards_sompi` that is still maturing and cannot be spent yet. */
+      rewards_immature_sompi: number | null
       min_funding_sompi: number
       blocks_won: number
       activity: string[]

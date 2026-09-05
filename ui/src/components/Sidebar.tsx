@@ -8,7 +8,7 @@ import { useEffect, useState } from 'react'
 import logo from '../assets/misaka-logo.png'
 import { api } from '../lib/api'
 import { relativeTime } from '../lib/format'
-import type { Effort, MiningState } from '../lib/types'
+import type { Effort, MiningState, PoolStatus } from '../lib/types'
 import { useStudio, type View } from '../store/studio'
 import { Icon, type IconName } from './common'
 
@@ -24,6 +24,7 @@ import { Icon, type IconName } from './common'
 function MiningLight() {
   const [mining, setMining] = useState<MiningState | null>(null)
   const [effort, setEffort] = useState<Effort | null>(null)
+  const [pool, setPool] = useState<PoolStatus | null>(null)
 
   useEffect(() => {
     let live = true
@@ -37,6 +38,15 @@ function MiningLight() {
       } catch {
         if (live) setMining(null)
       }
+      // Someone mining through a pool slot has no node of their own, so `node.mining` is
+      // truthfully "not mining" — and the light went dark for exactly the people it was added
+      // for. The slot's lane is asked separately and shown the same way.
+      try {
+        const slot = await api.pool()
+        if (live) setPool(slot)
+      } catch {
+        if (live) setPool(null)
+      }
     }
     void read()
     const timer = setInterval(() => void read(), 15_000)
@@ -46,7 +56,40 @@ function MiningLight() {
     }
   }, [])
 
-  if (!mining || mining.state === 'not_mining') return null
+  if (!mining || mining.state === 'not_mining') {
+    if (!pool || !pool.joined) return null
+    const lane = pool.fp
+    const promptMining = lane !== null && lane.mode === 'fp' && lane.gateway_running && lane.submitter_running
+    if (!promptMining && pool.phase !== 'producing') return null
+    return (
+      <div
+        className={`mx-2 mb-2 flex items-center gap-2 rounded-lg px-3 py-2 text-[0.7rem] ${
+          promptMining
+            ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
+            : 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300'
+        }`}
+        title={
+          promptMining
+            ? `Every chat in the Chat tab is mined on pool slot ${pool.slot_id}: the answer and the claim behind it are one execution under that slot's bond.`
+            : `Pool slot ${pool.slot_id} is producing on its own draws; turn on prompt mining in the Network tab to make your chats the work.`
+        }
+      >
+        {promptMining ? (
+          <span className="relative flex size-2 shrink-0">
+            <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+            <span className="relative inline-flex size-2 rounded-full bg-emerald-500" />
+          </span>
+        ) : (
+          <span className="size-2 shrink-0 rounded-full bg-amber-500" />
+        )}
+        <span className="min-w-0 flex-1 truncate">
+          {promptMining
+            ? `Mining on · ${pool.slot_id} · ${lane.claims_submitted} claim${lane.claims_submitted === 1 ? '' : 's'} · ${pool.blocks_won} block${pool.blocks_won === 1 ? '' : 's'}`
+            : `Pool slot producing · ${pool.slot_id} · ${pool.blocks_won} block${pool.blocks_won === 1 ? '' : 's'}`}
+        </span>
+      </div>
+    )
+  }
 
   const producing = mining.state === 'producing'
   return (

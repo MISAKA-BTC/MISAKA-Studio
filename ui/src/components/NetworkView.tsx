@@ -891,6 +891,25 @@ function PoolPanel() {
             <div className="text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">Blocks won</div>
             <div className="tabular-nums">{pool.blocks_won}</div>
           </div>
+          {/* The number a miner actually came for. It is read from the chain, not from the pool's
+              own count of what it thinks it paid: coinbase outputs at the slot address, so an
+              escrowed attempt reward appears here only once its claim is Final. */}
+          <div className="col-span-2 rounded-md bg-emerald-500/10 px-2 py-1.5">
+            <div className="text-[0.65rem] uppercase tracking-wide text-emerald-800 dark:text-emerald-300">
+              Rewards earned
+            </div>
+            <div className="tabular-nums text-sm font-medium text-emerald-900 dark:text-emerald-200">
+              {msk(pool.rewards_sompi ?? null)}
+              {pool.rewards_immature_sompi ? (
+                <span className="ml-1.5 text-[0.7rem] font-normal text-emerald-800/80 dark:text-emerald-300/80">
+                  ({msk(pool.rewards_immature_sompi)} still maturing)
+                </span>
+              ) : null}
+            </div>
+            <div className="text-[0.65rem] text-ink-500 dark:text-ink-400">
+              Coinbase the chain has paid to this slot&rsquo;s address. On a test network this has no value.
+            </div>
+          </div>
         </div>
         {pool.fp && pool.fp.mode === 'fp' && (
           <div className="rounded-lg border border-arc-500/30 bg-arc-500/5 p-2">
