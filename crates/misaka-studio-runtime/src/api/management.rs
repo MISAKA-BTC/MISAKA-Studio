@@ -52,6 +52,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .nest("/network", crate::api::network::router())
         .nest("/network/pool", crate::api::pool::router())
         .nest("/network/prompt-mining", crate::api::prompt_mining::router())
+        .nest("/network/mining-queue", crate::api::mining_queue::router())
         .route("/records", get(list_records))
         .route("/records/{id}", get(get_record))
 }

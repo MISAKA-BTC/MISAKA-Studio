@@ -234,6 +234,8 @@ export type Settings = {
     pool_url: string | null
     pool_slot_id: string | null
     pool_slot_token: string | null
+    palw_gateway_url: string | null
+    mining_mode: MiningMode
   }
   huggingface: { endpoint: string; token: string | null; max_concurrent_downloads: number }
   ui: { theme: 'system' | 'light' | 'dark'; show_provenance: boolean; show_performance: boolean }
@@ -286,6 +288,8 @@ export type ChatMessage = {
   streaming?: boolean
   error?: string
   stats?: TurnStats
+  /** Set on a user message that was queued for mining behind the chat. */
+  mining?: MessageMining
 }
 
 export type Conversation = {
@@ -481,6 +485,54 @@ export type PromptMiningStatus = {
 
 /** How far a commitment got. Today there is one value, and its name is the whole truth. */
 export type ChainReach = 'committed_not_submitted'
+
+/** Where a chat's mining happens: in the chat (it waits for the lane) or behind it (a queue). */
+export type MiningMode = 'inline' | 'background'
+
+export type MiningJobStatus = 'queued' | 'running' | 'committed' | 'refused' | 'failed'
+
+/** One prompt's passage through the slot's lane, as the runtime's queue records it. */
+export type MiningJob = {
+  id: string
+  conversation_id: string | null
+  message_id: string | null
+  prompt: string
+  created_ms: number
+  status: MiningJobStatus
+  attempts: number
+  not_before_ms: number
+  started_ms: number | null
+  finished_ms: number | null
+  fp_job_id: string | null
+  claim_id: string | null
+  /** The mined answer — the worker's, which need not match what the chat engine said. */
+  answer: string | null
+  prompt_tokens: number | null
+  completion_tokens: number | null
+  /** The lane's own words for a refusal or the last failure. */
+  error: string | null
+  gateway_url: string
+}
+
+export type MiningQueueView = {
+  mode: MiningMode
+  /** Whether `background` can be honoured now: a gateway is configured AND another engine can chat. */
+  background_available: boolean
+  background_blocker: string | null
+  gateway_url: string | null
+  counts: { queued: number; running: number; committed: number; refused: number; failed: number }
+  jobs: MiningJob[]
+}
+
+/** What a chat message knows about its own mining: the job it was queued as. */
+export type MessageMining = {
+  jobId: string
+  status: MiningJobStatus
+  claimId?: string | null
+  error?: string | null
+  /** The mined answer, once there is one — kept on the message so it survives the queue's trim. */
+  answer?: string | null
+}
 
 export type PromptMiningRun = {
   answer: string

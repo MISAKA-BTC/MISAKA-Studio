@@ -29,6 +29,7 @@ use tower_http::cors::{Any, CorsLayer};
 pub mod management;
 pub mod network;
 pub mod openai;
+pub mod mining_queue;
 pub mod pool;
 pub mod prompt_mining;
 

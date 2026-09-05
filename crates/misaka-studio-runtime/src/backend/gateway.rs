@@ -369,7 +369,7 @@ fn prompt_upper_bound(messages: &[ChatMessage]) -> u64 {
 /// The refusal names all three numbers — "prompt 51 + decode ceiling 476 exceeds
 /// max_context_tokens 512" — so the request that fits is arithmetic, not another guess. Retrying
 /// once with it turns the one failure a person cannot act on (an empty reply) into an answer.
-fn ceiling_from_refusal(message: &str) -> Option<u64> {
+pub(crate) fn ceiling_from_refusal(message: &str) -> Option<u64> {
     let after = |mark: &str| -> Option<u64> {
         let rest = message.split(mark).nth(1)?;
         let digits: String = rest.trim_start().chars().take_while(char::is_ascii_digit).collect();

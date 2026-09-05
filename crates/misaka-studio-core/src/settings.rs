@@ -300,6 +300,26 @@ pub struct NodeSettings {
     /// default; a pool-hosted gateway is the same field with someone else's host in it, which is
     /// what "mine with a prompt and no node here" means.
     pub palw_gateway_url: Option<String>,
+    /// Where a chat's mining happens relative to the chat itself — see [`MiningMode`].
+    pub mining_mode: MiningMode,
+}
+
+/// **Whether the Chat tab waits for the lane, or the lane runs behind it.**
+///
+/// The free-prompt lane executes for minutes per answer and refuses for reasons about the slot
+/// (unfunded, a full bond, a node mid-restart). `Inline` puts all of that in the chat: the answer
+/// IS the mined answer, and every lane condition is a chat error. `Background` answers the chat
+/// from an engine that can answer now and queues the same prompt for the slot's gateway, where a
+/// worker mines it on its own cadence and the chat is told, under the message, what came of it —
+/// the shape hash mining always had.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MiningMode {
+    /// The chat's answer is the mined answer; the chat waits for the lane.
+    #[default]
+    Inline,
+    /// The chat answers locally; prompts are mined from a queue behind it.
+    Background,
 }
 
 impl Default for NodeSettings {
@@ -326,6 +346,7 @@ impl Default for NodeSettings {
             pool_slot_id: None,
             pool_slot_token: None,
             palw_gateway_url: None,
+            mining_mode: MiningMode::default(),
         }
     }
 }

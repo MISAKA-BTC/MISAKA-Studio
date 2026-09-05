@@ -25,6 +25,8 @@ function MiningLight() {
   const [mining, setMining] = useState<MiningState | null>(null)
   const [effort, setEffort] = useState<Effort | null>(null)
   const [pool, setPool] = useState<PoolStatus | null>(null)
+  const queue = useStudio((s) => s.miningQueue)
+  const refreshMining = useStudio((s) => s.refreshMining)
 
   useEffect(() => {
     let live = true
@@ -47,6 +49,9 @@ function MiningLight() {
       } catch {
         if (live) setPool(null)
       }
+      // The same slow tick refreshes the mining queue, which is what the badges under the chat's
+      // messages read. One poll for both lights; the queue is not a dashboard either.
+      await refreshMining()
     }
     void read()
     const timer = setInterval(() => void read(), 15_000)
@@ -54,7 +59,7 @@ function MiningLight() {
       live = false
       clearInterval(timer)
     }
-  }, [])
+  }, [refreshMining])
 
   if (!mining || mining.state === 'not_mining') {
     if (!pool || !pool.joined) return null
@@ -84,7 +89,11 @@ function MiningLight() {
         )}
         <span className="min-w-0 flex-1 truncate">
           {promptMining
-            ? `Mining on · ${pool.slot_id} · ${lane.claims_submitted} claim${lane.claims_submitted === 1 ? '' : 's'} · ${pool.blocks_won} block${pool.blocks_won === 1 ? '' : 's'}`
+            ? `Mining on · ${pool.slot_id} · ${lane.claims_submitted} claim${lane.claims_submitted === 1 ? '' : 's'} · ${pool.blocks_won} block${pool.blocks_won === 1 ? '' : 's'}${
+                queue && queue.counts.queued + queue.counts.running > 0
+                  ? ` · ⛏ ${queue.counts.running > 0 ? 'mining' : 'queued'} ${queue.counts.queued + queue.counts.running}`
+                  : ''
+              }`
             : `Pool slot producing · ${pool.slot_id} · ${pool.blocks_won} block${pool.blocks_won === 1 ? '' : 's'}`}
         </span>
       </div>

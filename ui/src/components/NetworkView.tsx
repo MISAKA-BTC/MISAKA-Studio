@@ -13,6 +13,7 @@
 //   Studio afterwards.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { MiningQueuePanel } from './MiningQueuePanel'
 import { PromptMiningPanel } from './PromptMiningPanel'
 import { api } from '../lib/api'
 import { bytes, count, shortHash } from '../lib/format'
@@ -911,6 +912,7 @@ function PoolPanel() {
             </div>
           </div>
         </div>
+        {pool.fp && pool.fp.mode === 'fp' && pool.fp.gateway_running && pool.fp.submitter_running && <MiningQueuePanel />}
         {pool.fp && pool.fp.mode === 'fp' && (
           <div className="rounded-lg border border-arc-500/30 bg-arc-500/5 p-2">
             <div className="flex flex-wrap items-center gap-2">

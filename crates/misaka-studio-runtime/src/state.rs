@@ -68,6 +68,8 @@ pub struct AppState {
     pub metrics: Arc<MetricsHub>,
     pub node: Arc<crate::node::NodeManager>,
     pub records: RwLock<Arc<RecordStore>>,
+    /// Prompts waiting to be — or already — mined behind the chat. See `crate::mining_queue`.
+    pub mining: Arc<crate::mining_queue::MiningQueue>,
     catalog: RwLock<Arc<Catalog>>,
     backend: RwLock<SharedBackend>,
     loaded: RwLock<Option<LoadedState>>,
@@ -94,7 +96,8 @@ impl AppState {
         let metrics = MetricsHub::new(&hardware);
 
         let node = Arc::new(crate::node::NodeManager::with_journal(Some(data_dir.join("produced-blocks.jsonl"))));
-        Arc::new(AppState {
+        let mining = crate::mining_queue::MiningQueue::open(data_dir.join("mining-queue.json")).await;
+        let app = Arc::new(AppState {
             settings: RwLock::new(settings),
             settings_path,
             data_dir,
@@ -104,10 +107,45 @@ impl AppState {
             metrics,
             node,
             records: RwLock::new(records),
+            mining,
             catalog: RwLock::new(catalog),
             backend: RwLock::new(backend),
             loaded: RwLock::new(None),
-        })
+        });
+        // The queue's worker lives as long as the app: prompts queued in an earlier run are still
+        // owed a claim, and the person may have closed the window on them on purpose.
+        app.mining.spawn_worker(app.clone());
+        app
+    }
+
+    /// **Whether something other than the pool's gateway can answer the loaded model.**
+    ///
+    /// `Background` mining only makes sense if the chat has somewhere else to go: the local
+    /// integer runtime for a class artifact (`misaka-palw-serve`, when it is installed) or
+    /// llama.cpp/MLX for a GGUF (when their servers are). With nothing else installed the chat
+    /// must keep mining inline, and the queue must not be fed on top of it — that would mine one
+    /// prompt twice. `Err` carries the reason, for the panel.
+    pub async fn local_engine_for_loaded_model(&self) -> std::result::Result<(), String> {
+        let settings = self.settings.read().await.clone();
+        let Some(loaded) = self.loaded().await else {
+            return Err("no model is loaded".to_string());
+        };
+        let is_artifact = loaded.model.path.file_name().and_then(|n| n.to_str()).is_some_and(palw::is_artifact_filename);
+        if is_artifact {
+            let serve = settings.backend.misaka_serve_path.clone();
+            match serve {
+                Some(path) if path.is_file() => Ok(()),
+                Some(path) => Err(format!("the local integer runtime is not at {}", path.display())),
+                None => Err("the local integer runtime (misaka-palw-serve) is not installed; the chat can only be answered by the pool's gateway".to_string()),
+            }
+        } else {
+            let backend = build_backend_kind(BackendKind::Auto, &settings, &self.hardware);
+            if backend.availability().await.is_available() {
+                Ok(())
+            } else {
+                Err(format!("no local engine can run this file ({} is not installed)", backend.name()))
+            }
+        }
     }
 
     pub async fn catalog(&self) -> Arc<Catalog> {
@@ -239,7 +277,10 @@ impl AppState {
             || new.backend.llama_server_path != old.backend.llama_server_path
             || new.backend.mlx_server_path != old.backend.mlx_server_path
             || new.node.palw_gateway_url != old.node.palw_gateway_url
-            || new.node.pool_slot_token != old.node.pool_slot_token;
+            || new.node.pool_slot_token != old.node.pool_slot_token
+            // Background mining moves the chat off the gateway and onto the local runtime (when
+            // it is installed); the engine has to follow the switch, in both directions.
+            || new.node.mining_mode != old.node.mining_mode;
         let models_dir_changed = new.models_dir != old.models_dir;
         let hub_changed = new.huggingface.endpoint != old.huggingface.endpoint || new.huggingface.token != old.huggingface.token;
         let recording_changed = new.provenance.record_inferences != old.provenance.record_inferences
@@ -281,12 +322,22 @@ impl AppState {
     async fn backend_for(&self, model: &LocalModel, settings: &Settings) -> SharedBackend {
         let configured = self.backend.read().await.clone();
         let is_artifact = model.path.file_name().and_then(|n| n.to_str()).is_some_and(palw::is_artifact_filename);
+        // In `Background` mode the chat is answered here and the gateway mines from the queue —
+        // but only when the local integer runtime is actually installed. Otherwise the gateway
+        // stays the chat's engine and the queue is told not to double up (see
+        // `local_engine_for_loaded_model`).
+        let local_serve_installed = settings.backend.misaka_serve_path.as_deref().is_some_and(|p| p.is_file());
+        let background = settings.node.mining_mode == misaka_studio_core::settings::MiningMode::Background;
+        let prefer_local = is_artifact && background && local_serve_installed;
+        if prefer_local && configured.name() == crate::backend::gateway::NAME {
+            return build_backend_kind(BackendKind::Misaka, settings, &self.hardware);
+        }
         let reads_artifacts = [MisakaBackend::NAME, crate::backend::gateway::NAME].contains(&configured.name());
         if is_artifact == reads_artifacts {
             return configured;
         }
         let kind = if is_artifact {
-            if settings.node.palw_gateway_url.is_some() { BackendKind::Gateway } else { BackendKind::Misaka }
+            if settings.node.palw_gateway_url.is_some() && !prefer_local { BackendKind::Gateway } else { BackendKind::Misaka }
         } else {
             BackendKind::Auto
         };

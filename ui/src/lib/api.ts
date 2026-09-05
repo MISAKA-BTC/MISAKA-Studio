@@ -19,6 +19,9 @@ import type {
   ProducedBlock,
   PromptMiningRun,
   PromptMiningStatus,
+  MiningJob,
+  MiningMode,
+  MiningQueueView,
   RuntimeSample,
   RuntimeStatus,
   Settings,
@@ -120,6 +123,17 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ prompt, max_tokens: maxTokens ?? null }),
     }),
+  // The mining queue: prompts mined behind the chat, on the pool slot's gateway.
+  miningQueue: () => request<MiningQueueView>('/api/v1/network/mining-queue'),
+  miningEnqueue: (prompt: string, conversationId: string | null, messageId: string | null) =>
+    request<MiningJob>('/api/v1/network/mining-queue', {
+      method: 'POST',
+      body: JSON.stringify({ prompt, conversation_id: conversationId, message_id: messageId }),
+    }),
+  miningRemove: (id: string) => request<{ removed: string }>(`/api/v1/network/mining-queue/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  miningRetry: (id: string) => request<{ requeued: string }>(`/api/v1/network/mining-queue/${encodeURIComponent(id)}/retry`, { method: 'POST' }),
+  miningMode: (mode: MiningMode) =>
+    request<MiningQueueView>('/api/v1/network/mining-queue/mode', { method: 'PUT', body: JSON.stringify({ mode }) }),
   networkClasses: () => request<PalwClassStatus[]>('/api/v1/network/classes'),
   downloadClassArtifact: (name: string) =>
     request<DownloadProgress>(`/api/v1/network/classes/${encodeURIComponent(name)}/download`, { method: 'POST' }),

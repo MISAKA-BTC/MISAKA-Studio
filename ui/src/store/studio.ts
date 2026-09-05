@@ -12,7 +12,18 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { api, streamChat } from '../lib/api'
-import type { ChatMessage, Conversation, DownloadProgress, ModelView, RuntimeSample, RuntimeStatus, Settings, SystemInfo } from '../lib/types'
+import type {
+  ChatMessage,
+  Conversation,
+  DownloadProgress,
+  MessageMining,
+  MiningQueueView,
+  ModelView,
+  RuntimeSample,
+  RuntimeStatus,
+  Settings,
+  SystemInfo,
+} from '../lib/types'
 
 export type View = 'chat' | 'models' | 'network' | 'monitor' | 'settings'
 
@@ -60,6 +71,10 @@ type StudioState = {
   editMessage: (messageId: string, content: string) => Promise<void>
   stop: () => void
   isGenerating: () => boolean
+
+  /** The runtime's mining queue, as last read; drives the badges under user messages. */
+  miningQueue: MiningQueueView | null
+  refreshMining: () => Promise<void>
 }
 
 /** The in-flight generation. Outside the store: it is not state anyone renders, and it must not
@@ -94,6 +109,7 @@ export const useStudio = create<StudioState>()(
       toasts: [],
       conversations: [],
       activeConversationId: null,
+      miningQueue: null,
 
       setView: (view) => set({ view }),
 
@@ -256,7 +272,53 @@ export const useStudio = create<StudioState>()(
               : c,
           ),
         }))
+        // Background mining: the prompt goes to the slot's queue as well, and the chat carries
+        // on with whatever engine answers here. Only when the runtime says the queue can be fed
+        // without doubling up — with the gateway as the chat engine, the chat IS the mining.
+        const queue = get().miningQueue
+        if (queue && queue.mode === 'background' && queue.background_available) {
+          try {
+            const job = await api.miningEnqueue(trimmed, conversationId, message.id)
+            const mining: MessageMining = { jobId: job.id, status: job.status }
+            set((s) => ({
+              conversations: s.conversations.map((c) =>
+                c.id === conversationId ? { ...c, messages: c.messages.map((m) => (m.id === message.id ? { ...m, mining } : m)) } : c,
+              ),
+            }))
+          } catch (error) {
+            // The chat still answers; only the mining did not queue. Said once, where it can be
+            // acted on, rather than inside the message.
+            get().toast('error', `not queued for mining: ${(error as Error).message}`)
+          }
+        }
         await runGeneration(set, get, conversationId)
+      },
+
+      refreshMining: async () => {
+        try {
+          const queue = await api.miningQueue()
+          set({ miningQueue: queue })
+          // Fold the queue's word back onto the messages that were queued from here. A message
+          // whose job the queue has since trimmed keeps what it last heard.
+          const byId = new Map(queue.jobs.map((j) => [j.id, j]))
+          set((s) => ({
+            conversations: s.conversations.map((c) => ({
+              ...c,
+              messages: c.messages.map((m) => {
+                if (!m.mining) return m
+                const job = byId.get(m.mining.jobId)
+                if (!job) return m
+                const mining: MessageMining = { jobId: job.id, status: job.status, claimId: job.claim_id, error: job.error, answer: job.answer }
+                return mining.status === m.mining.status && mining.claimId === m.mining.claimId && mining.error === m.mining.error
+                  ? m
+                  : { ...m, mining }
+              }),
+            })),
+          }))
+        } catch {
+          // The runtime is the source of truth; when it is unreachable the badges simply keep
+          // their last state, the same way the connection dot already says so.
+        }
       },
 
       regenerate: async () => {

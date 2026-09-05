@@ -12,7 +12,7 @@
 
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { duration } from '../lib/format'
-import type { ChatMessage } from '../lib/types'
+import type { ChatMessage, MessageMining } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { CopyButton, EmptyState, Icon, Spinner } from './common'
 import { Markdown } from './Markdown'
@@ -31,6 +31,59 @@ import { ModelBar } from './ModelBar'
  * The elapsed count is the honest part: it says the wait is running, which a spinner alone does
  * not. llama.cpp streams, so there the wait is a second and this reads the same as before.
  */
+/**
+ * **What became of this prompt on the chain** — under the message, always visible, never a toast.
+ *
+ * Background mining answers the chat here and mines the prompt behind it; the badge is the only
+ * place the two halves meet. It says exactly what the runtime's queue says: queued, mining, a
+ * committed claim (with its id), or the lane's own refusal — and, when there is one, the mined
+ * answer, because that is the text misakascan will show and it need not match the chat's.
+ */
+function MiningBadge({ mining }: { mining: MessageMining }) {
+  const [open, setOpen] = useState(false)
+  const tone =
+    mining.status === 'committed'
+      ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
+      : mining.status === 'refused' || mining.status === 'failed'
+        ? 'bg-red-50 text-red-700 dark:bg-red-950/40 dark:text-red-300'
+        : 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300'
+  const label =
+    mining.status === 'queued'
+      ? 'queued for mining'
+      : mining.status === 'running'
+        ? 'mining…'
+        : mining.status === 'committed'
+          ? `mined · claim ${mining.claimId ? mining.claimId.slice(0, 8) + '…' : 'committed'}`
+          : mining.status === 'refused'
+            ? 'not mined — the lane refused'
+            : 'not mined — gave up'
+  return (
+    <div className="mt-1.5 flex flex-col items-end gap-1 text-[0.7rem]">
+      <button
+        type="button"
+        className={`inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 ${tone}`}
+        onClick={() => setOpen((v) => !v)}
+        title={mining.error ?? (mining.answer ? 'Show the mined answer' : undefined)}
+      >
+        <span aria-hidden>⛏</span>
+        {label}
+      </button>
+      {open && (mining.error || mining.answer) && (
+        <div className="max-w-prose rounded-lg border border-ink-200 bg-white p-2 text-left text-xs text-ink-700 dark:border-ink-800 dark:bg-ink-900 dark:text-ink-300">
+          {mining.error ? (
+            <p className="whitespace-pre-wrap">{mining.error}</p>
+          ) : (
+            <>
+              <p className="mb-1 text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">Mined answer — what the chain holds</p>
+              <p className="whitespace-pre-wrap">{mining.answer}</p>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function Waiting() {
   const backend = useStudio((s) => s.runtime?.backend)
   const [seconds, setSeconds] = useState(0)
@@ -254,6 +307,7 @@ function Message({
             )}
           </div>
         )}
+        {!editing && isUser && message.mining && <MiningBadge mining={message.mining} />}
 
         {!editing && (
           <div className={`mt-1.5 flex items-center gap-1 text-xs text-ink-500 opacity-0 transition-opacity group-hover:opacity-100 dark:text-ink-400 ${isUser ? 'justify-end' : ''}`}>
