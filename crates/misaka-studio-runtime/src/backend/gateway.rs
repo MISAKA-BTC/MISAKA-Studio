@@ -228,26 +228,20 @@ impl InferenceBackend for GatewayBackend {
                             ),
                         });
                     }
-                    // **256 is the lane's own ceiling today, not a preference.**
+                    // **Room is not a target.** A decode ceiling is what the model is ALLOWED to
+                    // generate, and this one does not reliably stop early: given the whole
+                    // remaining context it produced 438 of 438 tokens and took 6.7 minutes for a
+                    // two-line question. So an ask that does not fit the class — the app's default
+                    // is 2048, meant for a 32K GGUF — is sized like an answer rather than like the
+                    // context. A smaller ask, or a larger one that fits, is honoured as given.
                     //
-                    // A free-prompt result is validated with
-                    // `trace_chunk_count == ceil(decode_tokens_executed / PALW_FP_TRACE_CHUNK_EVENTS_V3)`,
-                    // and that constant is 256 — while the producer hardcodes ONE chunk
-                    // (`misaka-palw-base0/src/produce.rs`, the attempt lane's rule under ADR-0072
-                    // Decision 8). So a run of more than 256 tokens is refused by the gateway's own
-                    // binding check and its resident worker is dropped as if the transport had
-                    // failed. Measured against the live gateway, one token apart:
-                    //
-                    //     decode=256/256 … ok
-                    //     decode=257/257 … the retained-trace chunk count is not the executed shape's
-                    //
-                    // Asking for more cannot succeed, so it is clamped rather than sent — an
-                    // opaque failure four minutes in is worse than a shorter answer now. When the
-                    // producer learns the free-prompt manifest, this line is what should move.
-                    const LANE_CHUNK_EVENTS: u64 = 256;
-                    // Room is not a target either: given the whole remaining context this model
-                    // produced 438 of 438 tokens and took 6.7 minutes for a two-line question.
-                    request.params.max_tokens.min(room).min(LANE_CHUNK_EVENTS)
+                    // This was 256 for a while, and for a different reason: a producer that
+                    // hardcoded one retained-trace chunk made every run past 256 tokens fail its
+                    // own binding check. That is fixed in the producer, and measured here at the
+                    // token that used to break — decode 257/257, committed — so the number is back
+                    // to being a default answer length and not a wall.
+                    const DEFAULT_ANSWER_TOKENS: u64 = 256;
+                    if request.params.max_tokens <= room { request.params.max_tokens } else { room.min(DEFAULT_ANSWER_TOKENS) }
                 }
                 None => request.params.max_tokens,
             };
