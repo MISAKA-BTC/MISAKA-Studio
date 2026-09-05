@@ -13,11 +13,12 @@
 //   Studio afterwards.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { MiningDifficultyCard } from './MiningDifficultyCard'
 import { MiningQueuePanel } from './MiningQueuePanel'
 import { PromptMiningPanel } from './PromptMiningPanel'
 import { api } from '../lib/api'
 import { bytes, count, shortHash } from '../lib/format'
-import type { Effort, MiningState, NetworkOverview, NodeClassRow, NodeStatus, NodeView, PalwClassStatus, PoolStatus, ProducedBlock, Settings } from '../lib/types'
+import type { Effort, MiningState, NetworkOverview, NodeClassRow, NodeStatus, NodeView, PalwClassStatus, PoolBlock, PoolStatus, ProducedBlock, Settings } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { CopyButton, EmptyState, Field, Icon, Section, Spinner, Toggle } from './common'
 
@@ -49,6 +50,28 @@ export function NetworkView() {
       if (timer.current) clearInterval(timer.current)
     }
   }, [refresh])
+
+  // The pool slot, for the banner at the top: "not mining" was read from this machine's node
+  // alone, which is truthfully idle for someone whose producer is a pool slot — so the page
+  // opened by saying the opposite of what the sidebar light and the slot card said below it.
+  const [pool, setPool] = useState<PoolStatus | null>(null)
+  useEffect(() => {
+    let live = true
+    const read = async () => {
+      try {
+        const slot = await api.pool()
+        if (live) setPool(slot)
+      } catch {
+        if (live) setPool(null)
+      }
+    }
+    void read()
+    const id = setInterval(() => void read(), 30_000)
+    return () => {
+      live = false
+      clearInterval(id)
+    }
+  }, [])
 
   const start = async (role: 'observer' | 'verifier' | 'producer') => {
     setBusy(true)
@@ -112,7 +135,7 @@ export function NetworkView() {
 
   return (
     <div className="h-full overflow-y-auto p-4">
-      <MiningBanner mining={node.mining} effort={node.effort} pool={null} />
+      <MiningBanner mining={node.mining} effort={node.effort} pool={pool} />
       {(node.pay_address || node.registered_bond) && <ProducerIdentityCard node={node} />}
       <div className="grid gap-4 xl:grid-cols-3">
         <div className="space-y-4 xl:col-span-2">
@@ -218,6 +241,7 @@ const LANE_NAMES: Record<number, string> = {
 /** Every block this machine has won, described by the chain and linked to the public explorer. */
 function ProducedBlocksCard() {
   const [blocks, setBlocks] = useState<ProducedBlock[] | null>(null)
+  const [poolBlocks, setPoolBlocks] = useState<{ slot: string; blocks: PoolBlock[] } | null>(null)
   const [busy, setBusy] = useState(false)
   const [failed, setFailed] = useState<string | null>(null)
   const load = useCallback(async () => {
@@ -231,12 +255,25 @@ function ProducedBlocksCard() {
     } finally {
       setBusy(false)
     }
+    // A pool user's producer is the slot: the blocks it won are its node's, announced in its log,
+    // which the pool reads for us. Listed here with the local node's so "Blocks you have won" is
+    // true for both kinds of miner. Best effort — the pool being unreachable leaves the local rows.
+    try {
+      const slot = await api.pool()
+      setPoolBlocks(slot.joined ? { slot: slot.slot_id, blocks: slot.blocks ?? [] } : null)
+    } catch {
+      /* keep the last answer */
+    }
   }, [])
   useEffect(() => {
     void load()
     const id = setInterval(() => void load(), 60_000)
     return () => clearInterval(id)
   }, [load])
+
+  const localCount = blocks?.length ?? 0
+  const poolRows = poolBlocks?.blocks ?? []
+  const total = localCount + poolRows.length
 
   return (
     <section className="card p-5">
@@ -250,12 +287,47 @@ function ProducedBlocksCard() {
         Kept by this Studio, because nothing else can: the node&apos;s own counter resets every restart, and the chain
         holds no index of which miner won what. Every other column here is read back from your node, so a row is what
         the chain says about the block now — not what the log said when it was made.
+        {poolBlocks && <> Blocks won by your pool slot ({poolBlocks.slot}) are read from that node&apos;s log by the pool.</>}
       </p>
       {failed && <p className="mt-3 text-xs text-rose-600 dark:text-rose-400">Could not read the blocks: {failed}</p>}
-      {blocks !== null && blocks.length === 0 && (
+      {blocks !== null && total === 0 && (
         <p className="mt-3 text-xs text-ink-500 dark:text-ink-400">
-          No block yet. One appears here the moment your node announces it.
+          No block yet. One appears here the moment {poolBlocks ? 'your pool slot' : 'your node'} announces it.
         </p>
+      )}
+      {poolRows.length > 0 && (
+        <div className="mt-3 overflow-x-auto">
+          <table className="w-full min-w-[30rem] text-left text-xs">
+            <thead className="text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">
+              <tr>
+                <th className="pb-1 pr-3 font-medium">When</th>
+                <th className="pb-1 pr-3 font-medium">Won by</th>
+                <th className="pb-1 font-medium">Block</th>
+              </tr>
+            </thead>
+            <tbody>
+              {poolRows.map(b => (
+                <tr key={b.hash} className="border-t border-ink-200/60 dark:border-ink-800/60">
+                  <td className="py-1 pr-3 tabular-nums">{b.ts_ms ? new Date(b.ts_ms).toLocaleString() : '—'}</td>
+                  <td className="py-1 pr-3">
+                    <span className="badge bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">pool {poolBlocks?.slot}</span>
+                  </td>
+                  <td className="py-1">
+                    <a
+                      className="mono text-[0.7rem] underline decoration-dotted underline-offset-2"
+                      href={`https://misakascan.com/#/block/${b.hash}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      title={b.hash}
+                    >
+                      {shortHash(b.hash, 10, 6)}
+                    </a>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
       {blocks !== null && blocks.length > 0 && (
         <div className="mt-3 overflow-x-auto">
@@ -350,7 +422,7 @@ function ChainClock({ status }: { status: NodeStatus }) {
   )
 }
 
-function MiningBanner({ mining, effort }: { mining: MiningState; effort: Effort | null; pool: null }) {
+function MiningBanner({ mining, effort, pool }: { mining: MiningState; effort: Effort | null; pool: PoolStatus | null }) {
   if (mining.state === 'producing') {
     return (
       <div className="mb-4 flex flex-wrap items-center gap-3 rounded-xl border border-emerald-300 bg-emerald-50 p-4 dark:border-emerald-900 dark:bg-emerald-950/40">
@@ -387,6 +459,47 @@ function MiningBanner({ mining, effort }: { mining: MiningState; effort: Effort 
             ) : (
               <>{effort && effort.draws > 0 ? effortLine(effort) : 'Syncing, or waiting for its first win. The node states a reason here as soon as it has one.'}</>
             )}
+          </p>
+        </div>
+      </div>
+    )
+  }
+
+  // No node of your own, but a pool slot: the slot IS your producer. Say what it is doing, in the
+  // same green/amber the local producer would get, instead of "not mining" over a card that says
+  // "producing".
+  if (pool && pool.joined) {
+    const lane = pool.fp
+    const promptMining = lane !== null && lane.mode === 'fp' && lane.gateway_running && lane.submitter_running
+    const producing = pool.phase === 'producing'
+    if (promptMining || producing) {
+      return (
+        <div className="mb-4 flex flex-wrap items-center gap-3 rounded-xl border border-emerald-300 bg-emerald-50 p-4 dark:border-emerald-900 dark:bg-emerald-950/40">
+          <span className="relative flex size-3 shrink-0">
+            <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+            <span className="relative inline-flex size-3 rounded-full bg-emerald-500" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-semibold text-emerald-900 dark:text-emerald-200">
+              Mining through pool slot {pool.slot_id}
+              {promptMining ? ' — your chats are mined behind the conversation' : ' — the slot is drawing on its own'}
+            </p>
+            <p className="mt-0.5 text-xs text-emerald-800 dark:text-emerald-300">
+              {pool.blocks_won} block{pool.blocks_won === 1 ? '' : 's'} won by the slot
+              {promptMining && <> · {lane.claims_submitted} claim{lane.claims_submitted === 1 ? '' : 's'} submitted from your prompts</>}
+              {' '}· rewards land at the slot address (escrowed until each claim is Final)
+            </p>
+          </div>
+        </div>
+      )
+    }
+    return (
+      <div className="mb-4 flex flex-wrap items-center gap-3 rounded-xl border border-amber-300 bg-amber-50 p-4 dark:border-amber-900 dark:bg-amber-950/40">
+        <span className="size-3 shrink-0 rounded-full bg-amber-500" />
+        <div className="min-w-0 flex-1">
+          <p className="text-sm font-semibold text-amber-900 dark:text-amber-200">Pool slot {pool.slot_id} is not producing yet ({pool.phase})</p>
+          <p className="mt-0.5 text-xs leading-relaxed text-amber-800 dark:text-amber-300">
+            It starts by itself once it is funded and its bond is in a block — the slot card below says what it is waiting for.
           </p>
         </div>
       </div>
@@ -912,6 +1025,7 @@ function PoolPanel() {
             </div>
           </div>
         </div>
+        <MiningDifficultyCard pool={pool} />
         {pool.fp && pool.fp.mode === 'fp' && pool.fp.gateway_running && pool.fp.submitter_running && <MiningQueuePanel />}
         {pool.fp && pool.fp.mode === 'fp' && (
           <div className="rounded-lg border border-arc-500/30 bg-arc-500/5 p-2">

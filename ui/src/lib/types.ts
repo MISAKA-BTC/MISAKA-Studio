@@ -441,10 +441,39 @@ export type PoolStatus =
       rewards_immature_sompi: number | null
       min_funding_sompi: number
       blocks_won: number
+      /** The blocks this slot's node produced, newest first — read from the node's own log. */
+      blocks?: PoolBlock[]
+      /** The lottery's odds as the node last stated them; null until the slot has drawn. */
+      difficulty?: PoolDifficulty | null
       activity: string[]
       /** The slot's free-prompt lane, when the pool knows about one. */
       fp: PoolFpStatus | null
     }
+
+/** A block the pool slot's node produced, as its log announced it. */
+export type PoolBlock = {
+  hash: string
+  ts_ms: number | null
+}
+
+/**
+ * The slot's lottery, in the node's own numbers: a draw wins a block when it passes the class
+ * ticket (`class_ticket_p`) AND the Layer-0 target (`layer0_p`, from the chain's `bits`). The
+ * expected draws per block is the product's inverse; the seconds follow from the draw rate the
+ * node reports every five minutes.
+ */
+export type PoolDifficulty = {
+  sampled_at_ms: number | null
+  draws_this_run: number
+  produced_this_run: number
+  class_ticket_wins_this_run: number
+  class_ticket_p: number | null
+  layer0_p: number | null
+  bits: number | string | null
+  draws_per_block: number | null
+  draws_per_s: number | null
+  expected_seconds_per_block: number | null
+}
 
 /** What a slot's free-prompt lane is doing: the chat that mines, on that slot's own bond. */
 export type PoolFpStatus = {
