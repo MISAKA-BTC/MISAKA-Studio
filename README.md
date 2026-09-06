@@ -42,23 +42,28 @@ beside the app).
 ## Quick start
 
 ```bash
-# 1. The runtime and the UI bundle
-cargo build --release                    # misaka-studiod
+# 1. The UI bundle, then the runtime — in that order: the runtime compiles the built
+#    UI into itself, so a binary built before `npm run build` has no app inside it.
 npm --prefix ui install && npm --prefix ui run build
+cargo build --release                    # misaka-studiod
 
 # 2. An engine. The Studio drives llama.cpp; it does not bundle it.
 #    Install llama.cpp so `llama-server` is on PATH, or point the setting at your own build.
 
-# 3. Run
-./target/release/misaka-studiod --ui-dir ui/dist
+# 3. Run — from any directory; the UI travels inside the binary
+./target/release/misaka-studiod
 #   → http://127.0.0.1:1338
 ```
+
+`--ui-dir ui/dist` still works and takes precedence: it serves the directory live, so
+`npm --prefix ui run build` alone refreshes the app with no Rust recompile. Without it the
+embedded copy is served. `misaka-studiod --check` prints which of the two you are getting.
 
 No engine installed and just want to see the app? `--backend mock` streams canned replies with no
 model at all:
 
 ```bash
-./target/release/misaka-studiod --ui-dir ui/dist --backend mock
+./target/release/misaka-studiod --backend mock
 ```
 
 ### On Windows
@@ -70,7 +75,7 @@ The block above is bash. **Windows PowerShell 5.1 — the one that ships with Wi
 ```powershell
 cargo build --release
 npm --prefix ui install; npm --prefix ui run build
-.\target\release\misaka-studiod.exe --ui-dir ui\dist
+.\target\release\misaka-studiod.exe
 ```
 
 PowerShell 7 (`pwsh`) does support `&&`, so the bash lines work there unchanged apart from the

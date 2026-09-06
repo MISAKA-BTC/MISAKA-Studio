@@ -148,13 +148,39 @@ async fn main() -> anyhow::Result<()> {
     let ui_dir = locate_ui(args.ui_dir.clone());
     let addr: SocketAddr = format!("{}:{}", settings.server.host, settings.server.port).parse()?;
 
+    /// Where `/` will be served from — a directory, the copy inside this binary, or nowhere.
+    ///
+    /// Said out loud on every start because the difference is invisible until a window opens on
+    /// the wrong answer: the packaged app used to show the headless page and there was no line
+    /// anywhere saying the runtime had not found a UI.
+    fn ui_source(dir: Option<&std::path::Path>) -> String {
+        match dir {
+            Some(dir) => format!("{} (directory)", dir.display()),
+            None if !api::ui::embedded_is_empty() => format!("built into this binary ({} files)", api::ui::embedded_len()),
+            None => "none — this build has no UI bundle; serving the API only".into(),
+        }
+    }
+
     if args.check {
         println!("settings file : {}", settings_path.display());
         println!("data dir      : {}", data_dir.display());
         println!("models dir    : {}", settings.models_dir.display());
         println!("bind          : {addr}");
         println!("backend       : {:?}", settings.backend.kind);
-        println!("ui            : {}", ui_dir.map(|d| d.display().to_string()).unwrap_or_else(|| "none (API only)".into()));
+        println!("ui            : {}", ui_source(ui_dir.as_deref()));
+        // Reported on its own line, and NOT folded into the one above, because the question a
+        // release asks is different from the question an operator asks. An operator wants to know
+        // what this process will serve; a release wants to know what this *binary* would serve on
+        // a machine with no source tree — and on the build machine there is always a `ui/dist` in
+        // the working directory to mask an empty embed.
+        println!(
+            "ui (embedded) : {}",
+            if api::ui::embedded_is_empty() {
+                "none — built before the UI bundle existed".to_string()
+            } else {
+                format!("{} files", api::ui::embedded_len())
+            }
+        );
         println!("api key       : {}", if settings.server.api_key.is_some() { "set" } else { "not set" });
         return Ok(());
     }
@@ -177,9 +203,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("  OpenAI-compatible API : http://{bound}/v1");
     tracing::info!("  Studio API            : http://{bound}/api/v1");
     tracing::info!("  models found          : {models}");
-    if ui_dir.is_none() {
-        tracing::info!("  UI                    : not bundled; serving the API only");
-    }
+    tracing::info!("  UI                    : {}", ui_source(ui_dir.as_deref()));
 
     let parent_gone = args.exit_on_stdin_close.then(watch_stdin_eof);
     let shutdown_state = state.clone();

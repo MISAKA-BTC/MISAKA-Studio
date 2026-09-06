@@ -32,6 +32,7 @@ pub mod openai;
 pub mod mining_queue;
 pub mod pool;
 pub mod prompt_mining;
+pub mod ui;
 
 /// Build the whole application router.
 pub fn router(state: Arc<AppState>, ui_dir: Option<PathBuf>, cors_origins: Vec<String>) -> axum::Router {
@@ -42,8 +43,16 @@ pub fn router(state: Arc<AppState>, ui_dir: Option<PathBuf>, cors_origins: Vec<S
         .layer(cors_layer(cors_origins))
         .with_state(state);
 
+    // A directory wins when one was found — it is a live bundle, editable without a recompile.
+    // Otherwise the copy compiled into this binary, which is what makes the packaged app and a
+    // `misaka-studiod` started from any directory serve the app rather than a note about a flag.
+    // The headless page is left for the one case that is genuinely headless: a build made without
+    // a UI bundle at all.
     match ui_dir {
         Some(dir) => api.fallback(get(move |req: Request| serve_ui(dir.clone(), req))),
+        None if !ui::embedded_is_empty() => {
+            api.fallback(get(|req: Request| async move { ui::serve(req.uri().path()) }))
+        }
         None => api.fallback(get(no_ui)),
     }
 }
@@ -127,8 +136,9 @@ async fn file_response(path: &std::path::Path) -> Response {
     }
 }
 
-/// What `/` says when the runtime is running without a UI bundle — the headless case, which is
-/// legitimate: the API is the product for anyone pointing another app at it.
+/// What `/` says when this build has no UI bundle at all — neither a directory nor an embedded
+/// copy. Legitimate: the API is the product for anyone pointing another app at it. It is no longer
+/// what a packaged app can fall into, which is what it used to be.
 async fn no_ui() -> Response {
     (
         StatusCode::OK,

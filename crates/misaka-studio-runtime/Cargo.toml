@@ -8,6 +8,8 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 default-run = "misaka-studiod"
+# Builds the UI bundle into the binary; see build.rs and src/api/ui.rs.
+build = "build.rs"
 
 [[bin]]
 name = "misaka-studiod"
@@ -24,6 +26,7 @@ futures-util.workspace = true
 hex.workspace = true
 mime_guess.workspace = true
 reqwest.workspace = true
+rust-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -84,6 +84,25 @@ jobs:
       - name: Build the runtime
         run: cargo build --release --bin misaka-studiod
 
+      # The runtime compiles `ui/dist` into itself, so "Build the UI" must come first — and if it
+      # ever stops doing so, the binary still builds, still runs, and serves the headless "no UI
+      # bundle" page instead of the app. That is precisely the failure the packaged v0.1.x showed
+      # its users, and nothing about the artifact looks wrong until a window opens on it. So the
+      # order is asserted here rather than trusted: `--check` names the UI's source.
+      - name: The bundled runtime must carry the UI
+        shell: bash
+        run: |
+          BIN=target/release/misaka-studiod
+          [ "${{ runner.os }}" = "Windows" ] && BIN=target/release/misaka-studiod.exe
+          # The embedded line specifically: on this machine `ui/dist` exists, so the line that
+          # says what THIS process serves would read "(directory)" and hide an empty embed.
+          UI=$("$BIN" --check | grep '^ui (embedded)' || true)
+          echo "$UI"
+          case "$UI" in
+            *files*) ;;
+            *) echo "::error::the release runtime has no UI compiled in — 'Build the UI' must run before 'Build the runtime'"; exit 1 ;;
+          esac
+
       - name: Stage the runtime as a bundle resource
         shell: bash
         run: |
