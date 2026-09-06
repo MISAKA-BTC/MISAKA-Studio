@@ -18,7 +18,7 @@ import { MiningQueuePanel } from './MiningQueuePanel'
 import { PromptMiningPanel } from './PromptMiningPanel'
 import { api } from '../lib/api'
 import { bytes, count, shortHash } from '../lib/format'
-import type { Effort, MiningState, NetworkOverview, NodeClassRow, NodeStatus, NodeView, PalwClassStatus, PoolBlock, PoolStatus, ProducedBlock, Settings } from '../lib/types'
+import type { Effort, MiningState, NetworkOverview, NodeClassRow, NodeStatus, NodeView, PalwClassStatus, PoolBlock, PoolFunds, PoolStatus, ProducedBlock, Settings } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { CopyButton, EmptyState, Field, Icon, Section, Spinner, Toggle } from './common'
 
@@ -236,6 +236,45 @@ const LANE_NAMES: Record<number, string> = {
   7: 'receipt',
   8: 'heartbeat',
   9: 'attempt (exec)',
+}
+
+/**
+ * Why a reward is, or is not, spendable — the sentence that was missing while the panel said
+ * "still maturing" over money the node would have accepted a spend of.
+ *
+ * A coinbase clears the base maturity and then either the DNS confirmed anchor passes its own
+ * block (fast) or the settlement fallback elapses (slow). Which one applies is the whole story,
+ * so it is named rather than summarised.
+ */
+function RewardSettlement({ funds }: { funds: PoolFunds | null }) {
+  if (!funds || !funds.rule) return null
+  const { rule } = funds
+  const waiting = funds.waiting_sompi ?? 0
+  if (waiting === 0) {
+    return (
+      <>
+        All of it is spendable: the chain&apos;s confirmed anchor (DAA {rule.confirmed_anchor_daa?.toLocaleString()}) has
+        already passed every block you won, which settles its reward.
+      </>
+    )
+  }
+  if (!rule.accelerated) {
+    return (
+      <>
+        No confirmed anchor is visible right now, so each reward waits the full{' '}
+        {rule.settlement_daa.toLocaleString()}-DAA fallback instead of settling as soon as the anchor passes its block.
+        {funds.waiting_until_daa != null && (
+          <> The first clears at DAA {funds.waiting_until_daa.toLocaleString()}; the chain is at {funds.virtual_daa.toLocaleString()}.</>
+        )}
+      </>
+    )
+  }
+  return (
+    <>
+      The rest was won since the confirmed anchor (DAA {rule.confirmed_anchor_daa?.toLocaleString()}) and settles as it
+      catches up — the chain is at {funds.virtual_daa.toLocaleString()}.
+    </>
+  )
 }
 
 /** Every block this machine has won, described by the chain and linked to the public explorer. */
@@ -998,8 +1037,10 @@ function PoolPanel() {
         </div>
         <div className="grid grid-cols-2 gap-x-4 gap-y-1">
           <div>
-            <div className="text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">Balance</div>
-            <div className="tabular-nums">{msk(pool.balance_sompi)}</div>
+            <div className="text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">
+              {pool.funds?.spendable_sompi === undefined ? 'Balance' : 'Spendable now'}
+            </div>
+            <div className="tabular-nums">{msk(pool.funds?.spendable_sompi ?? pool.balance_sompi)}</div>
           </div>
           <div>
             <div className="text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">Blocks won</div>
@@ -1013,15 +1054,16 @@ function PoolPanel() {
               Rewards earned
             </div>
             <div className="tabular-nums text-sm font-medium text-emerald-900 dark:text-emerald-200">
-              {msk(pool.rewards_sompi ?? null)}
-              {pool.rewards_immature_sompi ? (
+              {msk(pool.funds?.rewards_sompi ?? pool.rewards_sompi ?? null)}
+              {pool.funds?.waiting_sompi ? (
                 <span className="ml-1.5 text-[0.7rem] font-normal text-emerald-800/80 dark:text-emerald-300/80">
-                  ({msk(pool.rewards_immature_sompi)} still maturing)
+                  ({msk(pool.funds.waiting_sompi)} not spendable yet)
                 </span>
               ) : null}
             </div>
-            <div className="text-[0.65rem] text-ink-500 dark:text-ink-400">
-              Coinbase the chain has paid to this slot&rsquo;s address. On a test network this has no value.
+            <div className="text-[0.65rem] leading-relaxed text-ink-500 dark:text-ink-400">
+              Coinbase the chain has paid to this slot&rsquo;s address. On a test network this has no value.{' '}
+              <RewardSettlement funds={pool.funds ?? null} />
             </div>
           </div>
         </div>

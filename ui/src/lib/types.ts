@@ -437,8 +437,16 @@ export type PoolStatus =
        *  handed over (an attempt block's reward is escrowed until its claim is Final, and shows up
        *  here only then). Null when the pool's node could not be asked. */
       rewards_sompi: number | null
-      /** The part of `rewards_sompi` that is still maturing and cannot be spent yet. */
+      /**
+       * The part of `rewards_sompi` the *wallet CLI* calls immature. Kept for compatibility, but
+       * do not show it as the truth: that CLI never asks the node for its DNS confirmed anchor, so
+       * it always applies the slow 600-DAA fallback and reports rewards as locked that the node
+       * would let you spend today. `funds` is the pool's own reading of the same rule, with the
+       * anchor, and is what the panel shows when present.
+       */
       rewards_immature_sompi: number | null
+      /** What the node would actually let this address spend right now; null when unreadable. */
+      funds?: PoolFunds | null
       min_funding_sompi: number
       blocks_won: number
       /** The blocks this slot's node produced, newest first — read from the node's own log. */
@@ -449,6 +457,34 @@ export type PoolStatus =
       /** The slot's free-prompt lane, when the pool knows about one. */
       fp: PoolFpStatus | null
     }
+
+/**
+ * What the slot address holds, split by what the node's mempool would accept a spend of.
+ *
+ * A mining reward is a coinbase output, and a coinbase clears two layers: the base maturity, and
+ * then EITHER the DNS confirmed anchor passing its own block (the fast path) OR the long
+ * settlement fallback elapsing. The pool applies that rule itself against the node's anchor —
+ * `spendable_sompi` and `waiting_sompi` are absent when the rule's constants have never been
+ * observed, because a guessed constant would report real money as locked.
+ */
+export type PoolFunds = {
+  virtual_daa: number
+  /** Coinbase paid to this address — the mining rewards. */
+  rewards_sompi: number
+  /** Ordinary transfers in: funding, faucet grants, change. */
+  transfers_sompi: number
+  rule: {
+    coinbase_maturity_daa: number
+    settlement_daa: number
+    confirmed_anchor_daa: number | null
+    /** Whether the fast path is available; false means every reward waits the full fallback. */
+    accelerated: boolean
+  } | null
+  spendable_sompi?: number
+  waiting_sompi?: number
+  /** The DAA score at which the first waiting output clears, if any is waiting. */
+  waiting_until_daa?: number | null
+}
 
 /** A block the pool slot's node produced, as its log announced it. */
 export type PoolBlock = {
