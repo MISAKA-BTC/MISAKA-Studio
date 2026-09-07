@@ -611,3 +611,38 @@ export type PromptMiningRun = {
   completion_tokens: number | null
   chain: ChainReach
 }
+
+/// **ADR-0090: what opening a line's market needs, against what the joined slot has.**
+///
+/// `already_seeded` is deliberately three-valued. `null` means the chain could not be asked, which
+/// is NOT "not seeded": the next thing a person does with that answer is lock a hundred thousand
+/// MSK forever, so an unreachable node must not read as an open door.
+export interface SeedReadiness {
+  line_id: string | null
+  from_address: string | null
+  spendable_sompi: number | null
+  seed_min_sompi: number
+  short_by_sompi: number | null
+  can_seed: boolean
+  blocked_because: string | null
+  already_seeded: boolean | null
+}
+
+export interface SeedOutcome {
+  submitted: boolean
+  txid: string | null
+  detail: string
+}
+
+/// What registering this machine's artifact as a class needs. A checklist, because registration is
+/// a node's act and every `false` here is something the node would refuse on at startup.
+export interface RegistrationReadiness {
+  artifact: string | null
+  bond: string | null
+  fee_outpoint: string | null
+  has_key: boolean
+  can_register: boolean
+  blocked_because: string | null
+  armed: boolean
+  command: string[]
+}

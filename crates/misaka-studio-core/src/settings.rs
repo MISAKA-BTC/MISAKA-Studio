@@ -226,6 +226,21 @@ pub enum NodeNetwork {
     Simnet,
 }
 
+impl NodeNetwork {
+    /// The network id the CLI and the node spell it by — the string `--network` takes.
+    ///
+    /// Spelled once, here, because the Studio hands it to another process: a network id that
+    /// disagrees with the node's is how a transaction gets signed for the wrong chain, and the
+    /// CLI's own `getServerInfo` check can only catch it if the two names came from one place.
+    pub fn id(self) -> &'static str {
+        match self {
+            NodeNetwork::Testnet11 => "testnet-11",
+            NodeNetwork::Devnet => "devnet",
+            NodeNetwork::Simnet => "simnet",
+        }
+    }
+}
+
 /// How this machine participates in the MISAKA network.
 ///
 /// The ladder is honest about what each rung requires. Observing needs a reachable node's RPC.
@@ -253,6 +268,21 @@ pub struct NodeSettings {
     /// Path to the `kaspad` binary (the misakas node keeps upstream's binary name). `None` means
     /// look beside the Studio's executable and on PATH, same as the engine resolution.
     pub kaspad_path: Option<PathBuf>,
+    /// The node wRPC **Borsh** endpoint (`host:port`) the `misaka` CLI should talk to.
+    ///
+    /// Separate from `rpc_url` because they are different protocols on different ports: the
+    /// Studio watches the node over wRPC-JSON, and the CLI speaks Borsh. `None` lets the CLI
+    /// resolve it the way it always does — `~/.misaka/<network>/endpoints.json`, which a node
+    /// writes when it starts, then the network default. Set it when the node is somebody
+    /// else's, which is the case for a Studio that only joined a pool.
+    pub misaka_rpc: Option<String>,
+    /// Path to the `misaka` CLI. `None` looks beside the Studio's executable and on PATH.
+    ///
+    /// The Studio shells out to it for the moves that spend money — seeding a line's market is
+    /// the first — rather than carrying a second ML-DSA-87 signer. One signer means one thing
+    /// that can be wrong about an irreversible transaction, and it is the one the chain's own
+    /// tests cover.
+    pub misaka_cli_path: Option<PathBuf>,
     /// Attach to an already-running node's wRPC endpoint instead of launching one. Takes
     /// precedence over launching: two nodes sharing one appdir is a corrupted database.
     pub rpc_url: Option<String>,
@@ -277,6 +307,17 @@ pub struct NodeSettings {
     pub producer_class: Option<String>,
     /// The class artifact file, for a model class.
     pub class_artifact: Option<PathBuf>,
+    /// **Armed once**: the next producer start files ONE `ClassRegistered` for `class_artifact`
+    /// and this clears itself.
+    ///
+    /// The value is the model id (`Qwen/Qwen2.5-Coder-1.5B-Instruct`) and may be empty, which
+    /// lets the node infer it — needed only when a converted shape matches more than one class
+    /// this build knows, because sibling models convert to the same shape and the file alone
+    /// cannot say which one it is.
+    ///
+    /// Arm-once rather than a standing setting, because the flag submits a transaction: left on,
+    /// every restart would file another registration for a class the chain already holds.
+    pub register_class: Option<String>,
     /// The node's data directory. `None` uses the node's own default.
     pub appdir: Option<PathBuf>,
     /// Extra arguments appended verbatim to the node's command line.
@@ -326,6 +367,8 @@ impl Default for NodeSettings {
     fn default() -> Self {
         NodeSettings {
             kaspad_path: None,
+            misaka_cli_path: None,
+            misaka_rpc: None,
             rpc_url: None,
             network: NodeNetwork::default(),
             role: NetworkRole::default(),
@@ -335,6 +378,7 @@ impl Default for NodeSettings {
             fee_outpoint: None,
             producer_class: None,
             class_artifact: None,
+            register_class: None,
             appdir: None,
             extra_args: Vec::new(),
             // Off since testnet-11 Relaunch 5f (2026-09-03): the dense class's material (~750 MB per

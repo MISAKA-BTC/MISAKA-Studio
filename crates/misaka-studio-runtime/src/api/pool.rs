@@ -87,6 +87,17 @@ fn seed_path(state: &AppState, slot_id: &str) -> std::path::PathBuf {
     state.data_dir.join(format!("pool-{slot_id}.seed"))
 }
 
+/// The joined slot's key file, or `None` when no slot is joined.
+///
+/// This is the only key this app holds, and the only one it can sign a market move with. Handed
+/// out as a path rather than as bytes: the CLI opens it, checks its mode, and the seed never
+/// passes through this process again after the join wrote it.
+pub async fn slot_seed_path(state: &AppState) -> Option<std::path::PathBuf> {
+    let slot_id = state.settings.read().await.node.pool_slot_id.clone()?;
+    let path = seed_path(state, &slot_id);
+    path.is_file().then_some(path)
+}
+
 async fn pool_get(url: &str, token: Option<&str>) -> Result<serde_json::Value> {
     let mut request = http().get(url);
     if let Some(token) = token {
@@ -116,7 +127,6 @@ pub struct JoinedSlot {
     pub line_id: Option<String>,
     /// What the chain would let this address spend, from the pool's own settlement reading.
     pub spendable_sompi: Option<u64>,
-    pub already_seeded: bool,
 }
 
 pub async fn joined_slot(state: &AppState) -> Option<JoinedSlot> {
@@ -136,7 +146,6 @@ pub async fn joined_slot(state: &AppState) -> Option<JoinedSlot> {
             .and_then(|f| f.get("spendable_sompi"))
             .and_then(serde_json::Value::as_u64)
             .or_else(|| body.get("balance_sompi").and_then(serde_json::Value::as_u64)),
-        already_seeded: false,
     })
 }
 

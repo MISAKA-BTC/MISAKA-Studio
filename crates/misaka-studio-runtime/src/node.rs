@@ -61,6 +61,17 @@ pub fn default_json_rpc_port(network: NodeNetwork) -> u16 {
     }
 }
 
+/// Default wRPC-**Borsh** ports, from the node's `network.rs` (upstream Kaspa's + 10000). Borsh
+/// is keyed by network TYPE there, so testnet-11 and testnet-10 share one — the suffix moves the
+/// P2P port, not this one.
+pub fn default_borsh_rpc_port(network: NodeNetwork) -> u16 {
+    match network {
+        NodeNetwork::Testnet11 => 27210,
+        NodeNetwork::Devnet => 27610,
+        NodeNetwork::Simnet => 27510,
+    }
+}
+
 /// P2P entry nodes for testnet-11, from the join runbook — used only as `--addpeer` fallbacks
 /// when DNS is unavailable, which is exactly the situation the runbook names them for.
 pub const TESTNET11_FALLBACK_PEERS: &[&str] = &["169.58.232.113:26311", "169.58.232.114:26311", "169.58.39.220:26311"];
@@ -798,6 +809,31 @@ impl NodeManager {
             .unwrap_or_else(|| PathBuf::from(name))
     }
 
+    /// Where the `misaka` CLI is: the configured path, beside the Studio, or PATH.
+    ///
+    /// Resolved exactly as [`Self::resolve_kaspad`] resolves the node, because a packaged Studio
+    /// ships both binaries side by side and a person who built from source has neither on PATH.
+    /// Returning the bare name when nothing is found is deliberate: the spawn then fails with the
+    /// name in the error, which is the message that tells someone what to install.
+    pub fn resolve_misaka_cli(configured: Option<&PathBuf>) -> PathBuf {
+        let name = if cfg!(windows) { "misaka.exe" } else { "misaka" };
+        if let Some(path) = configured {
+            return path.clone();
+        }
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            let beside = dir.join(name);
+            if beside.is_file() {
+                return beside;
+            }
+        }
+        std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).map(|dir| dir.join(name)).find(|c| c.is_file()))
+            .unwrap_or(None)
+            .unwrap_or_else(|| PathBuf::from(name))
+    }
+
     /// The command line for a node in `settings`' network and role.
     ///
     /// Built as data first so the UI can show it verbatim: a person putting a bonded key on the
@@ -820,6 +856,13 @@ impl NodeManager {
         // node's JSON RPC has no authentication, so exposing it is an operator's deliberate act
         // via extra_args, not a default.
         args.push(format!("--rpclisten-json=127.0.0.1:{rpc_port}"));
+        // And Borsh, on the network's own default port. Loopback for the same reason as above —
+        // the node's RPC has no authentication. What this buys is that the `misaka` CLI works
+        // with no configuration for anyone running a node here: the node writes both endpoints
+        // into `~/.misaka/<network>/endpoints.json` at startup, and the CLI reads that file
+        // before it reaches for a default. Without it, a person who has a node running would
+        // still have to find and type a port to sign anything.
+        args.push(format!("--rpclisten-borsh=127.0.0.1:{}", default_borsh_rpc_port(settings.network)));
         args.push("--utxoindex".into());
         // One-shot class-table dump after sync: the only place the node reports per-class share
         // and budget, and the source of the class ids the UI shows.
@@ -863,10 +906,29 @@ impl NodeManager {
             if let Some(artifact) = &settings.class_artifact {
                 args.push(format!("--palw-class-artifact={}", artifact.display()));
             }
+            // The registration run. It needs the artifact, the bond, its key and a funded fee
+            // outpoint — all of which are the flags above, which is why this is a phase of a
+            // producer start and not a separate process: a second node on this appdir would
+            // corrupt the database, and the prerequisites are already assembled here.
+            if let Some(model_id) = &settings.register_class {
+                args.push(if model_id.is_empty() {
+                    "--palw-register-class".to_string()
+                } else {
+                    format!("--palw-register-class={model_id}")
+                });
+            }
         }
 
         args.extend(settings.extra_args.iter().cloned());
         Ok(args)
+    }
+
+    /// Whether these settings would make the next start file a class registration.
+    ///
+    /// The caller disarms it afterwards. It lives here so the arming rule is stated beside the
+    /// flag it controls rather than inferred at the call site.
+    pub fn start_would_register_class(settings: &NodeSettings) -> bool {
+        settings.role == NetworkRole::Producer && settings.register_class.is_some()
     }
 
     /// Launch a supervised node. Refuses when one is already running — two nodes sharing an

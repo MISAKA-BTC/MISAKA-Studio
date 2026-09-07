@@ -26,6 +26,9 @@ import type {
   RuntimeStatus,
   Settings,
   SystemInfo,
+  SeedReadiness,
+  SeedOutcome,
+  RegistrationReadiness,
 } from './types'
 
 /**
@@ -117,6 +120,21 @@ export const api = {
   poolFaucet: () => request<Record<string, unknown>>('/api/v1/network/pool/faucet', { method: 'POST' }),
   faucetFor: (address: string) => request<Record<string, unknown>>('/api/v1/network/faucet', { method: 'POST', body: JSON.stringify({ address }) }),
   producerKey: () => request<{ producer_key_path: string; next: string }>('/api/v1/network/producer-key', { method: 'POST' }),
+
+  // ADR-0087/0090 — adding a model, and opening its market. Two separate acts on the chain, so
+  // two separate calls here.
+  classRegistration: () => request<RegistrationReadiness>('/api/v1/network/model-market/registration'),
+  registerClass: (modelId?: string | null) =>
+    request<RegistrationReadiness>('/api/v1/network/model-market/register-class', {
+      method: 'POST',
+      body: JSON.stringify({ model_id: modelId ?? null }),
+    }),
+  seedReadiness: () => request<SeedReadiness>('/api/v1/network/model-market/seed-readiness'),
+  seedMarket: (lineId: string, msk: string, confirm: boolean) =>
+    request<SeedOutcome>('/api/v1/network/model-market/seed', {
+      method: 'POST',
+      body: JSON.stringify({ line_id: lineId, msk, confirm }),
+    }),
   promptMining: () => request<PromptMiningStatus>('/api/v1/network/prompt-mining'),
   promptMiningRun: (prompt: string, maxTokens?: number) =>
     request<PromptMiningRun>('/api/v1/network/prompt-mining/run', {

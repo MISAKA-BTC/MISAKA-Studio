@@ -179,6 +179,15 @@ async fn start_node(State(state): State<Arc<AppState>>, body: Option<Json<StartB
     if node_settings.class_artifact.is_none() {
         node_settings.class_artifact = default_class_artifact(&settings.models_dir).await;
     }
+    // **Disarm before the node can succeed at it, not after.** A class registration is one
+    // transaction; the flag that files it must not survive into a second start. Written back
+    // ahead of the launch because a start that half-fails still ran the node, and a flag cleared
+    // only on the success path is a flag that files a second registration after a crash.
+    if crate::node::NodeManager::start_would_register_class(&node_settings) {
+        let mut next = settings.clone();
+        next.node.register_class = None;
+        state.apply_settings(next).await?;
+    }
     Ok(Json(state.node.start(&node_settings).await?))
 }
 
