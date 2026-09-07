@@ -12,7 +12,7 @@
 //! whether the engine instance is replaced.
 
 use misaka_studio_core::settings::{BackendKind, BackendSettings, Settings};
-use misaka_studio_runtime::{backend::gateway, AppState};
+use misaka_studio_runtime::{AppState, backend::gateway};
 use std::sync::Arc;
 
 async fn studio(url: &str, token: &str) -> (Arc<AppState>, tempfile::TempDir) {

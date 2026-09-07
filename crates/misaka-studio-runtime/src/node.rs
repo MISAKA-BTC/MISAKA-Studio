@@ -182,9 +182,7 @@ pub async fn query_status(url: &str) -> NodeStatus {
     // The sink's own header, for its timestamp and lane. A second call because getBlockDagInfo
     // names the sink and says nothing else about it.
     if let Some(sink) = status.sink.clone() {
-        if let Ok(answer) =
-            wrpc_call(url, "getBlock", json!({ "hash": sink, "includeTransactions": false }), timeout).await
-        {
+        if let Ok(answer) = wrpc_call(url, "getBlock", json!({ "hash": sink, "includeTransactions": false }), timeout).await {
             let header = answer.get("block").unwrap_or(&answer).get("header").cloned().unwrap_or(Value::Null);
             status.sink_timestamp_ms = header.get("timestamp").and_then(Value::as_u64);
             status.sink_algo_id = header.get("powAlgoId").and_then(Value::as_u64).map(|id| id as u8);
@@ -664,10 +662,7 @@ impl NodeLogState {
         }
         let record = ProducedBlockRecord {
             hash,
-            seen_at_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
+            seen_at_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0),
         };
         self.produced.push(record.clone());
         // Best effort: a miner's record of its own work must never be able to stop the miner, so a
@@ -676,11 +671,7 @@ impl NodeLogState {
             && let Ok(line) = serde_json::to_string(&record)
         {
             use std::io::Write;
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .and_then(|mut f| writeln!(f, "{line}"));
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| writeln!(f, "{line}"));
         }
     }
 }
@@ -757,8 +748,7 @@ impl NodeManager {
                     view.daa_score = header.get("daaScore").and_then(Value::as_u64);
                     view.algo_id = header.get("powAlgoId").and_then(Value::as_u64).map(|id| id as u8);
                     view.timestamp_ms = header.get("timestamp").and_then(Value::as_u64);
-                    view.is_chain_block =
-                        block.get("verboseData").and_then(|v| v.get("isChainBlock")).and_then(Value::as_bool);
+                    view.is_chain_block = block.get("verboseData").and_then(|v| v.get("isChainBlock")).and_then(Value::as_bool);
                     // What THIS block paid to THIS producer. Usually nothing: an attempt block's
                     // own reward is escrowed until its claim is Final, and the coinbase outputs a
                     // block does carry are other producers' matured claims riding in it.
@@ -772,9 +762,7 @@ impl NodeManager {
                             .map(|outs| {
                                 outs.iter()
                                     .filter(|o| {
-                                        o.get("verboseData")
-                                            .and_then(|v| v.get("scriptPublicKeyAddress"))
-                                            .and_then(Value::as_str)
+                                        o.get("verboseData").and_then(|v| v.get("scriptPublicKeyAddress")).and_then(Value::as_str)
                                             == Some(address.as_str())
                                     })
                                     .filter_map(|o| o.get("amount").and_then(Value::as_u64))

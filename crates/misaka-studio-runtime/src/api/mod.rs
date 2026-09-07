@@ -27,9 +27,10 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 pub mod management;
+pub mod mining_queue;
+pub mod model_market;
 pub mod network;
 pub mod openai;
-pub mod mining_queue;
 pub mod pool;
 pub mod prompt_mining;
 pub mod ui;
@@ -50,9 +51,7 @@ pub fn router(state: Arc<AppState>, ui_dir: Option<PathBuf>, cors_origins: Vec<S
     // a UI bundle at all.
     match ui_dir {
         Some(dir) => api.fallback(get(move |req: Request| serve_ui(dir.clone(), req))),
-        None if !ui::embedded_is_empty() => {
-            api.fallback(get(|req: Request| async move { ui::serve(req.uri().path()) }))
-        }
+        None if !ui::embedded_is_empty() => api.fallback(get(|req: Request| async move { ui::serve(req.uri().path()) })),
         None => api.fallback(get(no_ui)),
     }
 }

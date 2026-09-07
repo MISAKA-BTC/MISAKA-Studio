@@ -105,6 +105,41 @@ async fn pool_get(url: &str, token: Option<&str>) -> Result<serde_json::Value> {
 
 /// What the Network tab renders: not joined (with the default URL to offer), or the slot's
 /// live status as the pool tells it.
+/// The joined slot's facts that another module needs, or `None` when no slot is joined.
+///
+/// Read through the same `pool_get` the status route uses, so the market page and the slot card
+/// cannot disagree about what the address can spend — the number a seed is checked against must be
+/// the number the person is looking at.
+pub struct JoinedSlot {
+    pub address: String,
+    /// The line a seed would open. A class's founding line is keyed by the class id.
+    pub line_id: Option<String>,
+    /// What the chain would let this address spend, from the pool's own settlement reading.
+    pub spendable_sompi: Option<u64>,
+    pub already_seeded: bool,
+}
+
+pub async fn joined_slot(state: &AppState) -> Option<JoinedSlot> {
+    let node = state.settings.read().await.node.clone();
+    let (url, slot_id, token) = (node.pool_url?, node.pool_slot_id?, node.pool_slot_token?);
+    let body = pool_get(&format!("{url}/v1/slots/{slot_id}"), Some(&token)).await.ok()?;
+    let address = body.get("address").and_then(|v| v.as_str())?.to_string();
+    let funds = body.get("funds").and_then(|v| v.as_object());
+    // The line id lives on the fp status, not the slot's — a slot without the free-prompt lane has
+    // no line to seed, and reporting `None` for it is the honest answer rather than a guess at the
+    // class from a display name.
+    let fp = pool_get(&format!("{url}/v1/slots/{slot_id}/fp"), Some(&token)).await.ok();
+    Some(JoinedSlot {
+        address,
+        line_id: fp.as_ref().and_then(|f| f.get("line_id")).and_then(|v| v.as_str()).map(str::to_string),
+        spendable_sompi: funds
+            .and_then(|f| f.get("spendable_sompi"))
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| body.get("balance_sompi").and_then(serde_json::Value::as_u64)),
+        already_seeded: false,
+    })
+}
+
 async fn status(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>> {
     let node = state.settings.read().await.node.clone();
     let (Some(url), Some(slot_id), Some(token)) = (&node.pool_url, &node.pool_slot_id, &node.pool_slot_token) else {

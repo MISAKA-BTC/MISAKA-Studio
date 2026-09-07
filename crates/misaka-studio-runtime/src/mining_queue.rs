@@ -446,14 +446,24 @@ async fn run_job(job: &MiningJob, url: &str, token: Option<&str>) -> std::result
                 .unwrap_or_else(|| text.trim().chars().take(400).collect());
             // The worker's refusal for an ask that does not fit the class carries the numbers that
             // make the retry exact; one retry with those numbers, then it is the lane's answer.
-            if pass == 0 && let Some(room) = crate::backend::gateway::ceiling_from_refusal(&message) {
+            if pass == 0
+                && let Some(room) = crate::backend::gateway::ceiling_from_refusal(&message)
+            {
                 ceiling = room.min(ANSWER_TOKENS).max(1);
                 continue;
             }
-            let transient = status.is_server_error() || status.as_u16() == 429 || message.contains("Connection refused") || message.contains("could not be asked");
-            return Err(if transient { Outcome::Transient(format!("{status}: {message}")) } else { Outcome::Refused(format!("{status}: {message}")) });
+            let transient = status.is_server_error()
+                || status.as_u16() == 429
+                || message.contains("Connection refused")
+                || message.contains("could not be asked");
+            return Err(if transient {
+                Outcome::Transient(format!("{status}: {message}"))
+            } else {
+                Outcome::Refused(format!("{status}: {message}"))
+            });
         }
-        let body: serde_json::Value = serde_json::from_str(&text).map_err(|e| Outcome::Transient(format!("the gateway's answer was not JSON: {e}")))?;
+        let body: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| Outcome::Transient(format!("the gateway's answer was not JSON: {e}")))?;
         let answer = body
             .get("choices")
             .and_then(|c| c.get(0))
@@ -489,7 +499,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("mining-queue.json");
         let queue = MiningQueue::open(path.clone()).await;
-        let job = queue.enqueue("hello".into(), Some("be brief".into()), Some("c1".into()), Some("m1".into()), "http://gw".into()).await;
+        let job =
+            queue.enqueue("hello".into(), Some("be brief".into()), Some("c1".into()), Some("m1".into()), "http://gw".into()).await;
         assert_eq!(job.messages.len(), 2, "system prompt and the one user turn — never the history");
         queue.update(&job.id, |j| j.status = JobStatus::Running).await;
 
@@ -557,7 +568,12 @@ mod tests {
         let queue = MiningQueue::open(dir.path().join("q.json")).await;
         let a = queue.enqueue("a".into(), None, None, None, "http://gw".into()).await;
         let b = queue.enqueue("b".into(), None, None, None, "http://gw".into()).await;
-        queue.update(&a.id, |j| { j.status = JobStatus::Refused; j.error = Some("bond full".into()); }).await;
+        queue
+            .update(&a.id, |j| {
+                j.status = JobStatus::Refused;
+                j.error = Some("bond full".into());
+            })
+            .await;
         queue.update(&b.id, |j| j.status = JobStatus::Running).await;
 
         assert!(queue.retry(&a.id).await);

@@ -42,7 +42,9 @@ async fn view(state: &AppState) -> MiningQueueView {
     let settings = state.settings.read().await.clone();
     let gateway_url = settings.node.palw_gateway_url.clone();
     let (background_available, background_blocker) = match (&gateway_url, state.local_engine_for_loaded_model().await) {
-        (None, _) => (false, Some("no pool slot with a prompt-mining gateway is configured — join one from the Network tab".to_string())),
+        (None, _) => {
+            (false, Some("no pool slot with a prompt-mining gateway is configured — join one from the Network tab".to_string()))
+        }
         (Some(_), Err(why)) => (false, Some(why)),
         (Some(_), Ok(())) => (true, None),
     };
@@ -79,10 +81,8 @@ async fn enqueue(State(state): State<Arc<AppState>>, Json(body): Json<EnqueueBod
         return Err(Error::bad_request("no prompt-mining gateway is configured — join a pool slot for prompt mining first"));
     };
     let system = settings.generation.system_prompt.trim().to_string();
-    let job = state
-        .mining
-        .enqueue(prompt, (!system.is_empty()).then_some(system), body.conversation_id, body.message_id, gateway_url)
-        .await;
+    let job =
+        state.mining.enqueue(prompt, (!system.is_empty()).then_some(system), body.conversation_id, body.message_id, gateway_url).await;
     Ok(Json(job))
 }
 

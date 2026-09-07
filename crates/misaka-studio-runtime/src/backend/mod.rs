@@ -356,4 +356,3 @@ mod context_fit_tests {
         assert!(prompt_tokens_upper_bound(&kept) > 416, "it genuinely does not fit");
     }
 }
-
