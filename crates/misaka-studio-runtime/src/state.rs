@@ -493,10 +493,27 @@ impl AppState {
         };
 
         let request = GenerationRequest { model: state.model.id.clone(), messages, prompt, params, stop };
+        // Kept for the context retry below, which has to rebuild the request after `request` moves.
+        let (retry_model, retry_messages, retry_params, retry_stop) =
+            (request.model.clone(), request.messages.clone(), request.params, request.stop.clone());
+        let request_messages_len = if request.prompt.is_some() { 0 } else { request.messages.len() };
 
         self.metrics.generation_started();
-        let inner = match backend.generate(request).await {
+        let inner = match backend.generate(request.clone()).await {
             Ok(stream) => stream,
+            // **A conversation that outgrew the model is not a dead end.**
+            //
+            // A class artifact's context is fixed — `qwen25-1.5b-a16`'s rotary table covers 512
+            // positions and that number is inside the root the chain registered — so the app
+            // cannot raise it. But the app is what filled it: every turn re-sent the whole
+            // conversation, and the refusal a person saw was the engine's own string with no
+            // answer behind it ("the prompt is 524 tokens and this artifact's rotary table
+            // covers 512") after typing two characters.
+            //
+            // The refusal names the limit, so the request that fits is arithmetic. Drop the oldest
+            // turns, keep the system prompt and the question, and ask once more. A chat that has
+            // simply run long then keeps working instead of stopping; a single message that is
+            // itself too long still fails, and now says which of the two it was.
             Err(e) => {
                 // The counter must come back down on the failure path too, or "1 generation
                 // active" sticks forever after one bad request.
@@ -505,18 +522,60 @@ impl AppState {
             }
         };
 
+        // **The refusal arrives in the stream, not from the call.** The engine answers 200 and
+        // puts "the prompt is 557 tokens and this artifact's rotary table covers 512" in the first
+        // event, so a retry that only watches `generate`'s return value never fires. Nothing has
+        // reached the user at this point, which is what makes taking one item and deciding safe.
+        let mut inner = inner;
+        let first = inner.next().await;
+        let (mut inner, first) = match &first {
+            Some(Err(e)) => match crate::backend::context_limit_from_refusal(&e.to_string()) {
+                Some(limit) if request_messages_len > 1 => {
+                    const ANSWER_ROOM_TOKENS: u64 = 96;
+                    let budget = limit.saturating_sub(ANSWER_ROOM_TOKENS);
+                    let (fitted, dropped) = crate::backend::fit_messages_to_budget(&retry_messages, budget);
+                    if dropped == 0 {
+                        (inner, first)
+                    } else {
+                        tracing::info!(
+                            "context {limit}: dropped {dropped} older message(s) and retried — a class's context is its artifact's"
+                        );
+                        let retry = GenerationRequest {
+                            model: retry_model.clone(),
+                            messages: fitted,
+                            prompt: None,
+                            params: retry_params,
+                            stop: retry_stop.clone(),
+                        };
+                        match backend.generate(retry).await {
+                            Ok(mut s2) => {
+                                let f2 = s2.next().await;
+                                (s2, f2)
+                            }
+                            Err(_) => (inner, first),
+                        }
+                    }
+                }
+                _ => (inner, first),
+            },
+            _ => (inner, first),
+        };
+
         let app = self.clone();
         let started = Instant::now();
         let started_at_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
 
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         tokio::spawn(async move {
-            let mut inner = inner;
+            let mut pending_first = first;
             let mut text = String::new();
             let mut first_token: Option<Duration> = None;
             let mut usage = Usage::default();
 
-            while let Some(event) = inner.next().await {
+            while let Some(event) = match pending_first.take() {
+                Some(e) => Some(e),
+                None => inner.next().await,
+            } {
                 match &event {
                     Ok(StreamEvent::Delta(delta)) => {
                         if first_token.is_none() {

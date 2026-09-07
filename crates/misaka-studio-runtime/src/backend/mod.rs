@@ -194,6 +194,82 @@ pub fn render_fallback_prompt(messages: &[ChatMessage]) -> String {
 ///
 /// Deliberately crude — ~4 characters per token — and never used to bill anything or to size a
 /// context window. Its one job is keeping a tokens/sec readout from being blank.
+/// **A conversation trimmed to what the model can actually hold.**
+///
+/// A class artifact's context is not a setting: `qwen25-1.5b-a16`'s rotary table covers 512
+/// positions, that number is part of the root the chain registered, and no app can raise it. What
+/// an app CAN do is stop spending it on history the answer does not need — which is what was
+/// happening: every turn re-sent the whole conversation, so a two-character question arrived as
+/// 524 tokens and was refused outright, with nothing generated and nothing to act on.
+///
+/// Keeps the system prompt (it is an instruction, not history — dropping it changes the answer's
+/// language) and the newest turns, and drops from the oldest until the estimate fits. Returns the
+/// kept messages and how many were dropped, so the caller can say so rather than quietly forgetting
+/// what the user typed.
+///
+/// `budget` is the whole context minus whatever room the answer needs; the caller owns that split.
+/// The estimate is [`prompt_tokens_upper_bound`]'s, deliberately high — over-counting drops one
+/// turn too many, under-counting loses the request.
+pub fn fit_messages_to_budget(messages: &[ChatMessage], budget: u64) -> (Vec<ChatMessage>, usize) {
+    if prompt_tokens_upper_bound(messages) <= budget {
+        return (messages.to_vec(), 0);
+    }
+    let (system, rest): (Vec<_>, Vec<_>) = messages.iter().cloned().partition(|m| m.role == "system");
+    // The newest turn is the question; it is never dropped. If it alone does not fit, the caller
+    // gets it back and the error it deserves — a message that says the prompt itself is too long,
+    // not one that says the history was.
+    let mut kept: Vec<ChatMessage> = Vec::new();
+    for m in rest.iter().rev() {
+        let mut candidate = system.clone();
+        candidate.extend(kept.iter().rev().cloned());
+        candidate.push(m.clone());
+        let mut ordered = candidate.clone();
+        ordered.sort_by_key(|x| if x.role == "system" { 0 } else { 1 });
+        if !kept.is_empty() && prompt_tokens_upper_bound(&ordered) > budget {
+            break;
+        }
+        kept.push(m.clone());
+    }
+    kept.reverse();
+    let dropped = rest.len() - kept.len();
+    let mut out = system;
+    out.extend(kept);
+    (out, dropped)
+}
+
+/// **The context an engine's own refusal names.**
+///
+/// Engines say the same thing two ways. The free-prompt worker counts the whole request —
+/// "prompt 51 + decode ceiling 476 exceeds max_context_tokens 512" — and the artifact runtime
+/// counts only the prompt: "the prompt is 524 tokens and this artifact's rotary table covers 512".
+/// The second shape had no reader, so a conversation that outgrew the class produced a raw engine
+/// string, no answer, and no way for the app to act. Both give the number that matters.
+pub fn context_limit_from_refusal(message: &str) -> Option<u64> {
+    let after = |needle: &str| -> Option<u64> {
+        let rest = message.split(needle).nth(1)?;
+        let digits: String = rest.trim_start().chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    };
+    after("max_context_tokens ").or_else(|| after("rotary table covers "))
+}
+
+/// The token cost of a whole conversation, over-estimated on purpose.
+///
+/// One token per non-ASCII character (CJK sits at roughly one, sometimes more), a quarter of the
+/// ASCII, plus the chat template's markers per message. The tokenizer that would answer exactly
+/// lives with the engine, so this is the number an app can compute before it asks.
+pub fn prompt_tokens_upper_bound(messages: &[ChatMessage]) -> u64 {
+    const PER_MESSAGE_MARKERS: u64 = 8;
+    messages
+        .iter()
+        .map(|m| {
+            let ascii = m.content.chars().filter(char::is_ascii).count() as u64;
+            let other = m.content.chars().count() as u64 - ascii;
+            ascii.div_ceil(4) + other + PER_MESSAGE_MARKERS
+        })
+        .sum()
+}
+
 pub fn approximate_tokens(text: &str) -> u64 {
     (text.chars().count() as u64).div_ceil(4)
 }
@@ -216,3 +292,68 @@ mod tests {
         assert_eq!(approximate_tokens("12345678"), 2);
     }
 }
+
+#[cfg(test)]
+mod context_fit_tests {
+    use super::*;
+
+    fn msg(role: &str, content: &str) -> ChatMessage {
+        ChatMessage { role: role.into(), content: content.into() }
+    }
+
+    /// Both engines say it, and both had to be readable — the second shape is the one a person
+    /// actually hit, and it had no reader at all.
+    #[test]
+    fn either_refusal_names_the_context() {
+        assert_eq!(
+            context_limit_from_refusal("the worker refused the job: prompt 51 + decode ceiling 476 exceeds max_context_tokens 512"),
+            Some(512)
+        );
+        assert_eq!(
+            context_limit_from_refusal("misaka: the prompt is 524 tokens and this artifact's rotary table covers 512"),
+            Some(512)
+        );
+        assert_eq!(context_limit_from_refusal("connection refused"), None, "an unrelated failure must not look like a context limit");
+    }
+
+    /// The system prompt is an instruction, not history. Dropping it to make room changes the
+    /// answer's language, which is exactly the setting a user just went and set.
+    #[test]
+    fn the_system_prompt_and_the_question_survive_the_trim() {
+        let long = "あ".repeat(300);
+        let messages = vec![
+            msg("system", "日本語で答えてください。"),
+            msg("user", &long),
+            msg("assistant", &long),
+            msg("user", "Cでhelloworldのコードは"),
+        ];
+        let (kept, dropped) = fit_messages_to_budget(&messages, 416);
+        assert!(dropped > 0, "a conversation past the budget must lose something");
+        assert_eq!(kept.first().map(|m| m.role.as_str()), Some("system"), "the instruction stays first");
+        assert_eq!(kept.last().map(|m| m.content.as_str()), Some("Cでhelloworldのコードは"), "the question is never dropped");
+        assert!(prompt_tokens_upper_bound(&kept) <= 416, "and what is kept must actually fit");
+    }
+
+    /// A conversation that already fits is returned untouched — trimming that is not needed is
+    /// silent context loss.
+    #[test]
+    fn a_conversation_that_fits_is_left_alone() {
+        let messages = vec![msg("system", "hi"), msg("user", "Cで")];
+        let (kept, dropped) = fit_messages_to_budget(&messages, 416);
+        assert_eq!(dropped, 0);
+        assert_eq!(kept.len(), 2);
+    }
+
+    /// One message too long for the class cannot be fixed by dropping history — there is none.
+    /// The caller distinguishes the two cases by `dropped == 0`, so this must not silently
+    /// return something that fits.
+    #[test]
+    fn a_single_oversized_message_drops_nothing_and_says_so() {
+        let messages = vec![msg("user", &"あ".repeat(900))];
+        let (kept, dropped) = fit_messages_to_budget(&messages, 416);
+        assert_eq!(dropped, 0, "there was no history to drop");
+        assert_eq!(kept.len(), 1, "and the question is still handed back");
+        assert!(prompt_tokens_upper_bound(&kept) > 416, "it genuinely does not fit");
+    }
+}
+
