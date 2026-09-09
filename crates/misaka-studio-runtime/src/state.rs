@@ -9,7 +9,9 @@ use crate::backend::llamacpp::{LlamaCppBackend, accelerator_tag};
 use crate::backend::misaka::MisakaBackend;
 use crate::backend::mlx::MlxBackend;
 use crate::backend::mock::MockBackend;
-use crate::backend::{ChatMessage, GenerationRequest, LoadRequest, LoadedModel, SharedBackend, StreamEvent, Usage};
+use crate::backend::{
+    ChatMessage, GenerationRequest, LegLimits, LoadRequest, LoadedModel, SharedBackend, StreamEvent, Usage, merge_misaka,
+};
 use crate::catalog::Catalog;
 use crate::download::DownloadManager;
 use crate::metrics::MetricsHub;
@@ -25,8 +27,9 @@ use misaka_studio_core::provenance::{
     InferenceInputs, InferenceRecord, ModelIdentity, RuntimeIdentity, SamplingCommitment, canonical_prompt_bytes,
     canonical_raw_prompt_bytes,
 };
-use misaka_studio_core::settings::{BackendKind, GpuLayers, Settings};
+use misaka_studio_core::settings::{BackendKind, GpuLayers, SamplingPolicy, Settings};
 use serde::Serialize;
+use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -73,6 +76,8 @@ pub struct AppState {
     catalog: RwLock<Arc<Catalog>>,
     backend: RwLock<SharedBackend>,
     loaded: RwLock<Option<LoadedState>>,
+    /// The chat history, one file per conversation (ADR-0096 Decision 12).
+    pub conversations: Arc<crate::conversations::ConversationStore>,
 }
 
 impl AppState {
@@ -97,6 +102,7 @@ impl AppState {
 
         let node = Arc::new(crate::node::NodeManager::with_journal(Some(data_dir.join("produced-blocks.jsonl"))));
         let mining = crate::mining_queue::MiningQueue::open(data_dir.join("mining-queue.json")).await;
+        let conversations = crate::conversations::ConversationStore::new(data_dir.join("conversations"));
         let app = Arc::new(AppState {
             settings: RwLock::new(settings),
             settings_path,
@@ -111,6 +117,7 @@ impl AppState {
             catalog: RwLock::new(catalog),
             backend: RwLock::new(backend),
             loaded: RwLock::new(None),
+            conversations,
         });
         // The queue's worker lives as long as the app: prompts queued in an earlier run are still
         // owed a claim, and the person may have closed the window on them on purpose.
@@ -465,12 +472,8 @@ impl AppState {
         }
     }
 
-    /// Generate, with metrics and provenance attached.
-    ///
-    /// The returned stream is the backend's, wrapped: text is accumulated as it passes so the
-    /// completion can be committed to, and the record is written when the stream ends. Wrapping
-    /// rather than buffering matters — the user sees tokens as they arrive, and the record still
-    /// covers the whole answer.
+    /// Generate, with metrics and provenance attached — the plain form: messages or a prompt,
+    /// the sampling, the stop strings, and nothing of the tool, format or notice surface.
     pub async fn generate(
         self: &Arc<Self>,
         messages: Vec<ChatMessage>,
@@ -478,8 +481,54 @@ impl AppState {
         params: SamplingCommitment,
         stop: Vec<String>,
     ) -> Result<BoxStream<'static, Result<StreamEvent>>> {
+        self.generate_with(GenerateInputs { messages, prompt, params, stop, ..GenerateInputs::default() }).await
+    }
+
+    /// Generate, with metrics and provenance attached.
+    ///
+    /// The returned stream is the backend's, wrapped: text is accumulated as it passes so the
+    /// completion can be committed to, and the record is written when the stream ends. Wrapping
+    /// rather than buffering matters — the user sees tokens as they arrive, and the record still
+    /// covers the whole answer.
+    ///
+    /// Two refusals happen here, BEFORE the engine is asked, because both are about what this
+    /// engine can honour rather than about the request's shape (ADR-0096 Decisions 3 and 4): a
+    /// request that requires the committed format on an engine that commits nothing, and — under
+    /// `node.sampling_policy: refuse` — a non-greedy request bound for the lane. Under the default
+    /// policy the lane request goes through and the answer's `misaka.sampling` says what was
+    /// dropped; `finalize_misaka` is where that notice and the gateway's own report become one.
+    pub async fn generate_with(self: &Arc<Self>, inputs: GenerateInputs) -> Result<BoxStream<'static, Result<StreamEvent>>> {
+        let GenerateInputs { messages, prompt, params, stop, tools, tool_choice, response_format, misaka, mut notices } = inputs;
         let state = self.loaded().await.ok_or(Error::NoModelLoaded)?;
         let backend = self.backend().await;
+        let (policy, network, legs) = {
+            let settings = self.settings.read().await;
+            (
+                settings.node.sampling_policy,
+                settings.node.network.id(),
+                LegLimits {
+                    summarize_after_turns: settings.node.summarize_after_turns,
+                    continue_max_legs: settings.node.continue_max_legs,
+                },
+            )
+        };
+        let lane = backend.name() == crate::backend::gateway::NAME;
+        if crate::backend::gateway::requires_committed_format(misaka.as_ref()) && !lane {
+            return Err(Error::BadRequest {
+                message: format!(
+                    "misaka.require_committed_format: the `{}` engine commits nothing — an answer whose shape is committed \
+                     needs the gateway backend, on a network that armed palw_fp_decode_constraint (ADR-0096 Decision 3). \
+                     Drop require_committed_format to have this engine enforce the format on its own, uncommitted.",
+                    backend.name()
+                ),
+            });
+        }
+        if lane {
+            let notice = lane_sampling_gate(policy, &params, network)?;
+            let mut sampling = notices.remove("sampling").unwrap_or_else(|| Value::Object(Default::default()));
+            merge_misaka(&mut sampling, &notice);
+            notices.insert("sampling".into(), sampling);
+        }
 
         // The bytes the record commits to. Canonical and length-prefixed — see
         // `canonical_prompt_bytes`, which exists because the obvious `role: content` flattening
@@ -492,14 +541,24 @@ impl AppState {
             }
         };
 
-        let request = GenerationRequest { model: state.model.id.clone(), messages, prompt, params, stop };
+        let request = GenerationRequest {
+            model: state.model.id.clone(),
+            messages,
+            prompt,
+            params,
+            stop,
+            tools,
+            tool_choice,
+            response_format,
+            misaka,
+            legs,
+        };
         // Kept for the context retry below, which has to rebuild the request after `request` moves.
-        let (retry_model, retry_messages, retry_params, retry_stop) =
-            (request.model.clone(), request.messages.clone(), request.params, request.stop.clone());
+        let retry_template = request.clone();
         let request_messages_len = if request.prompt.is_some() { 0 } else { request.messages.len() };
 
         self.metrics.generation_started();
-        let inner = match backend.generate(request.clone()).await {
+        let inner = match backend.generate(request).await {
             Ok(stream) => stream,
             // **A conversation that outgrew the model is not a dead end.**
             //
@@ -533,20 +592,14 @@ impl AppState {
                 Some(limit) if request_messages_len > 1 => {
                     const ANSWER_ROOM_TOKENS: u64 = 96;
                     let budget = limit.saturating_sub(ANSWER_ROOM_TOKENS);
-                    let (fitted, dropped) = crate::backend::fit_messages_to_budget(&retry_messages, budget);
+                    let (fitted, dropped) = crate::backend::fit_messages_to_budget(&retry_template.messages, budget);
                     if dropped == 0 {
                         (inner, first)
                     } else {
                         tracing::info!(
                             "context {limit}: dropped {dropped} older message(s) and retried — a class's context is its artifact's"
                         );
-                        let retry = GenerationRequest {
-                            model: retry_model.clone(),
-                            messages: fitted,
-                            prompt: None,
-                            params: retry_params,
-                            stop: retry_stop.clone(),
-                        };
+                        let retry = GenerationRequest { messages: fitted, prompt: None, ..retry_template.clone() };
                         match backend.generate(retry).await {
                             Ok(mut s2) => {
                                 let f2 = s2.next().await;
@@ -571,21 +624,30 @@ impl AppState {
             let mut text = String::new();
             let mut first_token: Option<Duration> = None;
             let mut usage = Usage::default();
+            let mut misaka: Option<Value> = None;
 
             while let Some(event) = match pending_first.take() {
                 Some(e) => Some(e),
                 None => inner.next().await,
             } {
-                match &event {
+                let event = match event {
                     Ok(StreamEvent::Delta(delta)) => {
                         if first_token.is_none() {
                             first_token = Some(started.elapsed());
                         }
-                        text.push_str(delta);
+                        text.push_str(&delta);
+                        Ok(StreamEvent::Delta(delta))
                     }
-                    Ok(StreamEvent::Done { usage: u, .. }) => usage = *u,
-                    Err(_) => {}
-                }
+                    // The one place the app's notices and the engine's report meet: the client
+                    // and the record both read the merged object, so neither can see a `sampling`
+                    // the other did not.
+                    Ok(StreamEvent::Done { usage: u, finish_reason, misaka: from_engine }) => {
+                        usage = u;
+                        misaka = finalize_misaka(&notices, from_engine);
+                        Ok(StreamEvent::Done { usage: u, finish_reason, misaka: misaka.clone() })
+                    }
+                    other => other,
+                };
                 if tx.send(event).await.is_err() {
                     break; // client hung up
                 }
@@ -595,7 +657,7 @@ impl AppState {
             let ttft = first_token.map(|d| d.as_millis() as u64);
             let tps = if duration_ms > 0 { usage.completion_tokens as f64 * 1000.0 / duration_ms as f64 } else { 0.0 };
             app.metrics.generation_finished(usage.completion_tokens, tps, ttft.unwrap_or(0));
-            app.record(&state, &prompt_bytes, &text, usage, started_at_unix_ms, duration_ms, ttft, params).await;
+            app.record(&state, &prompt_bytes, &text, usage, started_at_unix_ms, duration_ms, ttft, params, misaka).await;
         });
 
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
@@ -612,6 +674,7 @@ impl AppState {
         duration_ms: u64,
         time_to_first_token_ms: Option<u64>,
         params: SamplingCommitment,
+        misaka: Option<Value>,
     ) {
         let records = self.records.read().await.clone();
         if !records.is_enabled() {
@@ -645,9 +708,55 @@ impl AppState {
                 prompt: keep_transcripts.then(|| String::from_utf8_lossy(prompt).into_owned()),
                 completion: keep_transcripts.then(|| completion.to_string()),
                 model_id: Some(state.model.id.clone()),
+                misaka,
             })
             .await;
     }
+}
+
+/// Everything one `/v1` request hands to [`AppState::generate_with`].
+///
+/// `notices` is the Studio's own half of the answer's `misaka` object — `ignored_fields`, the
+/// identity-valued knobs the parser accepted — which the generate path extends with its
+/// `sampling` notice and merges under the engine's report ([`finalize_misaka`]).
+#[derive(Clone, Debug, Default)]
+pub struct GenerateInputs {
+    pub messages: Vec<ChatMessage>,
+    pub prompt: Option<String>,
+    pub params: SamplingCommitment,
+    pub stop: Vec<String>,
+    pub tools: Option<Value>,
+    pub tool_choice: Option<Value>,
+    pub response_format: Option<Value>,
+    /// The request's `misaka` extension object, for the gateway backend.
+    pub misaka: Option<Value>,
+    pub notices: serde_json::Map<String, Value>,
+}
+
+/// **Decision 4 at the entrance.** For a request bound for the lane: the `misaka.sampling` notice
+/// under `greedy_with_notice`, or the refusal under `refuse` when any knob asks for something the
+/// lane will not run. A greedy request under `refuse` is not refused — it asks for exactly what
+/// runs — and still carries the notice, because every answer that went to the lane says so.
+pub fn lane_sampling_gate(policy: SamplingPolicy, params: &SamplingCommitment, network: &str) -> Result<Value> {
+    let divergence = crate::backend::gateway::sampling_divergence(params);
+    if policy == SamplingPolicy::Refuse && !divergence.is_empty() {
+        return Err(Error::BadRequest { message: crate::backend::gateway::sampling_refusal(&divergence, network) });
+    }
+    Ok(crate::backend::gateway::sampling_notice(params, network))
+}
+
+/// The answer's `misaka` object: the Studio's notices under the engine's report (the engine's
+/// keys win, [`merge_misaka`]). `None` when neither side had anything to say, so a local engine's
+/// answer carries no empty object.
+pub fn finalize_misaka(notices: &serde_json::Map<String, Value>, from_engine: Option<Value>) -> Option<Value> {
+    if notices.is_empty() && from_engine.is_none() {
+        return None;
+    }
+    let mut merged = Value::Object(notices.clone());
+    if let Some(report) = from_engine {
+        merge_misaka(&mut merged, &report);
+    }
+    Some(merged)
 }
 
 /// Build the backend a settings value asks for.
@@ -792,6 +901,50 @@ mod tests {
         // An MLX model is a directory: no file name, and no artifact, so no refusal from here.
         assert!(engine_pairing_refusal("c", None, "mlx").is_none());
     }
+    /// Under `refuse`, a request that asks for a temperature is refused BEFORE the lane is asked,
+    /// and the refusal names the knob and the way back; a greedy request passes and still carries
+    /// the notice. Under the default, everything passes and the notice prints what was dropped.
+    #[test]
+    fn the_sampling_policy_refuses_or_notices_before_the_lane_is_asked() {
+        let asked = SamplingCommitment { temperature: 0.7, top_k: 40, ..SamplingCommitment::default() };
+        match lane_sampling_gate(SamplingPolicy::Refuse, &asked, "testnet-11") {
+            Err(Error::BadRequest { message }) => {
+                assert!(message.contains("temperature=0.7") && message.contains("top_k=40"), "{message}");
+                assert!(message.contains("greedy_with_notice"), "the way back is named: {message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let greedy =
+            SamplingCommitment { temperature: 0.0, top_p: 1.0, top_k: 0, min_p: 0.0, repeat_penalty: 1.0, seed: None, max_tokens: 64 };
+        let notice = lane_sampling_gate(SamplingPolicy::Refuse, &greedy, "testnet-11").expect("greedy asks for what runs");
+        assert_eq!(notice["applied"]["temperature"], 0);
+
+        let notice = lane_sampling_gate(SamplingPolicy::GreedyWithNotice, &asked, "devnet").expect("passes");
+        assert_eq!(notice["requested"]["temperature"], 0.7);
+        assert_eq!(notice["applied"]["temperature"], 0);
+        assert!(notice["reason"].as_str().is_some_and(|r| r.contains("devnet")), "{notice}");
+        assert_eq!(notice["not_a_rule_on_this_lane"][0], "top_p");
+    }
+
+    /// The merge rule, from the record's side: the app's notices and the gateway's report become
+    /// one object, the gateway wins on conflict, and an engine with nothing to say leaves no
+    /// object at all.
+    #[test]
+    fn the_studios_notices_and_the_engines_report_become_one_misaka() {
+        let mut notices = serde_json::Map::new();
+        notices.insert("ignored_fields".into(), serde_json::json!(["store"]));
+        notices.insert("sampling".into(), serde_json::json!({"requested": {"temperature": 0.7}, "reason": "app"}));
+        let report = serde_json::json!({"fp_claim_id": "d673", "sampling": {"reason": "gateway"}});
+        let merged = finalize_misaka(&notices, Some(report)).expect("something to say");
+        assert_eq!(merged["fp_claim_id"], "d673");
+        assert_eq!(merged["ignored_fields"][0], "store");
+        assert_eq!(merged["sampling"]["requested"]["temperature"], 0.7);
+        assert_eq!(merged["sampling"]["reason"], "gateway", "the engine's word wins");
+
+        assert_eq!(finalize_misaka(&serde_json::Map::new(), None), None, "a local engine's answer carries no empty object");
+        assert_eq!(finalize_misaka(&notices, None).map(|m| m["sampling"]["reason"].clone()), Some(serde_json::json!("app")));
+    }
+
     use misaka_studio_core::hardware::{Accelerator, AcceleratorKind};
     use misaka_studio_core::model::ModelSource;
 

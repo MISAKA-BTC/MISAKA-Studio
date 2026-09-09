@@ -343,6 +343,38 @@ pub struct NodeSettings {
     pub palw_gateway_url: Option<String>,
     /// Where a chat's mining happens relative to the chat itself — see [`MiningMode`].
     pub mining_mode: MiningMode,
+    /// What the app does with a sampling knob the free-prompt lane cannot honour — see
+    /// [`SamplingPolicy`]. Only consulted when the engine answering is the gateway.
+    pub sampling_policy: SamplingPolicy,
+    /// ADR-0096 Decision 5: when trimming a conversation to the class's context would drop MORE
+    /// than this many turns, the dropped turns are first sent to the lane as their own job — a
+    /// short summary — and the summary rides the answer's prompt as a system-level turn. Below
+    /// it the turns are simply dropped and the count is reported. The summary is a real inference
+    /// and a real claim (one job per leg, ADR-0077 R0), which is why the threshold is not zero.
+    pub summarize_after_turns: u32,
+    /// ADR-0096 Decision 5: how many follow-up jobs may continue an answer the class's row cut
+    /// short (`finish_reason: "length"` while the request asked for more). Each leg is its own
+    /// claim; the client sees one stream and `misaka.jobs[]` lists the seams.
+    pub continue_max_legs: u32,
+}
+
+/// **What the app does with `temperature: 0.8` when the lane will replay a greedy decode.**
+///
+/// ADR-0096 Decision 4. The gateway refuses a non-greedy temperature or a seed outright while
+/// `palw_fp_decode_rules` is dormant (ADR-0082 Decision 11): a seat re-executes the job, and a
+/// sampler the seat does not know about is a claim nobody can reproduce. The Studio is the
+/// person's own app and never sent those knobs to the lane at all — it now has to SAY so, or the
+/// person is told a false thing about what ran. Either way nothing is downgraded silently.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SamplingPolicy {
+    /// The request goes through with the knobs dropped, and the answer carries
+    /// `misaka.sampling = { requested, applied, reason }` so what ran is printed beside what
+    /// was asked.
+    #[default]
+    GreedyWithNotice,
+    /// Refuse the request by name before anything is sent, the way the gateway would.
+    Refuse,
 }
 
 /// **Whether the Chat tab waits for the lane, or the lane runs behind it.**
@@ -391,6 +423,9 @@ impl Default for NodeSettings {
             pool_slot_token: None,
             palw_gateway_url: None,
             mining_mode: MiningMode::default(),
+            sampling_policy: SamplingPolicy::default(),
+            summarize_after_turns: 4,
+            continue_max_legs: 2,
         }
     }
 }
@@ -638,6 +673,31 @@ mod tests {
         assert!(s.requires_api_key());
         s.api_key = Some("secret".into());
         assert!(!s.requires_api_key());
+    }
+
+    /// A settings file written before ADR-0096 has none of the lane's three fields, and it must
+    /// load with the ADR's defaults — greedy-with-notice, summarize past four dropped turns, two
+    /// continue legs — rather than refuse to start over keys the person never set.
+    #[test]
+    fn an_older_settings_file_without_the_lane_fields_loads_with_their_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("old.json");
+        std::fs::write(&path, r#"{"node":{"network":"devnet","pool_slot_id":"slot-06"}}"#).expect("write");
+        let s = Settings::load(&path).expect("loads");
+        assert_eq!(s.node.network, NodeNetwork::Devnet, "the keys that were there still load");
+        assert_eq!(s.node.sampling_policy, SamplingPolicy::GreedyWithNotice);
+        assert_eq!(s.node.summarize_after_turns, 4);
+        assert_eq!(s.node.continue_max_legs, 2);
+    }
+
+    /// The policy is spelled on disk the way the ADR spells it, so a person following the text
+    /// can set it by hand.
+    #[test]
+    fn the_sampling_policy_is_spelled_as_the_adr_spells_it() {
+        assert_eq!(serde_json::to_string(&SamplingPolicy::GreedyWithNotice).expect("json"), "\"greedy_with_notice\"");
+        assert_eq!(serde_json::to_string(&SamplingPolicy::Refuse).expect("json"), "\"refuse\"");
+        let s: NodeSettings = serde_json::from_str(r#"{"sampling_policy":"refuse"}"#).expect("parses");
+        assert_eq!(s.sampling_policy, SamplingPolicy::Refuse);
     }
 
     #[test]

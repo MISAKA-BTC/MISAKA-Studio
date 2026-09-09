@@ -11,6 +11,21 @@
 //!                    the answer            roots · work_leaves · claim id
 //! ```
 //!
+//! # A long thread is a chain of jobs, and the chain is reported (ADR-0096 Decision 5)
+//!
+//! The class's row is 512 tokens and does not move (ADR-0092 Decision 4), so a conversation that
+//! outgrows it is TRIMMED — oldest turns first, the system prompt and the newest turn kept — and
+//! the count is reported in `misaka.context`. When the trim would drop more than
+//! `summarize_after_turns` turns, the dropped turns go to the lane first as their own job, a short
+//! summary, which rides the answer's prompt as a system-level "Earlier in this conversation: …"
+//! turn. When the row cuts the answer short (`finish_reason: "length"` while the request asked for
+//! more), up to `continue_max_legs` follow-up jobs continue it, and their deltas join the one
+//! stream the client sees. Every leg is one inference and one claim (ADR-0077 R0), listed in
+//! `misaka.jobs[]` with its role; nothing here fabricates a summary, and a summary or continue leg
+//! that fails is reported on its entry rather than failing the answer. [`plan_context`],
+//! [`summary_job_messages`], [`with_summary`], [`continue_leg_messages`] and [`LegPlanner`] are
+//! the decisions, pure; [`Lane`] is the HTTP.
+//!
 //! # What this backend does not do, and why it is not a gap
 //!
 //! **It does not spawn the gateway and it does not hold a key.** The gateway is an ordinary HTTP
@@ -23,22 +38,74 @@
 //! **It does not choose the model.** The gateway is resident on one registered class; `load`
 //! confirms it is up and reports what it holds. A model picker that appeared to switch the class
 //! would be describing something that did not happen.
+//!
+//! **It does not send sampling knobs.** The lane's execution is what a seat re-runs, and a
+//! temperature the seat does not know about is a claim nobody can reproduce. What was asked and
+//! what ran are printed beside each other by the caller (`misaka.sampling`, ADR-0096 Decision 4);
+//! [`sampling_notice`] and [`sampling_divergence`] are that sentence's two halves.
 
 use super::{
-    Availability, ChatMessage, GenerationRequest, InferenceBackend, LoadRequest, LoadedModel, SseParser, StreamEvent,
-    approximate_tokens,
+    Availability, ChatMessage, GenerationRequest, InferenceBackend, LegLimits, LoadRequest, LoadedModel, SseParser, StreamEvent,
+    Usage, fit_messages_to_budget, prompt_tokens_upper_bound, text_tokens_upper_bound,
 };
 use crate::{Error, Result};
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
-use misaka_studio_core::provenance::RuntimeDescriptor;
-use serde_json::Value;
-use std::sync::Arc;
+use misaka_studio_core::provenance::{RuntimeDescriptor, SamplingCommitment};
+use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+use tokio::sync::mpsc::Sender;
 
 /// The name this backend answers to, everywhere.
 pub const NAME: &str = "gateway";
+
+/// The model id the gateway serves every job under.
+pub const LANE_MODEL: &str = "misaka-palw-fp-v3";
+
+/// Room left for the chat template's own markers, which the prompt estimate does not see.
+const TEMPLATE_MARGIN_TOKENS: u64 = 24;
+
+/// **Room is not a target.** A decode ceiling is what the model is ALLOWED to generate, and this
+/// one does not reliably stop early: given the whole remaining context it produced 438 of 438
+/// tokens and took 6.7 minutes for a two-line question. So an ask that does not fit the class —
+/// the app's default is 2048, meant for a 32K GGUF — is sized like an answer rather than like the
+/// context. A smaller ask, or a larger one that fits, is honoured as given.
+///
+/// This was 256 for a while, and for a different reason: a producer that hardcoded one
+/// retained-trace chunk made every run past 256 tokens fail its own binding check. That is fixed
+/// in the producer, and measured here at the token that used to break — decode 257/257,
+/// committed — so the number is back to being a default answer length and not a wall.
+const DEFAULT_ANSWER_TOKENS: u64 = 256;
+
+/// The decode ceiling of a summary job: 120 words of English is about 160 tokens, and the lane
+/// decodes to its ceiling whatever the answer's length, so this is the job's cost as much as its
+/// length.
+const SUMMARY_TOKENS: u64 = 160;
+
+/// What the summary turn is expected to cost in the answer's prompt — its ceiling, the prefix,
+/// the message's markers — reserved BEFORE the trim so that everything the summary does not cover
+/// is exactly what was dropped, with no hole between the summary and the kept turns.
+const SUMMARY_RESERVE_TOKENS: u64 = SUMMARY_TOKENS + 40;
+
+/// The summary job's instruction, verbatim from ADR-0096 Decision 5.
+pub const SUMMARY_INSTRUCTION: &str =
+    "Summarize the following conversation in at most 120 words, keeping names, numbers and decisions. Reply with the summary only.";
+
+/// How the summary rides the next prompt.
+pub const SUMMARY_PREFIX: &str = "Earlier in this conversation: ";
+
+/// The continue leg's user turn.
+pub const CONTINUE_INSTRUCTION: &str = "Continue exactly where you stopped, without repeating.";
+
+/// The knobs ADR-0096 Decision 4 says have no consensus rule on this lane and never will under
+/// it: a per-lane key is the only sampler an exact court can carry (ADR-0082 Decision 11), and
+/// none of these is one.
+pub const NOT_A_RULE_ON_THIS_LANE: [&str; 4] = ["top_p", "top_k", "min_p", "repeat_penalty"];
+
+/// The seed the lane draws under while `palw_fp_decode_rules` is dormant: the zero seed, 64 hex
+/// characters, as the gateway spells it.
+pub const GREEDY_SEED_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// A gateway's `/health`, as much of it as this backend reads.
 #[derive(Clone, Debug, Default)]
@@ -52,6 +119,10 @@ pub struct GatewayFacts {
     pub runtime_manifest_hash: String,
     pub can_submit: bool,
     pub fp_certified: bool,
+    /// ADR-0096 Decision 8's fence, as the chain reports it (`chain.fp_decode_constraint_armed`).
+    /// Absent from an older gateway's health is `false`, which is also the truth on every shipped
+    /// network: arming needs a build that reports the field.
+    pub fp_decode_constraint_armed: bool,
 }
 
 pub struct GatewayBackend {
@@ -84,6 +155,12 @@ impl GatewayBackend {
         &self.url
     }
 
+    /// What `/health` said, for a test that must not reach a gateway.
+    #[cfg(test)]
+    pub(crate) async fn set_facts_for_test(&self, facts: GatewayFacts) {
+        *self.facts.write().await = Some(facts);
+    }
+
     async fn health(&self) -> std::result::Result<GatewayFacts, String> {
         let mut request = self.http.get(format!("{}/health", self.url)).timeout(Duration::from_secs(10));
         if let Some(token) = &self.token {
@@ -95,13 +172,15 @@ impl GatewayBackend {
         }
         let body: Value = response.json().await.map_err(|e| format!("{} did not answer JSON: {e}", self.url))?;
         let string = |key: &str| body.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
+        let chain_flag = |key: &str| body.get("chain").and_then(|c| c.get(key)).and_then(Value::as_bool).unwrap_or(false);
         let facts = GatewayFacts {
             class_id: string("class_id"),
             bond: string("bond"),
             n_ctx: body.get("n_ctx").and_then(Value::as_u64).unwrap_or(0) as u32,
             runtime_manifest_hash: string("runtime_manifest_hash"),
             can_submit: body.get("can_submit").and_then(Value::as_bool).unwrap_or(false),
-            fp_certified: body.get("chain").and_then(|c| c.get("fp_certified")).and_then(Value::as_bool).unwrap_or(false),
+            fp_certified: chain_flag("fp_certified"),
+            fp_decode_constraint_armed: chain_flag("fp_decode_constraint_armed"),
         };
         *self.facts.write().await = Some(facts.clone());
         Ok(facts)
@@ -191,177 +270,678 @@ impl InferenceBackend for GatewayBackend {
 
     fn generate(&self, request: GenerationRequest) -> BoxFuture<'_, Result<BoxStream<'static, Result<StreamEvent>>>> {
         Box::pin(async move {
-            let url = format!("{}/v1/chat/completions", self.url);
-            // The gateway's surface is deliberately small (ADR-0077 Decision 2): messages, a decode
-            // ceiling, and the stream flag. Sampling knobs are not sent because the lane's
-            // execution is what a seat re-runs — a temperature the seat does not know about is a
-            // claim nobody can reproduce.
-            let fallback_prompt_tokens =
-                approximate_tokens(&request.messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join("\n"));
+            let facts = self.facts.read().await.clone();
+            let n_ctx = facts.as_ref().map(|f| f.n_ctx as u64).filter(|n| *n > 0);
 
-            // **The ceiling has to fit the class, not the app's default.**
-            //
-            // A class is registered at a fixed context — 512 tokens for graph-v5@512 — and the
-            // worker checks `prompt + the DECODE CEILING` against it, not `prompt + what is
-            // actually generated`. So a request asking for the Studio's default 2048 is refused
-            // outright however short its answer would have been, and a conversation with any
-            // history behind it never gets past the first turn: "prompt 344 + decode ceiling 1024
-            // exceeds max_context_tokens 512". Measured, on a chat whose second message returned
-            // nothing at all.
-            //
-            // The prompt is estimated rather than tokenized here — the class's tokenizer lives with
-            // the worker — so a margin is left for the estimate being low and for the chat
-            // template's own markers.
-            const TEMPLATE_MARGIN_TOKENS: u64 = 24;
-            let fallback_prompt_tokens = prompt_upper_bound(&request.messages).max(fallback_prompt_tokens);
-            let n_ctx = self.facts.read().await.as_ref().map(|f| f.n_ctx as u64).filter(|n| *n > 0);
-            let ceiling = match n_ctx {
-                Some(n_ctx) => {
-                    let used = fallback_prompt_tokens.saturating_add(TEMPLATE_MARGIN_TOKENS);
-                    let room = n_ctx.saturating_sub(used);
-                    if room == 0 {
-                        return Err(Error::BadRequest {
-                            message: format!(
-                                "this class holds {n_ctx} tokens and the conversation is already about {used}. \
-                                 Start a new chat, or shorten it — the context is the class's, registered on chain, \
-                                 and not something this app can raise."
-                            ),
-                        });
-                    }
-                    // **Room is not a target.** A decode ceiling is what the model is ALLOWED to
-                    // generate, and this one does not reliably stop early: given the whole
-                    // remaining context it produced 438 of 438 tokens and took 6.7 minutes for a
-                    // two-line question. So an ask that does not fit the class — the app's default
-                    // is 2048, meant for a 32K GGUF — is sized like an answer rather than like the
-                    // context. A smaller ask, or a larger one that fits, is honoured as given.
-                    //
-                    // This was 256 for a while, and for a different reason: a producer that
-                    // hardcoded one retained-trace chunk made every run past 256 tokens fail its
-                    // own binding check. That is fixed in the producer, and measured here at the
-                    // token that used to break — decode 257/257, committed — so the number is back
-                    // to being a default answer length and not a wall.
-                    const DEFAULT_ANSWER_TOKENS: u64 = 256;
-                    if request.params.max_tokens <= room { request.params.max_tokens } else { room.min(DEFAULT_ANSWER_TOKENS) }
-                }
-                None => request.params.max_tokens,
+            // ADR-0096 Decision 3, before any job runs: an integration that needs the committed
+            // guarantee must never receive an advisory lookalike. The fence is the chain's, read
+            // from the gateway's health, and every shipped network has it dormant.
+            if requires_committed_format(request.misaka.as_ref()) && !facts.as_ref().is_some_and(|f| f.fp_decode_constraint_armed) {
+                return Err(Error::BadRequest { message: COMMITTED_FORMAT_REFUSAL.to_string() });
+            }
+
+            let shape = RequestShape::from_request(&request);
+            let extra_prompt_tokens = shape.prompt_tokens();
+            // A raw prompt is one user turn: the lane has only the chat entrance, and its template
+            // is the class's (ADR-0077 Decision 6), so a raw completion cannot bypass it.
+            let messages: Vec<ChatMessage> = match &request.prompt {
+                Some(prompt) if request.messages.is_empty() => vec![ChatMessage::new("user", prompt.clone())],
+                _ => request.messages.clone(),
             };
+            let requested_tokens = request.params.max_tokens;
+            let plan = plan_context(&messages, n_ctx, requested_tokens, extra_prompt_tokens, request.legs);
+            let original_turns = messages.iter().filter(|m| m.role != "system").count();
 
-            // One request, issued as a closure because it may have to be issued twice — see the
-            // refusal branch below, where the worker's own numbers give the ceiling that fits.
-            let messages: Vec<serde_json::Value> =
-                request.messages.iter().map(|m| serde_json::json!({ "role": m.role, "content": m.content })).collect();
-            let http = self.http.clone();
-            let token = self.token.clone();
-            let send = move |ceiling: u64| {
-                let (http, token, url, messages) = (http.clone(), token.clone(), url.clone(), messages.clone());
-                async move {
-                    let body = serde_json::json!({
-                        "model": "misaka-palw-fp-v3",
-                        "messages": messages,
-                        "max_tokens": ceiling,
-                        "stream": true,
-                    });
-                    let mut request = http.post(&url).json(&body);
-                    if let Some(token) = &token {
-                        request = request.header("x-pool-token", token);
-                    }
-                    let response = request.send().await.map_err(|e| Error::Engine {
-                        backend: NAME,
-                        message: format!("the gateway did not accept the request: {e}"),
-                    })?;
-                    if !response.status().is_success() {
-                        let status = response.status();
-                        let text = response.text().await.unwrap_or_default();
-                        return Err(Error::Engine { backend: NAME, message: format!("gateway returned {status}: {}", text.trim()) });
-                    }
-                    Ok(response)
+            let lane = Lane {
+                http: self.http.clone(),
+                token: self.token.clone(),
+                url: format!("{}/v1/chat/completions", self.url),
+                n_ctx,
+                extra_prompt_tokens,
+            };
+            let mut planner = LegPlanner::new(request.legs);
+            let mut jobs: Vec<Value> = Vec::new();
+            let mut context = plan.kept.clone();
+            let mut summarized: Option<usize> = None;
+
+            // **The first leg's request goes out before the stream is handed back**, so a gateway
+            // that will not take it — the lane not certified, the queue full, a slot unfunded —
+            // is a status code, as it always was, and not an error event behind a 200. A summary
+            // leg that fails here does not fail the answer: it is recorded and the answer goes.
+            let mut role = planner.first(plan.dropped.len());
+            let mut first: Option<Leg> = None;
+            if role == LegRole::Summary {
+                match summary_job_messages(&plan.dropped, lane.summary_budget()) {
+                    Some((messages, covered)) => match lane.send(&messages, SUMMARY_TOKENS, &RequestShape::default()).await {
+                        Ok(response) => {
+                            summarized = Some(covered);
+                            first = Some(Leg { messages, shape: RequestShape::default(), response });
+                        }
+                        Err(e) => jobs.push(job_error(LegRole::Summary, e.to_string())),
+                    },
+                    None => jobs.push(job_error(LegRole::Summary, "the dropped turns do not fit a summary job on this class".into())),
+                }
+            }
+            let mut first = match first {
+                Some(leg) => leg,
+                None => {
+                    role = LegRole::Answer;
+                    let ceiling = answer_ceiling(prompt_tokens_upper_bound(&context) + extra_prompt_tokens, n_ctx, requested_tokens)?;
+                    let response = lane.send(&context, ceiling, &shape).await?;
+                    Leg { messages: context.clone(), shape: shape.clone(), response }
                 }
             };
 
-            let response = send(ceiling).await?;
-            let claim_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
             Ok(crate::backend::mock::async_stream(move |tx| async move {
-                let mut retried = false;
-                let mut parser = SseParser::new(true);
-                let mut byte_stream = response.bytes_stream();
-                use futures_util::StreamExt;
-                let mut tail = Vec::new();
-
-                while let Some(chunk) = byte_stream.next().await {
-                    let chunk = match chunk {
-                        Ok(c) => c,
-                        Err(e) => {
-                            let _ = tx.send(Err(Error::Engine { backend: NAME, message: format!("stream broke: {e}") })).await;
+                let mut answer = String::new();
+                let mut usage = Usage::default();
+                let mut finish_reason = "stop".to_string();
+                let mut answer_misaka: Option<Value> = None;
+                loop {
+                    let forward = (role != LegRole::Summary).then_some(&tx);
+                    let result = lane.run_leg(first, forward).await;
+                    let outcome = match (role, result) {
+                        (LegRole::Summary, Ok(leg)) => {
+                            let mut entry = job_entry(role, &leg);
+                            let summary = leg.text.trim();
+                            if summary.is_empty() {
+                                // The job ran and is a claim; the person's history still was not
+                                // carried, and the entry says so rather than the app inventing one.
+                                entry["error"] = json!("the summary job returned no text; the dropped turns were not carried");
+                                summarized = None;
+                            } else {
+                                context = with_summary(&context, summary, plan.prompt_budget).0;
+                            }
+                            jobs.push(entry);
+                            LegOutcome { finish_reason: leg.finish_reason, delivered_tokens: 0, requested_tokens, failed: false }
+                        }
+                        (LegRole::Summary, Err(e)) => {
+                            summarized = None;
+                            jobs.push(job_error(role, e.to_string()));
+                            LegOutcome { finish_reason: String::new(), delivered_tokens: 0, requested_tokens, failed: true }
+                        }
+                        (LegRole::Answer | LegRole::Continue, Ok(leg)) => {
+                            jobs.push(job_entry(role, &leg));
+                            answer.push_str(&leg.text);
+                            usage.prompt_tokens += leg.usage.prompt_tokens;
+                            usage.completion_tokens += leg.usage.completion_tokens;
+                            finish_reason = leg.finish_reason.clone();
+                            if role == LegRole::Answer {
+                                answer_misaka = leg.misaka;
+                            }
+                            LegOutcome {
+                                finish_reason: leg.finish_reason,
+                                delivered_tokens: usage.completion_tokens,
+                                requested_tokens,
+                                failed: false,
+                            }
+                        }
+                        (LegRole::Answer, Err(e)) => {
+                            let _ = tx.send(Err(e)).await;
                             return;
+                        }
+                        (LegRole::Continue, Err(e)) => {
+                            jobs.push(job_error(role, e.to_string()));
+                            break;
                         }
                     };
-                    // The gateway's last event carries `misaka` — the job and claim ids. It is not
-                    // part of the OpenAI shape, so the parser drops it; it is logged here because a
-                    // chat that produced a claim and never said which one is a chat nobody can
-                    // follow to the chain.
-                    tail.extend_from_slice(&chunk);
-                    if !claim_seen.load(std::sync::atomic::Ordering::Relaxed)
-                        && let Some(claim) = claim_id_in(&tail)
-                    {
-                        claim_seen.store(true, std::sync::atomic::Ordering::Relaxed);
-                        tracing::info!(claim = %claim, "free-prompt claim committed");
-                    }
-                    for event in parser.push(&chunk) {
-                        if tx.send(Ok(event)).await.is_err() {
-                            return;
-                        }
-                    }
-                    // The gateway answers 200 and puts a refusal in the stream — a job over the
-                    // class's context, a lane the chain does not certify. Silence would be the
-                    // worst rendering of that.
-                    if let Some(message) = parser.take_error() {
-                        // The worker sized the request for us in the act of refusing it. One retry,
-                        // and only when the numbers are there: a second refusal is a real answer.
-                        if let (false, Some(room)) = (retried, ceiling_from_refusal(&message)) {
-                            retried = true;
-                            match send(room).await {
-                                Ok(next) => {
-                                    tracing::info!(ceiling = room, "retrying at the ceiling the worker named");
-                                    parser = SseParser::new(true);
-                                    byte_stream = next.bytes_stream();
-                                    continue;
-                                }
+
+                    let Some(next) = planner.after(role, &outcome) else { break };
+                    let leg = match next {
+                        LegRole::Answer => {
+                            let estimate = prompt_tokens_upper_bound(&context) + extra_prompt_tokens;
+                            match answer_ceiling(estimate, n_ctx, requested_tokens) {
+                                Ok(ceiling) => Some((context.clone(), ceiling, shape.clone())),
                                 Err(e) => {
                                     let _ = tx.send(Err(e)).await;
                                     return;
                                 }
                             }
                         }
-                        let _ = tx.send(Err(Error::Engine { backend: NAME, message })).await;
-                        return;
+                        LegRole::Continue => {
+                            let remaining = requested_tokens.saturating_sub(usage.completion_tokens);
+                            let budget = prompt_budget(n_ctx, extra_prompt_tokens, remaining);
+                            match continue_leg_messages(&context, &answer, budget) {
+                                Some(messages) => {
+                                    let estimate = prompt_tokens_upper_bound(&messages) + extra_prompt_tokens;
+                                    match answer_ceiling(estimate, n_ctx, remaining) {
+                                        Ok(ceiling) => Some((messages, ceiling, shape.clone())),
+                                        Err(e) => {
+                                            jobs.push(job_error(next, e.to_string()));
+                                            None
+                                        }
+                                    }
+                                }
+                                None => {
+                                    jobs.push(job_error(
+                                        next,
+                                        "the answer so far does not fit beside the context on this class".into(),
+                                    ));
+                                    None
+                                }
+                            }
+                        }
+                        // The planner never schedules a summary after the first leg.
+                        LegRole::Summary => None,
+                    };
+                    let Some((messages, ceiling, leg_shape)) = leg else { break };
+                    match lane.send(&messages, ceiling, &leg_shape).await {
+                        Ok(response) => {
+                            role = next;
+                            first = Leg { messages, shape: leg_shape, response };
+                        }
+                        Err(e) if next == LegRole::Answer => {
+                            let _ = tx.send(Err(e)).await;
+                            return;
+                        }
+                        Err(e) => {
+                            jobs.push(job_error(next, e.to_string()));
+                            break;
+                        }
                     }
                 }
-                let _ = tx.send(Ok(parser.finish(fallback_prompt_tokens))).await;
+
+                usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+                let kept_turns = context.iter().filter(|m| m.role != "system").count();
+                let mut report = json!({
+                    "n_ctx": n_ctx,
+                    "prompt_tokens_estimate": prompt_tokens_upper_bound(&context) + extra_prompt_tokens,
+                    "dropped_turns": original_turns.saturating_sub(kept_turns),
+                });
+                if let Some(covered) = summarized {
+                    report["summarized_turns"] = json!(covered);
+                }
+                let misaka = finalize_lane_misaka(answer_misaka, jobs, report);
+                let _ = tx.send(Ok(StreamEvent::Done { usage, finish_reason, misaka: Some(misaka) })).await;
             }))
         })
     }
 }
 
-/// An UPPER bound on a conversation's tokens — a different job from `approximate_tokens`.
+/// The refusal a `require_committed_format` request meets on a dormant network.
+const COMMITTED_FORMAT_REFUSAL: &str = "misaka.require_committed_format: this chain has not armed palw_fp_decode_constraint (ADR-0096 \
+     Decision 8), so a response_format can only be advisory here — the schema is rendered into the prompt, the run is \
+     unconstrained, and the answer is checked after the fact. The request is refused before any job runs; drop \
+     require_committed_format to accept an advisory answer marked as such (misaka.format.enforcement).";
+
+/// Whether the request's `misaka` extension demands the committed format mode.
+pub(crate) fn requires_committed_format(misaka: Option<&Value>) -> bool {
+    misaka.and_then(|m| m.get("require_committed_format")).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// The shape fields one leg carries to the gateway (ADR-0096 Decisions 1–3), as the client sent
+/// them. Empty for a summary leg: a summary is prose, not the answer's format, and not a tool
+/// round-trip.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct RequestShape {
+    pub tools: Option<Value>,
+    pub tool_choice: Option<Value>,
+    pub response_format: Option<Value>,
+    pub misaka: Option<Value>,
+}
+
+impl RequestShape {
+    fn from_request(request: &GenerationRequest) -> Self {
+        RequestShape {
+            tools: request.tools.clone(),
+            tool_choice: request.tool_choice.clone(),
+            response_format: request.response_format.clone(),
+            misaka: request.misaka.clone(),
+        }
+    }
+
+    /// What the shape adds to the prompt: the gateway renders `tools` into the system turn as
+    /// the model's own `<tools>` text and an advisory schema into the prompt, so both cost
+    /// context the conversation does not get.
+    fn prompt_tokens(&self) -> u64 {
+        [&self.tools, &self.response_format].into_iter().flatten().map(|value| text_tokens_upper_bound(&value.to_string())).sum()
+    }
+}
+
+/// The lane's request body: messages, a decode ceiling, the stream flag, and the shape fields
+/// only when the client sent them (ADR-0096 Decisions 1–3). No sampling knob, ever — see the
+/// module doc. A key sent as `null` is a different request from one not sent, so absent stays
+/// absent.
+pub(crate) fn lane_request_body(messages: &[ChatMessage], ceiling: u64, shape: &RequestShape) -> Value {
+    let mut body = json!({
+        "model": LANE_MODEL,
+        "messages": messages,
+        "max_tokens": ceiling,
+        "stream": true,
+    });
+    for (key, value) in [
+        ("tools", &shape.tools),
+        ("tool_choice", &shape.tool_choice),
+        ("response_format", &shape.response_format),
+        ("misaka", &shape.misaka),
+    ] {
+        if let Some(value) = value {
+            body[key] = value.clone();
+        }
+    }
+    body
+}
+
+// ---------------------------------------------------------------------------------------------
+// The decisions, pure: which legs, over which messages, at which ceiling
+// ---------------------------------------------------------------------------------------------
+
+/// The role of one job in a request's chain, as it is named in `misaka.jobs[].role`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LegRole {
+    Summary,
+    Answer,
+    Continue,
+}
+
+impl LegRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LegRole::Summary => "summary",
+            LegRole::Answer => "answer",
+            LegRole::Continue => "continue",
+        }
+    }
+}
+
+/// What a finished leg tells the planner.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LegOutcome {
+    pub finish_reason: String,
+    /// Decode tokens delivered to the client so far, over every answer and continue leg.
+    pub delivered_tokens: u64,
+    /// What the request asked for (`max_tokens`).
+    pub requested_tokens: u64,
+    pub failed: bool,
+}
+
+/// **Which legs run, in what order** — the decision, apart from the HTTP.
 ///
-/// That one is "about four characters per token" and its own doc says it is never for sizing a
-/// context window, which is exactly what this is for. Measured: a two-turn Japanese conversation of
-/// 51 real tokens estimated as 12, the ceiling was computed from the gap, and the worker refused
-/// the whole request — "prompt 51 + decode ceiling 476 exceeds max_context_tokens 512".
+/// A summary runs first only when the trim dropped MORE than `summarize_after_turns` turns; it
+/// is followed by the answer whether it succeeded or not. A continue leg follows an answer (or a
+/// continue) that the row cut short — `finish_reason == "length"` — while the request asked for
+/// more tokens than have been delivered, up to `continue_max_legs` of them. A leg that failed is
+/// never continued: a failed answer is the request's failure, and a failed continue leg ends the
+/// chain with what was delivered.
+#[derive(Clone, Debug)]
+pub struct LegPlanner {
+    limits: LegLimits,
+    continues_run: u32,
+}
+
+impl LegPlanner {
+    pub fn new(limits: LegLimits) -> Self {
+        LegPlanner { limits, continues_run: 0 }
+    }
+
+    /// The first leg, given how many turns the trim dropped.
+    pub fn first(&self, dropped_turns: usize) -> LegRole {
+        if dropped_turns as u64 > self.limits.summarize_after_turns as u64 { LegRole::Summary } else { LegRole::Answer }
+    }
+
+    /// The leg after `role` finished with `outcome`, if any. Never a summary.
+    pub fn after(&mut self, role: LegRole, outcome: &LegOutcome) -> Option<LegRole> {
+        match role {
+            LegRole::Summary => Some(LegRole::Answer),
+            LegRole::Answer | LegRole::Continue => {
+                if outcome.failed || outcome.finish_reason != "length" {
+                    return None;
+                }
+                if outcome.delivered_tokens >= outcome.requested_tokens {
+                    return None;
+                }
+                if self.continues_run >= self.limits.continue_max_legs {
+                    return None;
+                }
+                self.continues_run += 1;
+                Some(LegRole::Continue)
+            }
+        }
+    }
+}
+
+/// The conversation as the answer leg will send it, and what was cut to get there.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContextPlan {
+    /// The messages the answer's prompt is built from (system turns first, as the trim leaves them).
+    pub kept: Vec<ChatMessage>,
+    /// The non-system turns the trim dropped, oldest first.
+    pub dropped: Vec<ChatMessage>,
+    /// The prompt budget the kept turns fit — what a summary turn, once added, must fit too.
+    pub prompt_budget: u64,
+}
+
+/// The prompt budget for a conversation whose answer may take `asked` tokens: the class's context
+/// less the template's margin, the shape fields, and the answer's room (the ask, sized like an
+/// answer — see [`DEFAULT_ANSWER_TOKENS`]). Unbounded when the class's context is unknown.
+fn prompt_budget(n_ctx: Option<u64>, extra_prompt_tokens: u64, asked: u64) -> u64 {
+    match n_ctx {
+        Some(n_ctx) => n_ctx.saturating_sub(TEMPLATE_MARGIN_TOKENS + extra_prompt_tokens + asked.min(DEFAULT_ANSWER_TOKENS)),
+        None => u64::MAX,
+    }
+}
+
+/// **The trim, as one decision** (ADR-0096 Decision 5, step 1 — and the reservation step 2 needs).
 ///
-/// So: one token per non-ASCII character (CJK sits at roughly one, sometimes more), a quarter of
-/// the ASCII, and the chat template's markers per message. Over-counting shortens an answer;
-/// under-counting loses the request — and [`ceiling_from_refusal`] repairs the rest.
-fn prompt_upper_bound(messages: &[ChatMessage]) -> u64 {
-    const PER_MESSAGE_MARKERS: u64 = 8;
-    messages
-        .iter()
-        .map(|m| {
-            let ascii = m.content.chars().filter(char::is_ascii).count() as u64;
-            let other = m.content.chars().count() as u64 - ascii;
-            ascii.div_ceil(4) + other + PER_MESSAGE_MARKERS
-        })
-        .sum()
+/// Fits the conversation to the prompt budget with [`fit_messages_to_budget`] (system prompt and
+/// the newest turn survive, oldest go first). When that drops more than
+/// `limits.summarize_after_turns` turns, the fit is done again with the summary turn's room
+/// reserved, so that the dropped set is exactly what the summary job will be shown: a summary
+/// that had to make room for itself by dropping a kept turn would leave a hole between the
+/// summary and the history, and nothing would have been said about that turn at all.
+pub fn plan_context(
+    messages: &[ChatMessage],
+    n_ctx: Option<u64>,
+    asked: u64,
+    extra_prompt_tokens: u64,
+    limits: LegLimits,
+) -> ContextPlan {
+    let budget = prompt_budget(n_ctx, extra_prompt_tokens, asked);
+    let (mut kept, mut dropped_count) = fit_messages_to_budget(messages, budget);
+    if dropped_count as u64 > limits.summarize_after_turns as u64 {
+        let (with_reserve, more) = fit_messages_to_budget(messages, budget.saturating_sub(SUMMARY_RESERVE_TOKENS));
+        kept = with_reserve;
+        dropped_count = more;
+    }
+    let dropped = messages.iter().filter(|m| m.role != "system").take(dropped_count).cloned().collect();
+    ContextPlan { kept, dropped, prompt_budget: budget }
+}
+
+/// **The summary job's messages**, and how many of the dropped turns they cover.
+///
+/// The dropped turns are shown as `role: content` lines in one user turn under
+/// [`SUMMARY_INSTRUCTION`]. They may not all fit the class either — ten dropped turns of 300
+/// tokens is six rows — so the newest are taken first, being the ones nearest the kept context,
+/// until the budget is spent; the oldest beyond that are simply gone, and the count says so.
+/// `None` when not even the newest dropped turn fits: a summary job is never sent a prompt the
+/// worker will refuse.
+pub fn summary_job_messages(dropped: &[ChatMessage], budget: u64) -> Option<(Vec<ChatMessage>, usize)> {
+    let instruction = ChatMessage::new("system", SUMMARY_INSTRUCTION);
+    let mut lines: Vec<String> = Vec::new();
+    for turn in dropped.iter().rev() {
+        let mut candidate = lines.clone();
+        candidate.push(format!("{}: {}", turn.role, turn.content));
+        let user = ChatMessage::new("user", candidate.iter().rev().cloned().collect::<Vec<_>>().join("\n"));
+        if prompt_tokens_upper_bound(&[instruction.clone(), user]) > budget {
+            break;
+        }
+        lines = candidate;
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let covered = lines.len();
+    lines.reverse();
+    Some((vec![instruction, ChatMessage::new("user", lines.join("\n"))], covered))
+}
+
+/// **The summary, riding the next prompt** as a system-level turn placed after the original
+/// system prompt (an instruction stays first; the summary is context). The result is fitted to
+/// the budget once more in case the model overran its 120 words: [`fit_messages_to_budget`]
+/// keeps every system turn, so the summary survives and history gives way. Returns the messages
+/// and how many further turns that cost.
+pub fn with_summary(kept: &[ChatMessage], summary: &str, budget: u64) -> (Vec<ChatMessage>, usize) {
+    let leading_system = kept.iter().take_while(|m| m.role == "system").count();
+    let mut messages = kept.to_vec();
+    messages.insert(leading_system, ChatMessage::new("system", format!("{SUMMARY_PREFIX}{summary}")));
+    fit_messages_to_budget(&messages, budget)
+}
+
+/// **A continue leg's messages**: the kept context, the answer so far as the assistant's turn,
+/// and [`CONTINUE_INSTRUCTION`] as the user's. Fitted to the budget — the answer so far is up to
+/// a row's worth of new text, so history gives way to it. `None` when even the answer so far does
+/// not fit beside the instruction: a continuation of a text the model cannot see is not a
+/// continuation.
+pub fn continue_leg_messages(context: &[ChatMessage], answer_so_far: &str, budget: u64) -> Option<Vec<ChatMessage>> {
+    let mut messages = context.to_vec();
+    messages.push(ChatMessage::new("assistant", answer_so_far));
+    messages.push(ChatMessage::new("user", CONTINUE_INSTRUCTION));
+    let (kept, _) = fit_messages_to_budget(&messages, budget);
+    let answer_survived = kept.len() >= 2 && kept[kept.len() - 2].role == "assistant" && kept[kept.len() - 2].content == answer_so_far;
+    (answer_survived && prompt_tokens_upper_bound(&kept) <= budget).then_some(kept)
+}
+
+/// **The ceiling has to fit the class, not the app's default.**
+///
+/// A class is registered at a fixed context — 512 tokens for graph-v5@512 — and the worker checks
+/// `prompt + the DECODE CEILING` against it, not `prompt + what is actually generated`. So a
+/// request asking for the Studio's default 2048 is refused outright however short its answer
+/// would have been, and a conversation with any history behind it never gets past the first
+/// turn: "prompt 344 + decode ceiling 1024 exceeds max_context_tokens 512". Measured, on a chat
+/// whose second message returned nothing at all.
+///
+/// The prompt is estimated rather than tokenized here — the class's tokenizer lives with the
+/// worker — so a margin is left for the estimate being low and for the chat template's own
+/// markers.
+fn answer_ceiling(prompt_estimate: u64, n_ctx: Option<u64>, asked: u64) -> Result<u64> {
+    let Some(n_ctx) = n_ctx else { return Ok(asked) };
+    let used = prompt_estimate.saturating_add(TEMPLATE_MARGIN_TOKENS);
+    let room = n_ctx.saturating_sub(used);
+    if room == 0 {
+        return Err(Error::BadRequest {
+            message: format!(
+                "this class holds {n_ctx} tokens and the conversation is already about {used}. \
+                 Start a new chat, or shorten it — the context is the class's, registered on chain, \
+                 and not something this app can raise."
+            ),
+        });
+    }
+    Ok(if asked <= room { asked } else { room.min(DEFAULT_ANSWER_TOKENS) })
+}
+
+/// One `misaka.jobs[]` entry for a leg that ran.
+fn job_entry(role: LegRole, leg: &LegResult) -> Value {
+    let id = |key: &str| leg.misaka.as_ref().and_then(|m| m.get(key)).cloned().unwrap_or(Value::Null);
+    if let Some(claim) = id("fp_claim_id").as_str() {
+        tracing::info!(role = role.as_str(), claim, "free-prompt claim committed");
+    }
+    json!({
+        "fp_job_id": id("fp_job_id"),
+        "fp_claim_id": id("fp_claim_id"),
+        "role": role.as_str(),
+        "prompt_tokens": leg.usage.prompt_tokens,
+        "decode_tokens": leg.usage.completion_tokens,
+    })
+}
+
+/// One `misaka.jobs[]` entry for a leg that did not run, or did not finish.
+fn job_error(role: LegRole, error: String) -> Value {
+    tracing::warn!(role = role.as_str(), "lane leg failed: {error}");
+    json!({
+        "fp_job_id": null,
+        "fp_claim_id": null,
+        "role": role.as_str(),
+        "prompt_tokens": 0,
+        "decode_tokens": 0,
+        "error": error,
+    })
+}
+
+/// The answer's `misaka` object: the answer leg's own (job, claim, roots, derivation — it stays
+/// the top-level one) with `jobs[]` and `context` added beside it.
+fn finalize_lane_misaka(answer: Option<Value>, jobs: Vec<Value>, context: Value) -> Value {
+    let mut misaka = match answer {
+        Some(Value::Object(map)) => Value::Object(map),
+        _ => json!({}),
+    };
+    misaka["jobs"] = Value::Array(jobs);
+    misaka["context"] = context;
+    misaka
+}
+
+// ---------------------------------------------------------------------------------------------
+// Sampling at the entrance (ADR-0096 Decision 4): what was asked, printed beside what ran
+// ---------------------------------------------------------------------------------------------
+
+/// Every knob whose effective value asks for something other than the greedy decode the lane
+/// replays, with the value asked for. Empty is a request the lane honours exactly as written.
+pub fn sampling_divergence(params: &SamplingCommitment) -> Vec<(&'static str, Value)> {
+    let mut out = Vec::new();
+    if params.temperature != 0.0 {
+        out.push(("temperature", json!(params.temperature)));
+    }
+    if params.top_p != 1.0 {
+        out.push(("top_p", json!(params.top_p)));
+    }
+    if params.top_k != 0 {
+        out.push(("top_k", json!(params.top_k)));
+    }
+    if params.min_p != 0.0 {
+        out.push(("min_p", json!(params.min_p)));
+    }
+    if params.repeat_penalty != 1.0 {
+        out.push(("repeat_penalty", json!(params.repeat_penalty)));
+    }
+    if let Some(seed) = params.seed {
+        out.push(("seed", json!(seed)));
+    }
+    out
+}
+
+/// The `misaka.sampling` notice every answer that went to the lane carries: what was requested,
+/// what was applied (the greedy decode and the zero seed, which is what a seat replays), why, and
+/// which knobs have no rule on this lane at all.
+pub fn sampling_notice(params: &SamplingCommitment, network: &str) -> Value {
+    json!({
+        "requested": {
+            "temperature": params.temperature,
+            "top_p": params.top_p,
+            "top_k": params.top_k,
+            "min_p": params.min_p,
+            "repeat_penalty": params.repeat_penalty,
+            "seed": params.seed,
+        },
+        "applied": { "temperature": 0, "seed": GREEDY_SEED_HEX },
+        "reason": format!("palw_fp_decode_rules is not armed on {network}; the lane replays a greedy decode"),
+        "not_a_rule_on_this_lane": NOT_A_RULE_ON_THIS_LANE,
+    })
+}
+
+/// The refusal under `node.sampling_policy: refuse`, naming every knob and the way back.
+pub fn sampling_refusal(divergence: &[(&'static str, Value)], network: &str) -> String {
+    let asked: Vec<String> = divergence.iter().map(|(name, value)| format!("{name}={value}")).collect();
+    format!(
+        "node.sampling_policy is `refuse`, and this request asks for sampling the free-prompt lane cannot honour: {}. \
+         The lane replays a greedy decode while palw_fp_decode_rules is not armed on {network} (ADR-0082 Decision 11, \
+         ADR-0096 Decision 4). Send temperature 0, top_p 1, top_k 0, min_p 0, repeat_penalty 1 and no seed — or set \
+         node.sampling_policy to greedy_with_notice to have the knobs dropped and reported under misaka.sampling.",
+        asked.join(", ")
+    )
+}
+
+// ---------------------------------------------------------------------------------------------
+// The HTTP half
+// ---------------------------------------------------------------------------------------------
+
+/// One leg, sent: what it was sent with (the retry re-sends the same messages at the ceiling
+/// the worker names) and the gateway's open response.
+struct Leg {
+    messages: Vec<ChatMessage>,
+    shape: RequestShape,
+    response: reqwest::Response,
+}
+
+/// What one leg produced.
+struct LegResult {
+    text: String,
+    usage: Usage,
+    finish_reason: String,
+    misaka: Option<Value>,
+}
+
+/// The gateway's chat entrance, with everything a leg needs to reach it.
+#[derive(Clone)]
+struct Lane {
+    http: reqwest::Client,
+    token: Option<String>,
+    url: String,
+    n_ctx: Option<u64>,
+    extra_prompt_tokens: u64,
+}
+
+impl Lane {
+    /// The prompt budget of a summary job: the context less the template's margin and the
+    /// summary's own ceiling.
+    fn summary_budget(&self) -> u64 {
+        self.n_ctx.map(|n| n.saturating_sub(TEMPLATE_MARGIN_TOKENS + SUMMARY_TOKENS)).unwrap_or(u64::MAX)
+    }
+
+    async fn send(&self, messages: &[ChatMessage], ceiling: u64, shape: &RequestShape) -> Result<reqwest::Response> {
+        let body = lane_request_body(messages, ceiling, shape);
+        let mut request = self.http.post(&self.url).json(&body);
+        if let Some(token) = &self.token {
+            request = request.header("x-pool-token", token);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| Error::Engine { backend: NAME, message: format!("the gateway did not accept the request: {e}") })?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        let text = response.text().await.unwrap_or_default();
+        // The gateway's own error body is OpenAI-shaped; the sentence inside it is the one worth
+        // repeating. A 4xx is the gateway refusing BY NAME — a temperature on a dormant fence, a
+        // role it does not serve — and reaches the client as the 400 it is, not as an engine fault.
+        let message = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.get("message")).and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_else(|| text.trim().to_string());
+        if status.is_client_error() {
+            return Err(Error::BadRequest { message: format!("the gateway refused the request ({status}): {message}") });
+        }
+        Err(Error::Engine { backend: NAME, message: format!("gateway returned {status}: {message}") })
+    }
+
+    /// Stream one leg to its end. Deltas and tool-call deltas go to `forward` as they arrive (an
+    /// answer or continue leg); a summary leg forwards nothing. The gateway answers 200 and puts
+    /// a refusal in the stream — a job over the class's context, a lane the chain does not
+    /// certify — and silence would be the worst rendering of that. The worker sized the request
+    /// for us in the act of refusing it, so there is one retry at the ceiling it named, and only
+    /// when the numbers are there: a second refusal is a real answer.
+    async fn run_leg(&self, leg: Leg, forward: Option<&Sender<Result<StreamEvent>>>) -> Result<LegResult> {
+        use futures_util::StreamExt;
+        let Leg { messages, shape, response } = leg;
+        let fallback_prompt_tokens = prompt_tokens_upper_bound(&messages) + self.extra_prompt_tokens;
+        let mut response = response;
+        let mut retried = false;
+        loop {
+            let mut parser = SseParser::new(true);
+            let mut byte_stream = response.bytes_stream();
+            let mut text = String::new();
+            let mut refusal = None;
+            while let Some(chunk) = byte_stream.next().await {
+                let chunk = chunk.map_err(|e| Error::Engine { backend: NAME, message: format!("stream broke: {e}") })?;
+                for event in parser.push(&chunk) {
+                    if let StreamEvent::Delta(delta) = &event {
+                        text.push_str(delta);
+                    }
+                    if let Some(tx) = forward
+                        && tx.send(Ok(event)).await.is_err()
+                    {
+                        // The client hung up. Dropping the response cancels the request.
+                        return Err(Error::Cancelled);
+                    }
+                }
+                if let Some(message) = parser.take_error() {
+                    refusal = Some(message);
+                    break;
+                }
+            }
+            if let Some(message) = refusal {
+                if let (false, Some(room)) = (retried, ceiling_from_refusal(&message)) {
+                    retried = true;
+                    tracing::info!(ceiling = room, "retrying at the ceiling the worker named");
+                    response = self.send(&messages, room, &shape).await?;
+                    continue;
+                }
+                return Err(Error::Engine { backend: NAME, message });
+            }
+            let (usage, finish_reason, misaka) = parser.finish_parts(fallback_prompt_tokens);
+            return Ok(LegResult { text, usage, finish_reason, misaka });
+        }
+    }
 }
 
 /// **The ceiling the worker's own refusal implies.**
@@ -379,16 +959,6 @@ pub(crate) fn ceiling_from_refusal(message: &str) -> Option<u64> {
     let ctx = after("max_context_tokens ")?;
     // One token of slack: the template can add a marker the prompt count did not include.
     ctx.checked_sub(prompt + 1).filter(|room| *room > 0)
-}
-
-/// The claim id out of whatever of the stream has arrived, once the gateway's final event lands.
-fn claim_id_in(bytes: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(bytes);
-    let start = text.find("\"fp_claim_id\"")?;
-    let rest = &text[start + "\"fp_claim_id\"".len()..];
-    let open = rest.find('"')? + 1;
-    let end = rest[open..].find('"')? + open;
-    Some(rest[open..end].to_string())
 }
 
 #[cfg(test)]
@@ -414,17 +984,293 @@ mod tests {
     #[test]
     fn the_prompt_bound_does_not_undercount_japanese() {
         let jp = [ChatMessage::new("user", "東京の天気は")];
-        assert!(prompt_upper_bound(&jp) >= 6 + 8, "one token per kana or kanji, plus the template's markers");
+        assert!(prompt_tokens_upper_bound(&jp) >= 6 + 8, "one token per kana or kanji, plus the template's markers");
         let en = [ChatMessage::new("user", "weather in Tokyo")];
-        assert!(prompt_upper_bound(&en) >= 4, "ascii is cheaper, but never free");
+        assert!(prompt_tokens_upper_bound(&en) >= 4, "ascii is cheaper, but never free");
     }
 
+    /// The lane's body: the shape fields and the extension go through as sent, absent stays
+    /// absent, and no sampling knob is ever in it.
     #[test]
-    fn the_claim_id_is_read_out_of_the_gateways_last_event() {
-        let sse =
-            b"data: {\"choices\":[]}\n\ndata: {\"misaka\":{\"fp_job_id\":\"aa\",\"fp_claim_id\":\"d6730d8aca86\"},\"usage\":{}}\n\n";
-        assert_eq!(claim_id_in(sse).as_deref(), Some("d6730d8aca86"));
-        // Nothing to find yet is not an error: the id arrives in the last event, after every delta.
-        assert_eq!(claim_id_in(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"), None);
+    fn the_lane_body_forwards_the_shape_fields_and_the_misaka_extension() {
+        let messages = [ChatMessage::new("system", "be brief"), ChatMessage::new("user", "hi")];
+        let plain = lane_request_body(&messages, 200, &RequestShape::default());
+        assert_eq!(plain["model"], LANE_MODEL);
+        assert_eq!(plain["max_tokens"], 200);
+        assert_eq!(plain["stream"], true);
+        assert_eq!(plain["messages"][1]["content"], "hi");
+        for absent in ["tools", "tool_choice", "response_format", "misaka", "temperature", "seed", "top_p"] {
+            assert!(plain.get(absent).is_none(), "`{absent}` must not be in the body");
+        }
+
+        let shape = RequestShape {
+            tools: Some(json!([{"type":"function","function":{"name":"lookup"}}])),
+            tool_choice: Some(json!({"type":"function","function":{"name":"lookup"}})),
+            response_format: Some(json!({"type":"json_object"})),
+            misaka: Some(json!({"require_committed_format": false})),
+        };
+        let body = lane_request_body(&messages, 200, &shape);
+        assert_eq!(body["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(body["tool_choice"]["function"]["name"], "lookup");
+        assert_eq!(body["response_format"]["type"], "json_object");
+        assert_eq!(body["misaka"]["require_committed_format"], false);
+        assert!(shape.prompt_tokens() > 0, "tools and a schema cost prompt tokens the conversation does not get");
+    }
+
+    /// ADR-0096 Invariant 6's Studio half: the request is refused before any job is sent. The
+    /// gateway address here is unreachable on purpose — had anything been sent, the error would
+    /// name the connection, not the fence.
+    #[tokio::test]
+    async fn require_committed_format_is_refused_before_anything_is_sent() {
+        let backend = GatewayBackend::new("http://127.0.0.1:1".into(), None);
+        backend.set_facts_for_test(GatewayFacts { n_ctx: 512, ..Default::default() }).await;
+        let mut request = GenerationRequest::plain("c", vec![ChatMessage::new("user", "{}")], None, Default::default());
+        request.response_format = Some(json!({"type":"json_object"}));
+        request.misaka = Some(json!({"require_committed_format": true}));
+        match backend.generate(request).await {
+            Err(Error::BadRequest { message }) => {
+                assert!(message.contains("palw_fp_decode_constraint"), "the refusal names the fence: {message}");
+                assert!(message.contains("advisory"), "and says what is available instead: {message}");
+            }
+            Err(other) => panic!("refused for the wrong reason (was something sent?): {other}"),
+            Ok(_) => panic!("a dormant fence must refuse the committed mode"),
+        }
+        assert!(!requires_committed_format(Some(&json!({"require_committed_format": false}))));
+        assert!(!requires_committed_format(None));
+    }
+
+    /// The planner's first decision: a summary only when the trim dropped MORE than the threshold.
+    #[test]
+    fn the_planner_runs_a_summary_only_past_the_threshold() {
+        let planner = LegPlanner::new(LegLimits { summarize_after_turns: 4, continue_max_legs: 2 });
+        assert_eq!(planner.first(0), LegRole::Answer);
+        assert_eq!(planner.first(4), LegRole::Answer, "exactly the threshold is not past it");
+        assert_eq!(planner.first(5), LegRole::Summary);
+        let never = LegPlanner::new(LegLimits { summarize_after_turns: u32::MAX, continue_max_legs: 2 });
+        assert_eq!(never.first(1_000), LegRole::Answer);
+    }
+
+    /// The whole chain, driven by synthetic outcomes: summary → answer → continue → continue →
+    /// stop at the limit; and no continue at all when the answer stopped on its own, or when the
+    /// client already got what it asked for.
+    #[test]
+    fn the_planner_continues_on_length_up_to_the_limit_and_only_when_more_was_asked() {
+        let cut = |delivered: u64| LegOutcome {
+            finish_reason: "length".into(),
+            delivered_tokens: delivered,
+            requested_tokens: 2048,
+            failed: false,
+        };
+        let mut planner = LegPlanner::new(LegLimits { summarize_after_turns: 4, continue_max_legs: 2 });
+        let mut order = vec![planner.first(7)];
+        let mut role = order[0];
+        let mut delivered = 0;
+        while let Some(next) = planner.after(role, &if role == LegRole::Summary { cut(0) } else { cut(delivered) }) {
+            delivered += 256;
+            order.push(next);
+            role = next;
+        }
+        assert_eq!(order, vec![LegRole::Summary, LegRole::Answer, LegRole::Continue, LegRole::Continue], "then the limit");
+
+        let mut planner = LegPlanner::new(LegLimits::default());
+        let stopped = LegOutcome { finish_reason: "stop".into(), delivered_tokens: 40, requested_tokens: 2048, failed: false };
+        assert_eq!(planner.after(LegRole::Answer, &stopped), None, "an answer that ended is not continued");
+        let satisfied = LegOutcome { finish_reason: "length".into(), delivered_tokens: 100, requested_tokens: 100, failed: false };
+        assert_eq!(planner.after(LegRole::Answer, &satisfied), None, "the client asked for 100 and got 100");
+        let tool_calls =
+            LegOutcome { finish_reason: "tool_calls".into(), delivered_tokens: 30, requested_tokens: 2048, failed: false };
+        assert_eq!(planner.after(LegRole::Answer, &tool_calls), None, "a tool call is the app's turn now");
+        let mut none = LegPlanner::new(LegLimits { summarize_after_turns: 4, continue_max_legs: 0 });
+        assert_eq!(none.after(LegRole::Answer, &cut(256)), None, "zero legs is zero legs");
+    }
+
+    /// The guard: a summary that failed is followed by the answer regardless; a continue leg that
+    /// failed ends the chain with what was delivered, never with another leg.
+    #[test]
+    fn a_failed_summary_still_yields_the_answer_and_a_failed_continue_stops_the_chain() {
+        let mut planner = LegPlanner::new(LegLimits::default());
+        let failed = LegOutcome { finish_reason: String::new(), delivered_tokens: 0, requested_tokens: 2048, failed: true };
+        assert_eq!(planner.after(LegRole::Summary, &failed), Some(LegRole::Answer));
+        let cut = LegOutcome { finish_reason: "length".into(), delivered_tokens: 256, requested_tokens: 2048, failed: false };
+        assert_eq!(planner.after(LegRole::Answer, &cut), Some(LegRole::Continue));
+        let failed_cut = LegOutcome { failed: true, ..cut };
+        assert_eq!(planner.after(LegRole::Continue, &failed_cut), None);
+    }
+
+    fn turns(n: usize, len: usize) -> Vec<ChatMessage> {
+        let mut out = vec![ChatMessage::new("system", "日本語で答えてください。")];
+        for i in 0..n {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            out.push(ChatMessage::new(role, format!("{i}:{}", "あ".repeat(len))));
+        }
+        out
+    }
+
+    /// The trim plan: what fits is kept untouched; what does not is dropped oldest-first and the
+    /// dropped list is exactly the turns missing from `kept`; and past the threshold the reserve
+    /// makes room for the summary before anything is summarized.
+    #[test]
+    fn the_context_plan_names_what_was_dropped_and_reserves_room_for_a_summary() {
+        let limits = LegLimits { summarize_after_turns: 4, continue_max_legs: 2 };
+        let short = turns(2, 10);
+        let plan = plan_context(&short, Some(512), 2048, 0, limits);
+        assert_eq!(plan.kept, short, "a conversation that fits is left alone");
+        assert!(plan.dropped.is_empty());
+        assert_eq!(plan.prompt_budget, 512 - 24 - 256);
+
+        let long = turns(9, 60);
+        let plan = plan_context(&long, Some(512), 2048, 0, limits);
+        assert!(plan.dropped.len() > 4, "nine turns of 60 kana cannot fit a 232-token budget: {}", plan.dropped.len());
+        assert_eq!(plan.kept[0].role, "system");
+        assert_eq!(plan.kept.last(), long.last(), "the question survives");
+        let kept_turns: Vec<_> = plan.kept.iter().filter(|m| m.role != "system").collect();
+        let expected_dropped: Vec<_> = long.iter().filter(|m| m.role != "system").take(plan.dropped.len()).cloned().collect();
+        assert_eq!(plan.dropped, expected_dropped, "dropped is the oldest turns, in order");
+        assert_eq!(kept_turns.len() + plan.dropped.len(), 9);
+        // On the 512 class the reserve leaves 32 prompt tokens, and the question alone is 69: the
+        // trim keeps the question regardless (the ceiling shrinks to fit, later), so what is kept
+        // is the irreducible minimum — the system turns and the question — and nothing else.
+        assert_eq!(kept_turns.len(), 1, "the reserve is spent down to the question itself: {:?}", plan.kept);
+        assert!(prompt_tokens_upper_bound(&plan.kept) > plan.prompt_budget - SUMMARY_RESERVE_TOKENS);
+
+        // On a wider row the reserve is a real inequality: history is kept up to it and no further,
+        // so the summary turn will fit beside what was kept without dropping anything more.
+        let wide = turns(20, 40);
+        let plan = plan_context(&wide, Some(1024), 2048, 0, limits);
+        let kept_turns = plan.kept.iter().filter(|m| m.role != "system").count();
+        assert!(plan.dropped.len() > 4 && kept_turns > 1, "dropped {} kept {kept_turns}", plan.dropped.len());
+        let reserved = plan.prompt_budget - SUMMARY_RESERVE_TOKENS;
+        assert!(prompt_tokens_upper_bound(&plan.kept) <= reserved, "the summary's room is reserved");
+        let (without_reserve, dropped_without) = fit_messages_to_budget(&wide, plan.prompt_budget);
+        assert!(without_reserve.len() > plan.kept.len() && dropped_without < plan.dropped.len(), "the reserve cost history");
+
+        // Unknown context: nothing is trimmed, and the plan says the budget is unbounded.
+        let plan = plan_context(&long, None, 2048, 0, limits);
+        assert_eq!(plan.kept, long);
+        assert_eq!(plan.prompt_budget, u64::MAX);
+    }
+
+    /// The summary job: the instruction, then the dropped turns as `role: content` lines in one
+    /// user turn — the newest of them first to be admitted, in chronological order once they are
+    /// — and `None` rather than a prompt the worker would refuse.
+    #[test]
+    fn summary_job_messages_hold_the_dropped_turns_that_fit_newest_first() {
+        let dropped: Vec<ChatMessage> = turns(6, 30).into_iter().filter(|m| m.role != "system").collect();
+        let (messages, covered) = summary_job_messages(&dropped, 512 - 24 - SUMMARY_TOKENS).expect("they fit");
+        assert_eq!(covered, 6);
+        assert_eq!(messages[0], ChatMessage::new("system", SUMMARY_INSTRUCTION));
+        let body = &messages[1].content;
+        assert!(body.starts_with("user: 0:"), "chronological order: {body}");
+        assert!(body.contains("\nassistant: 5:"), "{body}");
+
+        let (messages, covered) = summary_job_messages(&dropped, 120).expect("some fit");
+        assert!(covered < 6 && covered > 0, "covered {covered}");
+        assert!(messages[1].content.contains("assistant: 5:"), "the newest dropped turn is the first admitted");
+        assert!(!messages[1].content.contains("user: 0:"), "the oldest is what goes");
+        assert!(prompt_tokens_upper_bound(&messages) <= 120);
+
+        assert_eq!(summary_job_messages(&dropped, 10), None, "not even one turn fits: no job");
+        assert_eq!(summary_job_messages(&[], 1000), None, "nothing to summarize");
+    }
+
+    /// The summary rides as a system turn AFTER the original system prompt, and the result is
+    /// fitted again so an overlong summary costs history rather than the request.
+    #[test]
+    fn the_summary_rides_as_a_system_turn_after_the_original_system_prompt() {
+        let kept = vec![ChatMessage::new("system", "be brief"), ChatMessage::new("user", "and now?")];
+        let (messages, dropped) = with_summary(&kept, "Alice asked for a plan; Bob chose option 2.", 1000);
+        assert_eq!(dropped, 0);
+        assert_eq!(messages[0].content, "be brief");
+        assert_eq!(messages[1].role, "system");
+        assert_eq!(messages[1].content, format!("{SUMMARY_PREFIX}Alice asked for a plan; Bob chose option 2."));
+        assert_eq!(messages[2].content, "and now?");
+
+        let kept = turns(4, 20);
+        let (messages, dropped) = with_summary(&kept, &"あ".repeat(100), 160);
+        assert!(dropped > 0, "an overlong summary costs history");
+        assert!(messages.iter().any(|m| m.content.starts_with(SUMMARY_PREFIX)), "and the summary itself survives");
+    }
+
+    /// A continue leg carries the answer so far as the assistant's turn and the instruction as
+    /// the user's — and is refused when the answer cannot be shown to the model that must go on.
+    #[test]
+    fn a_continue_leg_carries_the_answer_so_far_and_the_instruction() {
+        let context = vec![ChatMessage::new("system", "be brief"), ChatMessage::new("user", "explain")];
+        let messages = continue_leg_messages(&context, "First, the", 1000).expect("fits");
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[2], ChatMessage::new("assistant", "First, the"));
+        assert_eq!(messages[3], ChatMessage::new("user", CONTINUE_INSTRUCTION));
+
+        let long_context = turns(6, 30);
+        let messages = continue_leg_messages(&long_context, "First, the", 150).expect("history gives way");
+        assert!(messages.len() < long_context.len() + 2, "older turns were dropped for the answer");
+        assert_eq!(messages[messages.len() - 2].content, "First, the");
+
+        assert_eq!(continue_leg_messages(&context, &"あ".repeat(400), 200), None, "the answer so far itself does not fit");
+    }
+
+    /// The ceiling rule: an ask that fits is honoured; one that does not is sized like an answer;
+    /// no room at all is a refusal that names the numbers; no context is no rule.
+    #[test]
+    fn the_answer_ceiling_fits_the_class_and_names_a_full_context() {
+        assert_eq!(answer_ceiling(50, Some(512), 100).expect("fits"), 100);
+        assert_eq!(answer_ceiling(50, Some(512), 2048).expect("sized"), DEFAULT_ANSWER_TOKENS);
+        assert_eq!(answer_ceiling(400, Some(512), 2048).expect("sized"), 512 - 424);
+        assert_eq!(answer_ceiling(50, None, 2048).expect("no rule"), 2048);
+        match answer_ceiling(500, Some(512), 10) {
+            Err(Error::BadRequest { message }) => assert!(message.contains("512") && message.contains("524"), "{message}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// The notice prints what was asked beside what ran, and names the knobs that have no rule.
+    #[test]
+    fn the_sampling_notice_prints_what_was_asked_beside_what_ran() {
+        let params = SamplingCommitment { temperature: 0.7, seed: Some(7), ..Default::default() };
+        let notice = sampling_notice(&params, "testnet-11");
+        assert_eq!(notice["requested"]["temperature"], 0.7);
+        assert_eq!(notice["requested"]["seed"], 7);
+        assert_eq!(notice["applied"]["temperature"], 0);
+        assert_eq!(notice["applied"]["seed"], GREEDY_SEED_HEX);
+        assert_eq!(notice["reason"], "palw_fp_decode_rules is not armed on testnet-11; the lane replays a greedy decode");
+        assert_eq!(notice["not_a_rule_on_this_lane"], json!(["top_p", "top_k", "min_p", "repeat_penalty"]));
+    }
+
+    /// Identity values ask for nothing; everything else is named with its value, and the refusal
+    /// under `refuse` says the way back.
+    #[test]
+    fn sampling_divergence_names_every_knob_off_identity_and_the_refusal_names_the_way_back() {
+        let greedy =
+            SamplingCommitment { temperature: 0.0, top_p: 1.0, top_k: 0, min_p: 0.0, repeat_penalty: 1.0, seed: None, max_tokens: 64 };
+        assert!(sampling_divergence(&greedy).is_empty());
+        let names: Vec<&str> = sampling_divergence(&SamplingCommitment::default()).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["temperature", "top_p", "top_k", "min_p", "repeat_penalty"], "the Studio's defaults are not greedy");
+        let with_seed = SamplingCommitment { seed: Some(3), ..greedy };
+        assert_eq!(sampling_divergence(&with_seed), vec![("seed", json!(3))]);
+
+        let refusal = sampling_refusal(&sampling_divergence(&with_seed), "devnet");
+        assert!(refusal.contains("seed=3") && refusal.contains("devnet") && refusal.contains("greedy_with_notice"), "{refusal}");
+    }
+
+    /// `misaka.jobs[]` entries carry the ids the leg's gateway object had, or nulls and an error.
+    #[test]
+    fn job_entries_carry_the_ids_and_a_failed_leg_says_why() {
+        let leg = LegResult {
+            text: "…".into(),
+            usage: Usage { prompt_tokens: 51, completion_tokens: 160, total_tokens: 211 },
+            finish_reason: "stop".into(),
+            misaka: Some(json!({"fp_job_id": "aa", "fp_claim_id": "bb", "committed": true})),
+        };
+        let entry = job_entry(LegRole::Summary, &leg);
+        assert_eq!(entry, json!({"fp_job_id":"aa","fp_claim_id":"bb","role":"summary","prompt_tokens":51,"decode_tokens":160}));
+        let failed = job_error(LegRole::Continue, "connection refused".into());
+        assert_eq!(failed["role"], "continue");
+        assert_eq!(failed["fp_claim_id"], Value::Null);
+        assert_eq!(failed["error"], "connection refused");
+
+        let misaka = finalize_lane_misaka(Some(json!({"fp_claim_id": "bb"})), vec![entry, failed], json!({"n_ctx": 512}));
+        assert_eq!(misaka["fp_claim_id"], "bb", "the answer leg's object stays the top-level one");
+        assert_eq!(misaka["jobs"].as_array().map(Vec::len), Some(2));
+        assert_eq!(misaka["context"]["n_ctx"], 512);
     }
 }

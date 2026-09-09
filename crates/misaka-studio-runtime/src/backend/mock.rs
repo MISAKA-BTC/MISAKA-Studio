@@ -124,6 +124,7 @@ impl InferenceBackend for MockBackend {
                             .send(Ok(StreamEvent::Done {
                                 usage: Usage { prompt_tokens, completion_tokens: limit, total_tokens: prompt_tokens + limit },
                                 finish_reason: "length".into(),
+                                misaka: None,
                             }))
                             .await;
                         return;
@@ -139,6 +140,7 @@ impl InferenceBackend for MockBackend {
                     .send(Ok(StreamEvent::Done {
                         usage: Usage { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens },
                         finish_reason: "stop".into(),
+                        misaka: None,
                     }))
                     .await;
             });
@@ -170,13 +172,7 @@ mod tests {
     use misaka_studio_core::provenance::SamplingCommitment;
 
     fn request(text: &str) -> GenerationRequest {
-        GenerationRequest {
-            model: "mock".into(),
-            messages: vec![ChatMessage::new("user", text)],
-            prompt: None,
-            params: SamplingCommitment::default(),
-            stop: Vec::new(),
-        }
+        GenerationRequest::plain("mock", vec![ChatMessage::new("user", text)], None, SamplingCommitment::default())
     }
 
     async fn collect(backend: &MockBackend, req: GenerationRequest) -> (String, Usage) {
@@ -187,6 +183,7 @@ mod tests {
             match event.expect("no error") {
                 StreamEvent::Delta(d) => text.push_str(&d),
                 StreamEvent::Done { usage: u, .. } => usage = u,
+                StreamEvent::ToolCallDelta(_) => panic!("the mock never calls a tool"),
             }
         }
         (text, usage)
@@ -224,6 +221,7 @@ mod tests {
             match event.expect("no error") {
                 StreamEvent::Delta(_) => deltas += 1,
                 StreamEvent::Done { finish_reason, .. } => reason = finish_reason,
+                StreamEvent::ToolCallDelta(_) => panic!("the mock never calls a tool"),
             }
         }
         assert_eq!(deltas, 3);

@@ -25,6 +25,7 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use misaka_studio_core::provenance::{RuntimeDescriptor, SamplingCommitment};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -37,16 +38,130 @@ pub mod openai_child;
 pub(crate) use openai_child::SseParser;
 
 /// One turn in a conversation.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// **The content is one string, whatever shape it arrived in.** Every current OpenAI SDK sends
+/// `content` as a list of `{type:"text"}` parts by default — the multimodal-shaped form — and a
+/// message type that only read the string form failed a stock client on its first request
+/// (ADR-0096 §1.1). So the wire form is [`RawChatMessage`], which accepts both and flattens the
+/// parts (joined by `\n`), and this type is what every engine gets: a plain string, which is what
+/// a chat template renders and what the record commits to. A part that is not text (`image_url`,
+/// `input_audio`, `file`) is refused by name — this surface serves text, and dropping the image
+/// silently would send the model a question about a picture it never saw.
+///
+/// `name`, `tool_calls` and `tool_call_id` are OpenAI's tool-round-trip fields (ADR-0096 Decision
+/// 2: a tool call is a turn of text; the round-trip is the app's). They are kept as the SDK sent
+/// them and serialized only when present, so an engine that has never heard of them sees the
+/// same `{role, content}` it always did.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ChatMessage {
     pub role: String,
     #[serde(default)]
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// OpenAI's `tool_calls` on an assistant turn, in OpenAI's own shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Value>,
+    /// Which call a `tool` turn answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
     pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
-        ChatMessage { role: role.into(), content: content.into() }
+        ChatMessage { role: role.into(), content: content.into(), name: None, tool_calls: None, tool_call_id: None }
+    }
+}
+
+impl<'de> Deserialize<'de> for ChatMessage {
+    /// Accepts the wire form and flattens it. A refusal here cannot name the message's position
+    /// in `messages[]` — serde hands an element no index — so the request parser converts
+    /// [`RawChatMessage`]s itself, with the index; this impl is for every other reader.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        RawChatMessage::deserialize(deserializer)?.into_message(None).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A message as an OpenAI-shaped client sends it — `content` a string, a list of parts, or
+/// `null` (an assistant turn that only carried `tool_calls`).
+#[derive(Debug, Deserialize)]
+pub struct RawChatMessage {
+    pub role: String,
+    #[serde(default)]
+    pub content: Option<RawContent>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Value>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+}
+
+/// `content`, in both shapes the SDKs produce.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum RawContent {
+    Text(String),
+    Parts(Vec<Value>),
+}
+
+impl RawChatMessage {
+    /// Flatten into a [`ChatMessage`]. `index` is the message's position in `messages[]`, when
+    /// the caller knows it, so a refusal names the part a person can go and look at.
+    pub fn into_message(self, index: Option<usize>) -> std::result::Result<ChatMessage, String> {
+        let content = match self.content {
+            None => String::new(),
+            Some(RawContent::Text(text)) => text,
+            Some(RawContent::Parts(parts)) => flatten_content_parts(&parts, index)?,
+        };
+        Ok(ChatMessage { role: self.role, content, name: self.name, tool_calls: self.tool_calls, tool_call_id: self.tool_call_id })
+    }
+}
+
+/// The parts of a `content` list, joined by `\n` — or the name of the first part that is not
+/// text, with its index, because a refusal that says "unsupported content" sends a person
+/// reading a 40-line request body to guess.
+pub fn flatten_content_parts(parts: &[Value], message_index: Option<usize>) -> std::result::Result<String, String> {
+    let at = |j: usize| match message_index {
+        Some(i) => format!("messages[{i}].content[{j}]"),
+        None => format!("content[{j}]"),
+    };
+    let mut texts = Vec::with_capacity(parts.len());
+    for (j, part) in parts.iter().enumerate() {
+        let Some(kind) = part.get("type").and_then(Value::as_str) else {
+            return Err(format!("{}: a content part must be an object with a `type`; got {part}", at(j)));
+        };
+        if kind != "text" {
+            return Err(format!(
+                "{}: a `{kind}` part is not text — this surface serves text only (ADR-0096 Decision 1). \
+                 Send the text as a string, or as {{\"type\":\"text\"}} parts.",
+                at(j)
+            ));
+        }
+        match part.get("text").and_then(Value::as_str) {
+            Some(text) => texts.push(text),
+            None => return Err(format!("{}: a text part carries its text under `text`; got {part}", at(j))),
+        }
+    }
+    Ok(texts.join("\n"))
+}
+
+/// **How far one request may be split into lane jobs** (ADR-0096 Decision 5).
+///
+/// Carried on the request rather than read from settings by the backend: the gateway backend is
+/// built once from the settings it copies at construction, and a limit that lived only there
+/// would be the 2026-09-05 bug again — a setting changed in the file and not in the engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LegLimits {
+    /// A trim that drops more turns than this runs a summary job first.
+    pub summarize_after_turns: u32,
+    /// Follow-up jobs allowed after a `length` finish that delivered less than was asked.
+    pub continue_max_legs: u32,
+}
+
+impl Default for LegLimits {
+    fn default() -> Self {
+        LegLimits { summarize_after_turns: 4, continue_max_legs: 2 }
     }
 }
 
@@ -61,6 +176,37 @@ pub struct GenerationRequest {
     pub prompt: Option<String>,
     pub params: SamplingCommitment,
     pub stop: Vec<String>,
+    /// OpenAI's `tools`, as sent. Forwarded to engines that implement them (llama-server renders
+    /// them into the template; the gateway renders them as the model's own `<tools>` text).
+    pub tools: Option<Value>,
+    pub tool_choice: Option<Value>,
+    /// OpenAI's `response_format`, as sent — shape-checked by the API layer, enforced (or
+    /// rendered as advice, and said so) by the engine.
+    pub response_format: Option<Value>,
+    /// The request's `misaka` extension object (`{require_committed_format?: bool}`), for the
+    /// gateway backend. Other engines have nothing to commit and refuse a request that requires it.
+    pub misaka: Option<Value>,
+    /// How far this request may be split into lane jobs.
+    pub legs: LegLimits,
+}
+
+impl GenerationRequest {
+    /// A plain request: messages or a prompt, the sampling, and nothing of the tool or format
+    /// surface. What every backend test and the raw-completion path start from.
+    pub fn plain(model: impl Into<String>, messages: Vec<ChatMessage>, prompt: Option<String>, params: SamplingCommitment) -> Self {
+        GenerationRequest {
+            model: model.into(),
+            messages,
+            prompt,
+            params,
+            stop: Vec::new(),
+            tools: None,
+            tool_choice: None,
+            response_format: None,
+            misaka: None,
+            legs: LegLimits::default(),
+        }
+    }
 }
 
 /// Token accounting, in OpenAI's shape.
@@ -80,8 +226,41 @@ pub struct Usage {
 pub enum StreamEvent {
     /// A chunk of generated text.
     Delta(String),
+    /// One entry of OpenAI's streamed `delta.tool_calls[]`, as the engine sent it: `{index, id?,
+    /// type?, function: {name?, arguments}}`, where later entries with the same `index` carry
+    /// more of `arguments`. llama-server streams these; the gateway sends the parsed calls whole
+    /// in its final event. The API layer assembles them by index.
+    ToolCallDelta(Value),
     /// Generation finished normally.
-    Done { usage: Usage, finish_reason: String },
+    ///
+    /// `misaka` is the answer's extension object — the gateway's (job, claim, roots, `jobs[]`,
+    /// `context`, `format`) merged with the Studio's own notices (`sampling`, `ignored_fields`);
+    /// see [`merge_misaka`] for who wins. `None` from an engine that has nothing to say.
+    Done { usage: Usage, finish_reason: String, misaka: Option<Value> },
+}
+
+/// **One `misaka` object out of two, and the gateway's word wins.**
+///
+/// The Studio adds what it knows — that it dropped a temperature, that it ignored `store` — and
+/// the gateway adds what it did. Where both name the same key the gateway is describing what
+/// RAN, and the app's notice is describing what it asked for, so the gateway's value is the one
+/// that must survive: a notice that overwrote the lane's own report would be the app lying about
+/// the chain. Objects merge key by key (so `sampling.requested` from the app and
+/// `sampling.enforced` from the gateway both live); anything else is replaced whole.
+pub fn merge_misaka(base: &mut Value, over: &Value) {
+    match (base, over) {
+        (Value::Object(base), Value::Object(over)) => {
+            for (key, value) in over {
+                match base.get_mut(key) {
+                    Some(existing) => merge_misaka(existing, value),
+                    None => {
+                        base.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (base, over) => *base = over.clone(),
+    }
 }
 
 /// What to load.
@@ -257,17 +436,25 @@ pub fn context_limit_from_refusal(message: &str) -> Option<u64> {
 ///
 /// One token per non-ASCII character (CJK sits at roughly one, sometimes more), a quarter of the
 /// ASCII, plus the chat template's markers per message. The tokenizer that would answer exactly
-/// lives with the engine, so this is the number an app can compute before it asks.
+/// lives with the engine, so this is the number an app can compute before it asks. A turn's
+/// `tool_calls` are rendered into the prompt as text by every template that knows them, so their
+/// JSON counts too — a call with a long `arguments` string is not free.
 pub fn prompt_tokens_upper_bound(messages: &[ChatMessage]) -> u64 {
     const PER_MESSAGE_MARKERS: u64 = 8;
     messages
         .iter()
         .map(|m| {
-            let ascii = m.content.chars().filter(char::is_ascii).count() as u64;
-            let other = m.content.chars().count() as u64 - ascii;
-            ascii.div_ceil(4) + other + PER_MESSAGE_MARKERS
+            let calls = m.tool_calls.as_ref().map(|c| c.to_string()).unwrap_or_default();
+            text_tokens_upper_bound(&m.content) + text_tokens_upper_bound(&calls) + PER_MESSAGE_MARKERS
         })
         .sum()
+}
+
+/// The same bound for one piece of text, without a message's markers.
+pub fn text_tokens_upper_bound(text: &str) -> u64 {
+    let ascii = text.chars().filter(char::is_ascii).count() as u64;
+    let other = text.chars().count() as u64 - ascii;
+    ascii.div_ceil(4) + other
 }
 
 pub fn approximate_tokens(text: &str) -> u64 {
@@ -294,11 +481,102 @@ mod tests {
 }
 
 #[cfg(test)]
+mod wire_shape_tests {
+    use super::*;
+
+    /// The multimodal-shaped default every current SDK sends: parts, flattened, one string.
+    #[test]
+    fn content_parts_flatten_to_one_string_joined_by_newlines() {
+        let m: ChatMessage =
+            serde_json::from_str(r#"{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}"#)
+                .expect("parses");
+        assert_eq!(m.content, "a\nb");
+        let plain: ChatMessage = serde_json::from_str(r#"{"role":"user","content":"hi"}"#).expect("parses");
+        assert_eq!(plain.content, "hi");
+    }
+
+    /// A picture the model will never see must not become a question about a picture. Refused,
+    /// and the refusal says which part — by index — and which kind.
+    #[test]
+    fn a_non_text_part_is_refused_by_name_with_its_index() {
+        let raw: RawChatMessage = serde_json::from_str(
+            r#"{"role":"user","content":[{"type":"text","text":"what is this"},{"type":"image_url","image_url":{"url":"data:..."}}]}"#,
+        )
+        .expect("the wire form parses");
+        let err = raw.into_message(Some(3)).expect_err("refused");
+        assert!(err.starts_with("messages[3].content[1]"), "{err}");
+        assert!(err.contains("`image_url`"), "{err}");
+        assert!(err.contains("text only"), "{err}");
+
+        let err = serde_json::from_str::<ChatMessage>(r#"{"role":"user","content":[{"type":"input_audio"}]}"#)
+            .expect_err("refused through serde too");
+        assert!(err.to_string().contains("content[0]") && err.to_string().contains("`input_audio`"), "{err}");
+    }
+
+    /// An assistant turn that only called a tool has `content: null`; that is an empty string
+    /// here, and the calls ride along.
+    #[test]
+    fn null_content_is_empty_text_and_the_tool_fields_ride_along() {
+        let m: ChatMessage = serde_json::from_str(
+            r#"{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{}"}}]}"#,
+        )
+        .expect("parses");
+        assert_eq!(m.content, "");
+        assert_eq!(m.tool_calls.as_ref().and_then(|c| c[0]["id"].as_str()), Some("call_1"));
+        let t: ChatMessage = serde_json::from_str(r#"{"role":"tool","tool_call_id":"call_1","content":"42"}"#).expect("parses");
+        assert_eq!(t.tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    /// What an engine receives: `content` as a plain string, and the optional fields only when
+    /// they were there — an engine that predates them must see the message it always saw.
+    #[test]
+    fn a_message_serializes_its_content_as_a_plain_string_and_optionals_only_when_present() {
+        let plain = serde_json::to_value(ChatMessage::new("user", "hi")).expect("json");
+        assert_eq!(plain, serde_json::json!({"role":"user","content":"hi"}));
+        let tool = ChatMessage { tool_call_id: Some("c1".into()), ..ChatMessage::new("tool", "42") };
+        let v = serde_json::to_value(tool).expect("json");
+        assert_eq!(v["tool_call_id"], "c1");
+        assert!(v.get("name").is_none() && v.get("tool_calls").is_none());
+    }
+
+    /// The merge rule: the app's notice and the gateway's report become one object, objects
+    /// merge key by key, and where they collide the gateway is describing what ran.
+    #[test]
+    fn merge_misaka_lets_the_gateway_win_on_conflict_and_keeps_the_rest() {
+        let mut base = serde_json::json!({
+            "ignored_fields": ["store"],
+            "sampling": { "requested": { "temperature": 0.7 }, "reason": "the app's sentence" }
+        });
+        let gateway = serde_json::json!({
+            "fp_claim_id": "d673",
+            "sampling": { "reason": "the gateway's sentence", "enforced": "greedy" },
+            "ignored_fields": ["user"]
+        });
+        merge_misaka(&mut base, &gateway);
+        assert_eq!(base["fp_claim_id"], "d673", "the gateway's keys arrive");
+        assert_eq!(base["sampling"]["requested"]["temperature"], 0.7, "the app's nested keys survive");
+        assert_eq!(base["sampling"]["enforced"], "greedy");
+        assert_eq!(base["sampling"]["reason"], "the gateway's sentence", "on conflict the gateway wins");
+        assert_eq!(base["ignored_fields"], serde_json::json!(["user"]), "a non-object is replaced whole");
+    }
+
+    #[test]
+    fn tool_calls_count_toward_the_prompt_estimate() {
+        let plain = [ChatMessage::new("assistant", "")];
+        let with_call = [ChatMessage {
+            tool_calls: Some(serde_json::json!([{"id":"c","function":{"name":"lookup","arguments":"{\"city\":\"Tokyo\"}"}}])),
+            ..ChatMessage::new("assistant", "")
+        }];
+        assert!(prompt_tokens_upper_bound(&with_call) > prompt_tokens_upper_bound(&plain));
+    }
+}
+
+#[cfg(test)]
 mod context_fit_tests {
     use super::*;
 
     fn msg(role: &str, content: &str) -> ChatMessage {
-        ChatMessage { role: role.into(), content: content.into() }
+        ChatMessage::new(role, content)
     }
 
     /// Both engines say it, and both had to be readable — the second shape is the one a person

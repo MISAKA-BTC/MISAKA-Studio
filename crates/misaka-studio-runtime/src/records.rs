@@ -39,6 +39,13 @@ pub struct StoredRecord {
     /// The model this ran on, by Studio id — the human-readable half of `h_M`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    /// The answer's `misaka` object, when the run had one (ADR-0096 Decision 12's record half):
+    /// the lane's `jobs[]` — every claim one request drove — its `context`, `format` and
+    /// `sampling` notices, the claim id. What makes the everyday pipeline (task → shape → store →
+    /// use) leave a record a person can `jq`. Absent, not null, for an engine that had nothing to
+    /// say, so an older reader sees the record it always saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub misaka: Option<serde_json::Value>,
 }
 
 /// Append-only record log with an in-memory tail.
@@ -184,6 +191,7 @@ mod tests {
             prompt: None,
             completion: None,
             model_id: Some("m".into()),
+            misaka: None,
         }
     }
 
@@ -238,6 +246,31 @@ mod tests {
 
         let reopened = RecordStore::open(path, 100, true).await;
         assert_eq!(reopened.list(10).await.len(), 1);
+    }
+
+    /// The lane's report rides the record whole and survives a reopen; a run without one writes
+    /// no key at all, so a line from before ADR-0096 and a line from after read the same way.
+    #[tokio::test]
+    async fn the_misaka_object_is_kept_on_the_record_and_absent_when_there_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("records.jsonl");
+        let store = RecordStore::open(path.clone(), 100, true).await;
+        let mut lane = record("lane");
+        lane.misaka = Some(serde_json::json!({
+            "fp_claim_id": "d6730d8aca86",
+            "jobs": [{"fp_job_id": "aa", "fp_claim_id": "d6730d8aca86", "role": "answer", "prompt_tokens": 51, "decode_tokens": 256}],
+            "sampling": {"applied": {"temperature": 0}}
+        }));
+        store.append(lane).await;
+        store.append(record("local")).await;
+
+        let reopened = RecordStore::open(path.clone(), 100, true).await;
+        let lane = reopened.get("lane").await.expect("kept");
+        assert_eq!(lane.misaka.as_ref().and_then(|m| m["jobs"][0]["role"].as_str()), Some("answer"));
+        assert_eq!(reopened.get("local").await.expect("kept").misaka, None);
+        let text = tokio::fs::read_to_string(&path).await.expect("read");
+        let local_line = text.lines().find(|l| l.contains("\"local\"")).expect("the local record's line");
+        assert!(!local_line.contains("\"misaka\""), "absent, not null: {local_line}");
     }
 
     /// The privacy default, asserted: a record on disk carries hashes, not the conversation.

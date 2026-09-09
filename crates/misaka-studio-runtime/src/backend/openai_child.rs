@@ -344,7 +344,14 @@ fn free_port() -> Result<u16> {
     Ok(port)
 }
 
-fn request_body(request: &GenerationRequest, chat: bool) -> serde_json::Value {
+/// The engine's request.
+///
+/// `tools`, `tool_choice` and `response_format` go through only when the client sent them
+/// (ADR-0096 Decisions 2 and 3): llama-server implements all three — it renders the tools into
+/// the template and compiles a `json_schema` to a grammar — and `mlx_lm.server` ignores what it
+/// does not know. A key sent as `null` would be a different request from one not sent, so absent
+/// stays absent.
+pub(crate) fn request_body(request: &GenerationRequest, chat: bool) -> serde_json::Value {
     let p = &request.params;
     let mut body = serde_json::json!({
         "model": request.model,
@@ -365,8 +372,16 @@ fn request_body(request: &GenerationRequest, chat: bool) -> serde_json::Value {
     }
     if chat {
         body["messages"] = serde_json::json!(request.messages);
+        for (key, value) in [("tools", &request.tools), ("tool_choice", &request.tool_choice)] {
+            if let Some(value) = value {
+                body[key] = value.clone();
+            }
+        }
     } else {
         body["prompt"] = serde_json::json!(request.prompt.clone().unwrap_or_default());
+    }
+    if let Some(format) = &request.response_format {
+        body["response_format"] = format.clone();
     }
     body
 }
@@ -441,11 +456,18 @@ pub(crate) struct SseParser {
     /// at 0.0 tok/s: the one failure that looks like nothing happening. Measured on a chat whose
     /// second turn exceeded the class's context.
     error: Option<String>,
+    /// The `misaka` extension object, from whichever event carried one last.
+    ///
+    /// The gateway's final event is `{"misaka": {...}, "usage": {...}}` with no `choices` at
+    /// all — the job and claim ids, the roots, whether the answer became a claim. It used to be
+    /// scraped out of the raw bytes for a log line; it is the part of the answer a person can
+    /// follow to the chain, so it rides the `Done` event whole.
+    misaka: Option<serde_json::Value>,
 }
 
 impl SseParser {
     pub(crate) fn new(chat: bool) -> Self {
-        SseParser { buffer: Vec::new(), chat, text_len: 0, usage: None, finish_reason: None, error: None }
+        SseParser { buffer: Vec::new(), chat, text_len: 0, usage: None, finish_reason: None, error: None, misaka: None }
     }
 
     pub(crate) fn push(&mut self, bytes: &[u8]) -> Vec<StreamEvent> {
@@ -477,10 +499,28 @@ impl SseParser {
                     total_tokens: usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                 });
             }
+            if let Some(misaka) = json.get("misaka").filter(|m| m.is_object()) {
+                self.misaka = Some(misaka.clone());
+            }
+            // Parsed tool calls beside `misaka` in a final event that has no `choices` — the
+            // whole-call form, one event per call.
+            if let Some(calls) = json.get("tool_calls").and_then(|c| c.as_array()) {
+                events.extend(calls.iter().cloned().map(StreamEvent::ToolCallDelta));
+            }
 
             let Some(choice) = json.get("choices").and_then(|c| c.get(0)) else { continue };
             if let Some(reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
                 self.finish_reason = Some(reason.to_string());
+            }
+            if self.chat {
+                // `delta.tool_calls` is the streamed form (llama-server); `message.tool_calls` is
+                // a server that put the whole message in one event. Either way each entry is
+                // handed on as it came, and the API layer assembles by `index`.
+                for holder in ["delta", "message"] {
+                    if let Some(calls) = choice.get(holder).and_then(|d| d.get("tool_calls")).and_then(|c| c.as_array()) {
+                        events.extend(calls.iter().cloned().map(StreamEvent::ToolCallDelta));
+                    }
+                }
             }
             let text = if self.chat {
                 choice.get("delta").and_then(|d| d.get("content")).and_then(|v| v.as_str())
@@ -504,6 +544,12 @@ impl SseParser {
     }
 
     pub(crate) fn finish(self, fallback_prompt_tokens: u64) -> StreamEvent {
+        let (usage, finish_reason, misaka) = self.finish_parts(fallback_prompt_tokens);
+        StreamEvent::Done { usage, finish_reason, misaka }
+    }
+
+    /// The same, as parts — for a caller that folds several streams into one `Done`.
+    pub(crate) fn finish_parts(self, fallback_prompt_tokens: u64) -> (Usage, String, Option<serde_json::Value>) {
         let usage = self.usage.unwrap_or_else(|| {
             let completion = self.text_len.div_ceil(4);
             Usage {
@@ -512,7 +558,7 @@ impl SseParser {
                 total_tokens: fallback_prompt_tokens + completion,
             }
         });
-        StreamEvent::Done { usage, finish_reason: self.finish_reason.unwrap_or_else(|| "stop".into()) }
+        (usage, self.finish_reason.unwrap_or_else(|| "stop".into()), self.misaka)
     }
 }
 
@@ -569,11 +615,63 @@ mod tests {
         parser.push(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18}}\n");
         parser.push(b"data: [DONE]\n");
         match parser.finish(999) {
-            StreamEvent::Done { usage, finish_reason } => {
+            StreamEvent::Done { usage, finish_reason, misaka } => {
                 assert_eq!(usage.prompt_tokens, 11);
                 assert_eq!(usage.completion_tokens, 7);
                 assert_eq!(finish_reason, "stop");
+                assert_eq!(misaka, None, "an engine that said nothing has nothing to report");
             }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    /// The gateway's last event: `misaka` and `usage`, no `choices`. Written against the bytes
+    /// the live gateway sends (`sink.event(json!({ "misaka": …, "usage": … }))`), because a
+    /// parser written against an imagined shape is the old byte-scraper with more steps.
+    #[test]
+    fn the_misaka_object_rides_the_done_event() {
+        let mut parser = SseParser::new(true);
+        parser.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n");
+        parser.push(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n");
+        parser.push(
+            b"data: {\"misaka\":{\"fp_job_id\":\"aa\",\"fp_claim_id\":\"d6730d8aca86\",\"committed\":true},\
+              \"usage\":{\"prompt_tokens\":51,\"completion_tokens\":256,\"total_tokens\":307}}\n",
+        );
+        parser.push(b"data: [DONE]\n");
+        match parser.finish(0) {
+            StreamEvent::Done { usage, finish_reason, misaka } => {
+                let misaka = misaka.expect("the extension object");
+                assert_eq!(misaka["fp_claim_id"], "d6730d8aca86");
+                assert_eq!(usage.completion_tokens, 256);
+                assert_eq!(finish_reason, "stop");
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    /// llama-server streams a call as `delta.tool_calls[]` fragments; each is handed on as it
+    /// came, and a text delta beside it is still a text delta.
+    #[test]
+    fn tool_call_deltas_surface_as_events_in_order() {
+        let mut parser = SseParser::new(true);
+        let events = parser.push(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\
+              \"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"ci\"}}]}}]}\n\
+              data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ty\\\":1}\"}}]}}]}\n\
+              data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"tool_calls\"}]}\n",
+        );
+        assert_eq!(events.len(), 3, "{events:?}");
+        match &events[0] {
+            StreamEvent::ToolCallDelta(v) => assert_eq!(v["function"]["name"], "lookup"),
+            other => panic!("expected a tool-call delta, got {other:?}"),
+        }
+        match &events[1] {
+            StreamEvent::ToolCallDelta(v) => assert_eq!(v["function"]["arguments"], "ty\":1}"),
+            other => panic!("expected a tool-call delta, got {other:?}"),
+        }
+        assert_eq!(events[2], StreamEvent::Delta("ok".into()));
+        match parser.finish(0) {
+            StreamEvent::Done { finish_reason, .. } => assert_eq!(finish_reason, "tool_calls"),
             other => panic!("expected Done, got {other:?}"),
         }
     }
@@ -608,19 +706,40 @@ mod tests {
 
     #[test]
     fn the_request_body_carries_every_sampling_field() {
-        let request = GenerationRequest {
-            model: "m".into(),
-            messages: vec![super::super::ChatMessage::new("user", "hi")],
-            prompt: None,
-            params: misaka_studio_core::provenance::SamplingCommitment { seed: Some(7), ..Default::default() },
-            stop: vec!["</s>".into()],
-        };
+        let mut request = GenerationRequest::plain(
+            "m",
+            vec![super::super::ChatMessage::new("user", "hi")],
+            None,
+            misaka_studio_core::provenance::SamplingCommitment { seed: Some(7), ..Default::default() },
+        );
+        request.stop = vec!["</s>".into()];
         let body = request_body(&request, true);
         assert_eq!(body["seed"], 7);
         assert_eq!(body["top_k"], 40);
         assert_eq!(body["stop"][0], "</s>");
         assert!(body["messages"].is_array());
         assert!(body.get("prompt").is_none(), "a chat request must not also send a raw prompt");
+        for absent in ["tools", "tool_choice", "response_format"] {
+            assert!(body.get(absent).is_none(), "`{absent}` was not sent, so it is not forwarded — not even as null");
+        }
+    }
+
+    /// ADR-0096 Decisions 2 and 3: the shape fields reach the engine exactly as the client sent
+    /// them. llama-server implements all three; a key it did not receive it cannot misread.
+    #[test]
+    fn the_request_body_forwards_tools_tool_choice_and_response_format() {
+        let mut request = GenerationRequest::plain("m", vec![super::super::ChatMessage::new("user", "hi")], None, Default::default());
+        request.tools = Some(serde_json::json!([{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]));
+        request.tool_choice = Some(serde_json::json!("auto"));
+        request.response_format = Some(serde_json::json!({"type":"json_object"}));
+        let body = request_body(&request, true);
+        assert_eq!(body["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["response_format"]["type"], "json_object");
+        // A raw completion has no tool surface; the format still applies to the text.
+        let raw = request_body(&GenerationRequest { prompt: Some("x".into()), ..request }, false);
+        assert!(raw.get("tools").is_none() && raw.get("tool_choice").is_none());
+        assert_eq!(raw["response_format"]["type"], "json_object");
     }
 
     #[test]

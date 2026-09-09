@@ -25,6 +25,7 @@
 pub mod api;
 pub mod backend;
 pub mod catalog;
+pub mod conversations;
 pub mod download;
 pub mod error;
 pub mod metrics;
