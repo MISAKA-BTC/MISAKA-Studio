@@ -173,7 +173,16 @@ export function Sidebar() {
   // through the runtime, which holds them; the window's cache is not the copy worth exporting.
   const exportAll = async () => {
     try {
-      downloadJson('misaka-studio-conversations.json', await api.exportConversations())
+      const exported = await api.exportConversations()
+      // The desktop shell's window has no file-save path (no filesystem or dialog plugin is
+      // granted), so a blob download there ends nowhere. Inside the shell the export goes to the
+      // clipboard and says so; in a browser the download is the natural thing.
+      if ('__TAURI_INTERNALS__' in window) {
+        await navigator.clipboard.writeText(JSON.stringify(exported, null, 2))
+        toast('success', `Copied ${exported.conversations.length} conversations to the clipboard as JSON — paste them into a file to keep them.`)
+        return
+      }
+      downloadJson('misaka-studio-conversations.json', exported)
     } catch (error) {
       toast('error', `Export failed: ${(error as Error).message}`)
     }

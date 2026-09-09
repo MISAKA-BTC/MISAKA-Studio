@@ -257,6 +257,11 @@ function ModelRequestDoor() {
   const toast = useStudio((s) => s.toast)
   const [prefill, setPrefill] = useState<ModelRequestPrefill | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
+  // The desktop shell grants its window no opener plugin (`desktop/src-tauri/capabilities/
+  // default.json`), so `window.open` there returns null and nothing happens. The link is then
+  // shown instead of opened — a button that silently does nothing is the one outcome a person
+  // cannot act on.
+  const [link, setLink] = useState<string | null>(null)
 
   useEffect(() => {
     let live = true
@@ -285,7 +290,8 @@ function ModelRequestDoor() {
         return
       }
     }
-    window.open(target.url, '_blank', 'noopener')
+    const opened = window.open(target.url, '_blank', 'noopener')
+    if (!opened) setLink(target.url)
   }
 
   return (
@@ -305,6 +311,15 @@ function ModelRequestDoor() {
           Request a model…
         </button>
       </div>
+      {link && (
+        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+          <span className="text-ink-500 dark:text-ink-400">This window cannot open links. Copy the form's address and open it in a browser:</span>
+          <CopyButton text={link} label="Copy link" />
+          <span className="mono max-w-full truncate text-[0.68rem] text-ink-500 dark:text-ink-400" title={link}>
+            {link}
+          </span>
+        </div>
+      )}
       {prefill && (
         <details className="mt-2 text-xs">
           <summary className="cursor-pointer text-ink-500 dark:text-ink-400">What the form is prefilled with — read it before you click</summary>
