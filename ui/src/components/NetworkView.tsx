@@ -19,7 +19,21 @@ import { MiningQueuePanel } from './MiningQueuePanel'
 import { PromptMiningPanel } from './PromptMiningPanel'
 import { api } from '../lib/api'
 import { bytes, count, shortHash } from '../lib/format'
-import type { Effort, MiningState, NetworkOverview, NodeClassRow, NodeStatus, NodeView, PalwClassStatus, PoolBlock, PoolFunds, PoolStatus, ProducedBlock, Settings } from '../lib/types'
+import type {
+  Effort,
+  MiningState,
+  ModelRequestPrefill,
+  NetworkOverview,
+  NodeClassRow,
+  NodeStatus,
+  NodeView,
+  PalwClassStatus,
+  PoolBlock,
+  PoolFunds,
+  PoolStatus,
+  ProducedBlock,
+  Settings,
+} from '../lib/types'
 import { useStudio } from '../store/studio'
 import { CopyButton, EmptyState, Field, Icon, Section, Spinner, Toggle } from './common'
 
@@ -171,6 +185,7 @@ export function NetworkView() {
                   <ChainClassCard key={row.class_id} row={row} />
                 ))}
             </div>
+            <ModelRequestDoor />
           </section>
 
           <ProducedBlocksCard />
@@ -224,6 +239,111 @@ export function NetworkView() {
  * only the producer's own `produced block #N`, states the answer in one word, and when the answer
  * is no it carries the node's own reason rather than making the user go looking for it.
  */
+/**
+ * **The door for a model that does not exist yet** (ADR-0096 Decision 13).
+ *
+ * Adding a model has a path end to end — conversion, registration, certification, a line with an
+ * owner — and had no place for the person who will do none of that to ask. The runtime builds
+ * the issue form's URL from what this machine knows (RAM, accelerator, the classes it holds); the
+ * fields are shown here first, because a link that quietly carries a hardware description to a
+ * public tracker is the kind of thing a person should read before clicking. A request is public,
+ * buys no priority and moves nothing on chain.
+ *
+ * The prefill is fetched when the card mounts, not on the click: a browser only lets a page open
+ * a new tab from inside the click itself, and a click that first awaits a fetch is no longer
+ * inside it.
+ */
+function ModelRequestDoor() {
+  const toast = useStudio((s) => s.toast)
+  const [prefill, setPrefill] = useState<ModelRequestPrefill | null>(null)
+  const [failure, setFailure] = useState<string | null>(null)
+
+  useEffect(() => {
+    let live = true
+    api
+      .modelRequest()
+      .then((p) => {
+        if (live) setPrefill(p)
+      })
+      .catch((e: unknown) => {
+        if (live) setFailure((e as Error).message)
+      })
+    return () => {
+      live = false
+    }
+  }, [])
+
+  const open = async () => {
+    let target = prefill
+    if (!target) {
+      try {
+        target = await api.modelRequest()
+        setPrefill(target)
+        setFailure(null)
+      } catch (e) {
+        toast('error', `Cannot build the request: ${(e as Error).message}`)
+        return
+      }
+    }
+    window.open(target.url, '_blank', 'noopener')
+  }
+
+  return (
+    <div className="mt-4 border-t border-ink-200 pt-3 dark:border-ink-800">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-xs text-ink-500 dark:text-ink-400">
+          Want a model this network does not run yet? Ask in the open: a request is public, buys no priority and moves
+          nothing on chain — the queue is the tracker.
+        </p>
+        <button
+          type="button"
+          className="btn-outline"
+          onClick={() => void open()}
+          title={failure ?? 'Opens the model-request form on GitHub, prefilled with what this machine knows'}
+        >
+          <Icon name="external" className="size-3.5" />
+          Request a model…
+        </button>
+      </div>
+      {prefill && (
+        <details className="mt-2 text-xs">
+          <summary className="cursor-pointer text-ink-500 dark:text-ink-400">What the form is prefilled with — read it before you click</summary>
+          {/* Every field of the form is in the URL, empty ones included; the filled ones are
+              what leaves this machine, the empty ones are the questions the person answers. */}
+          <dl className="mt-2 space-y-2">
+            {Object.entries(prefill.fields)
+              .filter(([, value]) => value.trim() !== '')
+              .map(([key, value]) => (
+                <div key={key}>
+                  <dt className="text-[0.7rem] font-medium text-ink-600 dark:text-ink-300">{key}</dt>
+                  <dd>
+                    <pre className="mono whitespace-pre-wrap rounded-lg bg-ink-100 p-2 text-[0.68rem] leading-relaxed dark:bg-ink-800">{value}</pre>
+                  </dd>
+                </div>
+              ))}
+          </dl>
+          {Object.entries(prefill.fields).some(([, value]) => value.trim() === '') && (
+            <p className="mt-2 text-[0.7rem] text-ink-500 dark:text-ink-400">
+              Left for you to fill in on the form:{' '}
+              {Object.entries(prefill.fields)
+                .filter(([, value]) => value.trim() === '')
+                .map(([key]) => key)
+                .join(', ')}
+              .
+            </p>
+          )}
+          <p className="mono mt-2 truncate text-[0.65rem] text-ink-500 dark:text-ink-400" title={prefill.url}>
+            {prefill.url}
+          </p>
+        </details>
+      )}
+      {failure && !prefill && (
+        <p className="mt-2 text-[0.7rem] text-ink-500 dark:text-ink-400">The runtime could not prefill the form: {failure}</p>
+      )}
+    </div>
+  )
+}
+
 /** One draw is one complete inference the node ran to buy a ticket. */
 function effortLine(effort: Effort): string {
   const draws = `${effort.draws.toLocaleString()} draw${effort.draws === 1 ? '' : 's'} this run`

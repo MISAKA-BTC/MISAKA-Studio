@@ -236,6 +236,16 @@ export type Settings = {
     pool_slot_token: string | null
     palw_gateway_url: string | null
     mining_mode: MiningMode
+    /**
+     * ADR-0096 Decision 4 — what the app does with a sampling request the lane cannot commit.
+     * `greedy_with_notice` sends the request through and prints what ran beside what was asked;
+     * `refuse` answers as the gateway does: by name, before the inference.
+     */
+    sampling_policy: 'greedy_with_notice' | 'refuse'
+    /** ADR-0096 Decision 5 — a trim that would drop more turns than this becomes a summary job. */
+    summarize_after_turns: number
+    /** ADR-0096 Decision 5 — how many continuation legs may follow a `length` finish (0 to 4). */
+    continue_max_legs: number
   }
   huggingface: { endpoint: string; token: string | null; max_concurrent_downloads: number }
   ui: { theme: 'system' | 'light' | 'dark'; show_provenance: boolean; show_performance: boolean }
@@ -280,6 +290,71 @@ export type TurnStats = {
   finishReason: string
 }
 
+// --- ADR-0096: what the lane reports beside an answer ----------------------
+
+/** Decision 4: the sampling that ran, printed beside the sampling that was asked for. */
+export type MisakaSampling = {
+  requested: Record<string, unknown>
+  /** The contract says always; optional here because the runtime merges the app's own notice
+   *  (`requested`, `reason`) with the gateway's report key by key, and an object that arrived
+   *  with only the app's half must render a notice, not blank the window. */
+  applied?: { temperature: number; seed: string }
+  reason: string
+  /** The gateway's one-word account of what ran (`"greedy"`), where it sends one. */
+  enforced?: string
+  /** Knobs with no consensus rule on this lane (`top_p`, `top_k`, …): named, never dropped. */
+  not_a_rule_on_this_lane?: string[]
+}
+
+/** Decision 3: the shape that was asked for, and whether the chain enforced it or only checked it. */
+export type MisakaFormat = {
+  requested: { type: string; constraint_id: string | null }
+  /** `committed` — the seat replays the constraint and the court can try it; `advisory` — the
+   *  schema rode the prompt as text and the answer was validated after the fact. */
+  enforcement: 'advisory' | 'committed'
+  valid: boolean
+  errors: string[]
+  canonical_sha256: string | null
+}
+
+/** Decision 5: the row is 512 and the answer is what is left of it; this is what was trimmed. */
+export type MisakaContext = {
+  n_ctx: number
+  prompt_tokens_estimate: number
+  dropped_turns: number
+  /** How many of the dropped turns a summary job covered, when one ran. */
+  summarized_turns?: number
+}
+
+export type MisakaJobRole = 'summary' | 'answer' | 'continue' | 'tool_leg'
+
+/** Decision 5: one inference is one claim, so a long thread is a chain of jobs — every one listed. */
+export type MisakaJob = {
+  /** Null for a leg that did not run — such an entry carries `error` instead. */
+  fp_job_id: string | null
+  fp_claim_id: string | null
+  role: MisakaJobRole
+  prompt_tokens: number
+  decode_tokens: number
+  error?: string
+}
+
+/**
+ * The `misaka` object on the last chunk of a chat completion. Every field is optional on purpose:
+ * a GGUF engine sends none of it, and a gateway from before ADR-0096 sends only the job and claim
+ * ids. What is absent is simply not shown.
+ */
+export type MisakaExtension = {
+  fp_job_id?: string
+  fp_claim_id?: string
+  sampling?: MisakaSampling
+  format?: MisakaFormat
+  context?: MisakaContext
+  jobs?: MisakaJob[]
+  /** Fields OpenAI defines as having no effect on the answer — accepted and listed (Decision 1). */
+  ignored_fields?: string[]
+}
+
 export type ChatMessage = {
   id: string
   role: 'system' | 'user' | 'assistant'
@@ -290,6 +365,14 @@ export type ChatMessage = {
   stats?: TurnStats
   /** Set on a user message that was queued for mining behind the chat. */
   mining?: MessageMining
+  /**
+   * What the lane said about this answer (ADR-0096 Decisions 3–5). Kept on the message and
+   * persisted like `stats`: a notice that vanished with the window would be a notice nobody read.
+   */
+  misaka?: MisakaExtension
+  /** The tool calls the answer carried (ADR-0096 Decision 2), in OpenAI's shape. The app that
+   *  asked is expected to run them; this window only shows them. */
+  toolCalls?: unknown[]
 }
 
 export type Conversation = {
@@ -299,6 +382,33 @@ export type Conversation = {
   updatedAt: number
   modelId: string | null
   messages: ChatMessage[]
+}
+
+// --- ADR-0096 Decision 12: conversations are the runtime's -----------------
+
+/** One row of `GET /api/v1/conversations`: enough to draw the list, without the messages. */
+export type ConversationSummary = {
+  id: string
+  title: string
+  createdAt: number
+  updatedAt: number
+  modelId: string | null
+  messageCount: number
+}
+
+/** The Studio's own export — and the one shape the import takes back unchanged. */
+export type ConversationExport = {
+  schema: 'misaka-studio/conversations/v1'
+  /** Milliseconds since the epoch, like every timestamp in a conversation. */
+  exportedAt: number
+  conversations: Conversation[]
+}
+
+/** What an import did, by name: every skipped row says why (a non-text part, an unknown role). */
+export type ConversationImportReport = {
+  imported: number
+  skipped: { reason: string; count: number }[]
+  ids: string[]
 }
 
 // --- the Network tab -------------------------------------------------------
@@ -547,6 +657,15 @@ export type PromptMiningStatus = {
   health: GatewayHealth | null
   class: ClassMatch | null
 }
+
+/**
+ * ADR-0096 Decision 13: the door for a model that does not exist yet. `url` opens the issue form
+ * prefilled; `fields` is the form's every field by its own id — `title` and `machine` filled from
+ * this machine (RAM, accelerator, the classes it holds), the rest empty for the person to write —
+ * shown before the click, because it goes to a public tracker. `machine` is the same facts,
+ * structured.
+ */
+export type ModelRequestPrefill = { url: string; fields: Record<string, string>; machine?: Record<string, unknown> }
 
 /** How far a commitment got. Today there is one value, and its name is the whole truth. */
 export type ChainReach = 'committed_not_submitted'

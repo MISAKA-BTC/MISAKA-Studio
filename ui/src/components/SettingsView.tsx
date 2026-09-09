@@ -15,6 +15,13 @@ import type { BackendInfo, Settings } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { Field, Icon, Section, Toggle } from './common'
 
+/** A number field's text as a whole number within bounds — an emptied field is `fallback`, not NaN. */
+function clampInt(text: string, min: number, max: number, fallback: number): number {
+  const value = Math.floor(Number(text))
+  if (!Number.isFinite(value)) return fallback
+  return Math.min(max, Math.max(min, value))
+}
+
 export function SettingsView() {
   const settings = useStudio((s) => s.settings)
   const save = useStudio((s) => s.saveSettings)
@@ -97,7 +104,7 @@ export function SettingsView() {
 
           <Field
             label="misaka-palw-serve path"
-            hint="The integer runtime, for PALW class artifacts (.palwart). Build it with `cargo build --release -p misaka-palw-base0 --bin misaka-palw-serve`. Empty looks beside the app and on PATH."
+            hint="Retired: the node tree removed this binary on 2026-09-02 (one runtime — v3-serve on both family workers). The integer engine now runs through misaka-palw-gateway in --answer-never-commit mode over the family worker (ADR-0096 Decision 10); a path here is rewritten into the two paths the gateway needs, and said so once. Kept until that migration has run."
           >
             <input
               className="input mt-1"
@@ -251,6 +258,55 @@ export function SettingsView() {
             </span>
             .
           </p>
+        </Section>
+
+        {/* ADR-0096 Decisions 4 and 5. These are `node` settings because the lane is the node's:
+            the row is 512 tokens and an inference is a claim, and none of that is this window's
+            to change. What the window chooses is what to do at the edge of it. */}
+        <Section
+          title="Lane"
+          description="What the app does when a request asks the free-prompt lane for more than one job can commit. Every answer says what ran, under the message."
+        >
+          <Field
+            label="Sampling policy"
+            hint="The lane decodes greedily on every shipped network — a temperature is not a rule the seat can replay. Mapping sends the request through and prints what ran beside what was asked; refusing answers as the gateway does, by name, before the inference."
+          >
+            <select
+              className="input mt-1"
+              value={draft.node.sampling_policy ?? 'greedy_with_notice'}
+              onChange={(e) => set('node', { ...draft.node, sampling_policy: e.target.value as Settings['node']['sampling_policy'] })}
+            >
+              <option value="greedy_with_notice">Map to greedy and say so</option>
+              <option value="refuse">Refuse non-greedy requests</option>
+            </select>
+          </Field>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field
+              label="Summarize when more than N turns would be dropped"
+              hint="The row is 512 tokens, so a long thread is trimmed oldest-first to fit. A trim that would drop more turns than this becomes a summary job of its own — an inference and a claim like any other, never made up by the app."
+            >
+              <input
+                className="input mt-1"
+                type="number"
+                min={0}
+                value={draft.node.summarize_after_turns ?? 4}
+                onChange={(e) => set('node', { ...draft.node, summarize_after_turns: clampInt(e.target.value, 0, 1000, 4) })}
+              />
+            </Field>
+            <Field
+              label="Continue legs"
+              hint="When an answer hits its length ceiling, how many follow-up jobs continue it (0 to 4). Each leg is its own claim; the seams are listed under the message."
+            >
+              <input
+                className="input mt-1"
+                type="number"
+                min={0}
+                max={4}
+                value={draft.node.continue_max_legs ?? 2}
+                onChange={(e) => set('node', { ...draft.node, continue_max_legs: clampInt(e.target.value, 0, 4, 2) })}
+              />
+            </Field>
+          </div>
         </Section>
 
         <Section title="Hugging Face" description="Where models are searched for and downloaded from.">
