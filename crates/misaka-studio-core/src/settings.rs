@@ -523,6 +523,28 @@ impl GenerationDefaults {
     }
 }
 
+/// Where the components manifest is, and whether the Studio consults it without being asked.
+///
+/// ADR-0096 Decision 10: one `components.json` (schema `misaka/components/v1`) names every
+/// binary and artifact the Studio can spawn or map, with the bytes' digest. `manifest` is a local
+/// path or an `https://` URL; `None` means the Studio only knows what is on disk and says so
+/// (`state: "not-in-manifest"` for everything found). `auto_check` is whether
+/// `GET /api/v1/components` fetches the manifest on its own — off, it is fetched only when the
+/// request asks (`?check=1`), for a metered or offline machine; `misaka-studiod --check` reads
+/// it whenever it is set, because a person running `--check` is asking.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ComponentsSettings {
+    pub manifest: Option<String>,
+    pub auto_check: bool,
+}
+
+impl Default for ComponentsSettings {
+    fn default() -> Self {
+        ComponentsSettings { manifest: None, auto_check: true }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -548,6 +570,7 @@ pub struct Settings {
     pub huggingface: HuggingFaceSettings,
     pub ui: UiSettings,
     pub provenance: ProvenanceSettings,
+    pub components: ComponentsSettings,
 }
 
 impl Default for Settings {
@@ -562,6 +585,7 @@ impl Default for Settings {
             huggingface: HuggingFaceSettings::default(),
             ui: UiSettings::default(),
             provenance: ProvenanceSettings::default(),
+            components: ComponentsSettings::default(),
         }
     }
 }
@@ -688,6 +712,22 @@ mod tests {
         assert_eq!(s.node.sampling_policy, SamplingPolicy::GreedyWithNotice);
         assert_eq!(s.node.summarize_after_turns, 4);
         assert_eq!(s.node.continue_max_legs, 2);
+    }
+
+    /// A settings file written before the components manifest existed has no `components` key
+    /// and must load with the manifest unset and the automatic check on — the default that makes a
+    /// later `components.manifest` take effect without a second edit.
+    #[test]
+    fn an_older_settings_file_without_components_loads_with_the_check_on_and_no_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("old.json");
+        std::fs::write(&path, r#"{"server":{"port":9001}}"#).expect("write");
+        let s = Settings::load(&path).expect("loads");
+        assert_eq!(s.components.manifest, None);
+        assert!(s.components.auto_check);
+        let s: Settings = serde_json::from_str(r#"{"components":{"manifest":"contrib/components/testnet-11.json"}}"#).expect("parses");
+        assert_eq!(s.components.manifest.as_deref(), Some("contrib/components/testnet-11.json"));
+        assert!(s.components.auto_check, "an unset auto_check is on");
     }
 
     /// The policy is spelled on disk the way the ADR spells it, so a person following the text

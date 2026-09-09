@@ -1,0 +1,37 @@
+{
+  "components": [
+    {
+      "artifact_root": "1a7457f100d9fb0f3406d882b4b5bcd7e2ebcccd54edc5268a08c3a85bc6c8d3adacdf345cde3cb72ffe8ed7fe7a2f729d10f00821f94b1e8562e4e217b72708",
+      "class_id": "4277d84f7d91528cc04aa366d51ee1c2e4f7902c4f6b16a213dead1c7e227977db732f18ed6183db3d944d44726ebd3feff7b15c48f9dba11cd526684f35f1b7",
+      "convert_command": "qwen25-convert /path/to/Qwen2.5-1.5B-Instruct --a16 --out qwen25-1.5b-a16.palwart",
+      "id": "qwen25-1.5b-a16",
+      "kind": "artifact",
+      "model_id": "Qwen/Qwen2.5-1.5B/graph-v5@512",
+      "notes": "OFFLINE COPY of the testnet-11 artifact row, copied 2026-09-10 from the misakas tree's docs/components-manifest.md example, which copied it from MISAKA-Studio's TESTNET11_CLASSES (crates/misaka-studio-core/src/palw.rs); a test pins the two to the same sha256, size, url, class_id and artifact_root. Not a published manifest: no node release has written the worker rows this row requires yet, so the validator refuses this file on `requires` until they exist — the cross-repository check in miniature.",
+      "platform": "any",
+      "requires": ["palw-a16-fp-worker"],
+      "sha256": "a8c4e53e5b30dd0d4dc6ef791e0513890a07a2b3a22d045e612536bba1240b1f",
+      "size": 1795427276,
+      "url": "hf://Misakachain/Qwen2.5-1.5B-PALW-A16-runtime/palw-runtime/qwen25-1.5b-a16.palwart",
+      "version": "relaunch-5f"
+    },
+    {
+      "artifact_root": "f4aad4fd543928eb2d3a737555b09da9bf685fc515c0f8d4520988efcffacf0813d1b727537f0d03d349253aa11ef427e4047c2166b69fd7edb46a4a9984b368",
+      "class_id": "5bd9ae3d91df80650caffe3126a38bafb0b4feb9b046a416d353a7c3f71af6eab5aadf9b1ce41650007a980f1cc6044ef218424f4cbb8299ef9e92c97b99ef8e",
+      "convert_command": "qwen36-convert --url <gguf url> --header header.bin --out qwen36.palwq36 --context 512",
+      "id": "qwen36",
+      "kind": "artifact",
+      "model_id": "Qwen3.6-35B-A3B/graph-v3",
+      "notes": "OFFLINE COPY of the testnet-11 artifact row, copied 2026-09-10 from the misakas tree's docs/components-manifest.md example, which copied it from MISAKA-Studio's TESTNET11_CLASSES (crates/misaka-studio-core/src/palw.rs); a test pins the two to the same sha256, size, url, class_id and artifact_root. Not a published manifest: no node release has written the worker rows this row requires yet, so the validator refuses this file on `requires` until they exist — the cross-repository check in miniature.",
+      "platform": "any",
+      "requires": ["palw-qwen36-fp-worker"],
+      "sha256": "7a944595a4256ab0aa4ca8b59f39fea268654b3630e54fb354cf1fa7658cf08c",
+      "size": 36492831232,
+      "url": "hf://Misakachain/Qwen3.6-35B-A3B-PALW-runtime/qwen36.palwq36",
+      "version": "relaunch-5f"
+    }
+  ],
+  "network": "testnet-11",
+  "release": "relaunch-5f",
+  "schema": "misaka/components/v1"
+}

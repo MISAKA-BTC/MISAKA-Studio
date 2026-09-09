@@ -45,8 +45,8 @@
 //! [`sampling_notice`] and [`sampling_divergence`] are that sentence's two halves.
 
 use super::{
-    Availability, ChatMessage, GenerationRequest, InferenceBackend, LegLimits, LoadRequest, LoadedModel, SseParser, StreamEvent,
-    Usage, fit_messages_to_budget, prompt_tokens_upper_bound, text_tokens_upper_bound,
+    Availability, ChatMessage, GenerationRequest, InferenceBackend, LegLimits, LoadRequest, LoadedModel, RuntimeFingerprint,
+    SseParser, StreamEvent, Usage, fit_messages_to_budget, prompt_tokens_upper_bound, text_tokens_upper_bound,
 };
 use crate::{Error, Result};
 use futures_util::future::BoxFuture;
@@ -190,6 +190,15 @@ impl GatewayBackend {
 impl InferenceBackend for GatewayBackend {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    /// The address and the token — the two values whose omission from the old rebuild list was
+    /// the 2026-09-05 bug. The token rides as a digest prefix, never as itself.
+    fn fingerprint(&self) -> RuntimeFingerprint {
+        let mut fingerprint = RuntimeFingerprint::new(NAME);
+        fingerprint.url = Some(self.url.clone());
+        fingerprint.token_sha256_prefix = self.token.as_deref().map(RuntimeFingerprint::token_prefix);
+        fingerprint
     }
 
     fn descriptor(&self) -> BoxFuture<'_, RuntimeDescriptor> {
@@ -968,6 +977,30 @@ mod tests {
     /// The refusal carries the arithmetic that makes the retry exact. Written against the message
     /// the live worker actually sent, because a parser written against an imagined format is a
     /// parser that silently declines to fix anything.
+    /// The fingerprint carries the address and a digest prefix of the token — never the token —
+    /// and an empty token is no token, the same normalisation the constructor applies.
+    #[test]
+    fn the_fingerprint_names_the_slot_without_leaking_its_token() {
+        let a = GatewayBackend::new("https://pool.example/pool/v1/slots/slot-06/fp/".into(), Some("token-06".into())).fingerprint();
+        assert_eq!(a.kind, NAME);
+        assert_eq!(
+            a.url.as_deref(),
+            Some("https://pool.example/pool/v1/slots/slot-06/fp"),
+            "the trailing slash is trimmed as at construction"
+        );
+        let prefix = a.token_sha256_prefix.clone().expect("a prefix");
+        assert_eq!(prefix.len(), 12);
+        assert!(!serde_json::to_string(&a).expect("json").contains("token-06"), "the token itself never appears");
+        assert_eq!(prefix, RuntimeFingerprint::token_prefix("token-06"));
+
+        let rotated =
+            GatewayBackend::new("https://pool.example/pool/v1/slots/slot-06/fp".into(), Some("token-07".into())).fingerprint();
+        assert_ne!(a, rotated, "a new token is a new engine");
+        let empty = GatewayBackend::new("https://pool.example/pool/v1/slots/slot-06/fp".into(), Some(String::new())).fingerprint();
+        assert_eq!(empty.token_sha256_prefix, None);
+        assert_eq!(empty, GatewayBackend::new("https://pool.example/pool/v1/slots/slot-06/fp".into(), None).fingerprint());
+    }
+
     #[test]
     fn a_refusal_names_the_ceiling_that_would_have_fit() {
         let refusal = "the worker refused the job: prompt 51 + decode ceiling 476 exceeds max_context_tokens 512";

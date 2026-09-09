@@ -29,8 +29,9 @@
 //! shown: this module drives inference and makes no mining claim of its own.
 
 use super::openai_child::{ChildEngine, ChildEngineConfig};
-use super::{Availability, GenerationRequest, InferenceBackend, LoadRequest, LoadedModel, StreamEvent};
+use super::{Availability, GenerationRequest, InferenceBackend, LoadRequest, LoadedModel, RuntimeFingerprint, StreamEvent};
 use crate::Result;
+use crate::components::{ComponentId, resolve_component};
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use misaka_studio_core::provenance::RuntimeDescriptor;
@@ -44,6 +45,9 @@ pub const MISAKA_CLASS_TAG: &str = "misaka-palw-base0/deterministic-integer/v1";
 
 pub struct MisakaBackend {
     engine: ChildEngine,
+    /// `backend.misaka_tokenizer_path`, kept beside the args closure that also holds it so the
+    /// fingerprint can name it: a closure cannot be asked what it captured.
+    tokenizer: Option<PathBuf>,
 }
 
 impl MisakaBackend {
@@ -55,12 +59,15 @@ impl MisakaBackend {
     /// `serve` is `backend.misaka_serve_path` and `tokenizer` is `backend.misaka_tokenizer_path`;
     /// both `None` fall back to the resolutions documented on the settings fields.
     pub fn new(serve: Option<PathBuf>, tokenizer: Option<PathBuf>, startup_timeout: Duration) -> Self {
-        let program = resolve_program(serve);
+        let resolution = resolve_component(&ComponentId::MisakaPalwServe, serve.as_deref(), None);
+        let for_args = tokenizer.clone();
         MisakaBackend {
+            tokenizer,
             engine: ChildEngine::new(ChildEngineConfig {
-                name: "misaka",
-                program,
-                args: Box::new(move |request, port| build_args(request, port, tokenizer.as_deref())),
+                name: Self::NAME,
+                program: resolution.path,
+                program_candidate: resolution.candidate,
+                args: Box::new(move |request, port| build_args(request, port, for_args.as_deref())),
                 health_path: "/health",
                 startup_timeout,
                 env: Vec::new(),
@@ -73,32 +80,12 @@ impl MisakaBackend {
     }
 }
 
-/// Where the server binary is: configured, then beside the Studio (how a packaged app ships one),
-/// then PATH. A bare name is the last answer so a failure names what is missing rather than an
-/// absolute path that never existed.
+/// Where the server binary is — the one search order (`crate::components`), for this component,
+/// under the name and signature the callers had. `misaka-palw-serve` is a retired id in that
+/// table: the node tree stopped building it on 2026-09-02, and the components check says so by
+/// name for as long as this backend spawns it.
 pub fn resolve_program(configured: Option<PathBuf>) -> PathBuf {
-    let exe_name = if cfg!(windows) { "misaka-palw-serve.exe" } else { "misaka-palw-serve" };
-    if let Some(path) = configured {
-        return path;
-    }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        for candidate in [dir.join(exe_name), dir.join("engines").join(exe_name)] {
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
-    }
-    if let Some(found) = which(exe_name) {
-        return found;
-    }
-    PathBuf::from(exe_name)
-}
-
-fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|dir| dir.join(name)).find(|c| c.is_file())
+    resolve_component(&ComponentId::MisakaPalwServe, configured.as_deref(), None).path
 }
 
 /// **The tokenizer, which the artifact deliberately does not carry.**
@@ -137,6 +124,12 @@ fn build_args(request: &LoadRequest, port: u16, tokenizer: Option<&std::path::Pa
 impl InferenceBackend for MisakaBackend {
     fn name(&self) -> &'static str {
         MisakaBackend::NAME
+    }
+
+    fn fingerprint(&self) -> RuntimeFingerprint {
+        let mut fingerprint = self.engine.fingerprint();
+        fingerprint.tokenizer = self.tokenizer.clone();
+        fingerprint
     }
 
     fn descriptor(&self) -> BoxFuture<'_, RuntimeDescriptor> {
@@ -245,6 +238,19 @@ mod tests {
         for forbidden in ["--n-gpu-layers", "--threads", "--flash-attn", "--no-mmap", "--mlock"] {
             assert!(!args.iter().any(|a| a == forbidden), "{forbidden} would change arithmetic this class fixes");
         }
+    }
+
+    /// The tokenizer path is a constructor input — it rides the args closure — so it is in the
+    /// fingerprint, and a settings change to it replaces the engine.
+    #[test]
+    fn the_tokenizer_path_is_in_the_fingerprint() {
+        let serve = Some(PathBuf::from("/nonexistent/misaka-palw-serve"));
+        let none = MisakaBackend::new(serve.clone(), None, Duration::from_secs(1)).fingerprint();
+        let some = MisakaBackend::new(serve, Some(PathBuf::from("/models/tokenizer.json")), Duration::from_secs(1)).fingerprint();
+        assert_eq!(none.kind, "misaka");
+        assert_eq!(none.tokenizer, None);
+        assert_eq!(some.tokenizer.as_deref(), Some(std::path::Path::new("/models/tokenizer.json")));
+        assert_ne!(none, some);
     }
 
     /// A tokenizer beside the artifact is the downloaded-class layout; the configured path wins

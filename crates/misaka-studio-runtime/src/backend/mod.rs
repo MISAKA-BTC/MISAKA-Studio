@@ -26,6 +26,7 @@ use futures_util::stream::BoxStream;
 use misaka_studio_core::provenance::{RuntimeDescriptor, SamplingCommitment};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -300,10 +301,65 @@ pub struct LoadedModel {
     pub load_ms: u64,
 }
 
+/// **What an engine was built FROM** — every value its constructor copied, and nothing else.
+///
+/// ADR-0096 Decision 11. `apply_settings` used to rebuild the engine when a hand-kept list of
+/// settings fields changed, and on 2026-09-05 the list lacked the gateway URL and the slot token:
+/// the chat kept mining on a slot the person had just left while every panel named the new one.
+/// The list is gone. Each backend derives this value from the fields it actually stored, so the
+/// rebuild predicate compares two fingerprints and cannot forget a field — it no longer
+/// enumerates fields. The same value is what `/api/v1/settings/effective` prints beside the
+/// settings file, so a panel can say "the file says X, the engine holds Y".
+///
+/// A secret never appears in it: a token is carried as the first twelve hex characters of its
+/// SHA-256, enough to tell two tokens apart and useless for presenting one.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeFingerprint {
+    /// The backend's [`InferenceBackend::name`].
+    pub kind: String,
+    /// The executable a child engine is spawned from, as resolved at construction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<PathBuf>,
+    /// The endpoint an HTTP engine posts to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// See [`RuntimeFingerprint::token_prefix`]; `None` when no token was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_sha256_prefix: Option<String>,
+    /// The tokenizer file the integer runtime renders prompts with, when one was configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenizer: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_timeout_secs: Option<u64>,
+    /// Anything else a constructor copied — the accelerator tag, the mock's token delay, where
+    /// the program was found. Sorted, so two fingerprints compare and print the same way.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, String>,
+}
+
+impl RuntimeFingerprint {
+    pub fn new(kind: &str) -> Self {
+        RuntimeFingerprint { kind: kind.to_string(), ..Default::default() }
+    }
+
+    /// The first twelve hex characters of a token's SHA-256 — what a fingerprint carries instead
+    /// of the token. Twelve is 48 bits: two slots' tokens do not collide, and nothing about the
+    /// token is recoverable from it.
+    pub fn token_prefix(token: &str) -> String {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(token.as_bytes());
+        hex::encode(digest)[..12].to_string()
+    }
+}
+
 /// An engine, behind one interface.
 pub trait InferenceBackend: Send + Sync {
     /// Stable name: `llamacpp`, `mlx`, `mock`.
     fn name(&self) -> &'static str;
+
+    /// Everything this instance was constructed from — see [`RuntimeFingerprint`]. Synchronous
+    /// and pure: it reads fields the constructor stored, never the settings, the disk or a socket.
+    fn fingerprint(&self) -> RuntimeFingerprint;
 
     /// The identity of this engine — what `h_R` is derived from.
     ///

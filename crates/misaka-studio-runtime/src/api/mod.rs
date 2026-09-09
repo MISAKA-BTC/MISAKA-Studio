@@ -26,6 +26,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
+pub mod components;
 pub mod conversations;
 pub mod management;
 pub mod mining_queue;

@@ -53,6 +53,9 @@ pub struct ChildEngineConfig {
     pub name: &'static str,
     /// The executable.
     pub program: PathBuf,
+    /// Which step of the search order produced `program` — carried into the fingerprint so the
+    /// effective view can say "found beside the executable" rather than only where.
+    pub program_candidate: crate::components::Candidate,
     /// Build the argument list for a load, given the request and the port to listen on.
     pub args: ArgsBuilder,
     /// Path of the health endpoint, relative to the base URL.
@@ -91,6 +94,19 @@ impl ChildEngine {
 
     pub fn name(&self) -> &'static str {
         self.config.name
+    }
+
+    /// What this supervisor was configured with: the program, where it was found, the startup
+    /// timeout and the child's extra environment. A backend adds what it copied on top.
+    pub fn fingerprint(&self) -> super::RuntimeFingerprint {
+        let mut fingerprint = super::RuntimeFingerprint::new(self.config.name);
+        fingerprint.program = Some(self.config.program.clone());
+        fingerprint.startup_timeout_secs = Some(self.config.startup_timeout.as_secs());
+        fingerprint.extra.insert("program_candidate".into(), self.config.program_candidate.to_string());
+        for (key, value) in &self.config.env {
+            fingerprint.extra.insert(format!("env:{key}"), value.clone());
+        }
+        fingerprint
     }
 
     /// The engine's recent output, newest last.

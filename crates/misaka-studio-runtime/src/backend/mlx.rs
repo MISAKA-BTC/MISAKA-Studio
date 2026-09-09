@@ -12,8 +12,9 @@
 //! after a download and a click is not.
 
 use super::openai_child::{ChildEngine, ChildEngineConfig};
-use super::{Availability, GenerationRequest, InferenceBackend, LoadRequest, LoadedModel, StreamEvent};
+use super::{Availability, GenerationRequest, InferenceBackend, LoadRequest, LoadedModel, RuntimeFingerprint, StreamEvent};
 use crate::Result;
+use crate::components::{ComponentId, resolve_component};
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use misaka_studio_core::provenance::RuntimeDescriptor;
@@ -25,13 +26,19 @@ pub struct MlxBackend {
 }
 
 impl MlxBackend {
+    /// The name this backend answers to, everywhere.
+    pub const NAME: &'static str = "mlx";
+
     pub fn new(configured: Option<PathBuf>, startup_timeout: Duration) -> Self {
-        // `mlx_lm.server` is installed as a console script by the `mlx-lm` package.
-        let program = configured.unwrap_or_else(|| PathBuf::from("mlx_lm.server"));
+        // `mlx_lm.server` is installed as a console script by the `mlx-lm` package. The one
+        // search order finds it where the packaged app or `pip` put it, and when nothing has,
+        // the bare name lets the shell's own PATH lookup and its error name it.
+        let resolution = resolve_component(&ComponentId::MlxServer, configured.as_deref(), None);
         MlxBackend {
             engine: ChildEngine::new(ChildEngineConfig {
-                name: "mlx",
-                program,
+                name: Self::NAME,
+                program: resolution.path,
+                program_candidate: resolution.candidate,
                 args: Box::new(build_args),
                 // MLX's server has no health endpoint; /v1/models is the cheapest thing it
                 // answers once it is up, and it answers nothing before that.
@@ -63,7 +70,11 @@ fn build_args(request: &LoadRequest, port: u16) -> Vec<String> {
 
 impl InferenceBackend for MlxBackend {
     fn name(&self) -> &'static str {
-        "mlx"
+        Self::NAME
+    }
+
+    fn fingerprint(&self) -> RuntimeFingerprint {
+        self.engine.fingerprint()
     }
 
     fn descriptor(&self) -> BoxFuture<'_, RuntimeDescriptor> {

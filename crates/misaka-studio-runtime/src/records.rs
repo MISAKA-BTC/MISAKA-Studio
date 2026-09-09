@@ -74,6 +74,12 @@ impl RecordStore {
         self.enabled
     }
 
+    /// The cap this store was opened with — what the effective view holds against
+    /// `provenance.max_records`.
+    pub fn max_records(&self) -> usize {
+        self.max_records
+    }
+
     /// Append a record. A failure to write is logged, never propagated: losing the provenance
     /// line must not fail the user's completion, which has already been generated and streamed.
     pub async fn append(&self, stored: StoredRecord) {

@@ -38,6 +38,7 @@
 //! with new flags to change role, is normal). Polling a loopback socket once a second costs
 //! microseconds; the complexity is the thing worth not paying.
 
+use crate::components::{Candidate, ComponentId, resolve_component};
 use crate::{Error, Result};
 use futures_util::{SinkExt, StreamExt};
 use misaka_studio_core::settings::{NetworkRole, NodeNetwork, NodeSettings};
@@ -192,13 +193,13 @@ pub async fn query_status(url: &str) -> NodeStatus {
     }
     // The sink's own header, for its timestamp and lane. A second call because getBlockDagInfo
     // names the sink and says nothing else about it.
-    if let Some(sink) = status.sink.clone() {
-        if let Ok(answer) = wrpc_call(url, "getBlock", json!({ "hash": sink, "includeTransactions": false }), timeout).await {
-            let header = answer.get("block").unwrap_or(&answer).get("header").cloned().unwrap_or(Value::Null);
-            status.sink_timestamp_ms = header.get("timestamp").and_then(Value::as_u64);
-            status.sink_algo_id = header.get("powAlgoId").and_then(Value::as_u64).map(|id| id as u8);
-            status.sink_stand_down_secs = status.sink_algo_id.and_then(heartbeat_stand_down_secs);
-        }
+    if let Some(sink) = status.sink.clone()
+        && let Ok(answer) = wrpc_call(url, "getBlock", json!({ "hash": sink, "includeTransactions": false }), timeout).await
+    {
+        let header = answer.get("block").unwrap_or(&answer).get("header").cloned().unwrap_or(Value::Null);
+        status.sink_timestamp_ms = header.get("timestamp").and_then(Value::as_u64);
+        status.sink_algo_id = header.get("powAlgoId").and_then(Value::as_u64).map(|id| id as u8);
+        status.sink_stand_down_secs = status.sink_algo_id.and_then(heartbeat_stand_down_secs);
     }
     if let Ok(peers) = wrpc_call(url, "getConnectedPeerInfo", json!({}), timeout).await {
         status.peer_count = peers.get("peerInfo").and_then(Value::as_array).map(Vec::len);
@@ -501,6 +502,25 @@ struct SupervisedNode {
     rpc_url: String,
     role: NetworkRole,
     args_shown: Vec<String>,
+    /// What the child was spawned from and with, and when — the running object's own record,
+    /// which the effective view reads instead of rebuilding the arguments from settings that may
+    /// have changed since.
+    binary: PathBuf,
+    binary_candidate: Candidate,
+    args: Vec<String>,
+    started_at: std::time::SystemTime,
+}
+
+/// The supervised node as it is running — see [`NodeManager::effective`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct NodeEffective {
+    pub binary: PathBuf,
+    /// Which step of the search order found the binary.
+    pub binary_candidate: Candidate,
+    pub args: Vec<String>,
+    pub rpc_url: String,
+    pub role: NetworkRole,
+    pub started_at_unix: u64,
 }
 
 /// The node this Studio watches or runs.
@@ -789,49 +809,35 @@ impl NodeManager {
         out
     }
 
-    /// Where the node binary is: the configured path, beside the Studio, or PATH.
+    /// Where the node binary is — the one search order (`crate::components::resolve_component`):
+    /// the configured path, beside the Studio, `engines/`, `PATH`. Kept under this name for the
+    /// callers that had it. Returning the bare name when nothing is found is deliberate: the
+    /// spawn then fails with the name in the error, which is the message that tells someone what
+    /// to install.
     pub fn resolve_kaspad(configured: Option<&PathBuf>) -> PathBuf {
-        let name = if cfg!(windows) { "kaspad.exe" } else { "kaspad" };
-        if let Some(path) = configured {
-            return path.clone();
-        }
-        if let Ok(exe) = std::env::current_exe()
-            && let Some(dir) = exe.parent()
-        {
-            let beside = dir.join(name);
-            if beside.is_file() {
-                return beside;
-            }
-        }
-        std::env::var_os("PATH")
-            .map(|path| std::env::split_paths(&path).map(|dir| dir.join(name)).find(|c| c.is_file()))
-            .unwrap_or(None)
-            .unwrap_or_else(|| PathBuf::from(name))
+        resolve_component(&ComponentId::Kaspad, configured.map(PathBuf::as_path), None).path
     }
 
-    /// Where the `misaka` CLI is: the configured path, beside the Studio, or PATH.
-    ///
-    /// Resolved exactly as [`Self::resolve_kaspad`] resolves the node, because a packaged Studio
-    /// ships both binaries side by side and a person who built from source has neither on PATH.
-    /// Returning the bare name when nothing is found is deliberate: the spawn then fails with the
-    /// name in the error, which is the message that tells someone what to install.
+    /// Where the `misaka` CLI is — the same order as the node, because a packaged Studio ships
+    /// both binaries side by side and a person who built from source has neither on PATH.
     pub fn resolve_misaka_cli(configured: Option<&PathBuf>) -> PathBuf {
-        let name = if cfg!(windows) { "misaka.exe" } else { "misaka" };
-        if let Some(path) = configured {
-            return path.clone();
-        }
-        if let Ok(exe) = std::env::current_exe()
-            && let Some(dir) = exe.parent()
-        {
-            let beside = dir.join(name);
-            if beside.is_file() {
-                return beside;
-            }
-        }
-        std::env::var_os("PATH")
-            .map(|path| std::env::split_paths(&path).map(|dir| dir.join(name)).find(|c| c.is_file()))
-            .unwrap_or(None)
-            .unwrap_or_else(|| PathBuf::from(name))
+        resolve_component(&ComponentId::Misaka, configured.map(PathBuf::as_path), None).path
+    }
+
+    /// **What the supervised node was actually started with** — for `/api/v1/settings/effective`
+    /// (ADR-0096 Decision 11). `None` while nothing is supervised: an attached node was started
+    /// by someone else, and this manager holds no argument list for it to report.
+    pub async fn effective(&self) -> Option<NodeEffective> {
+        let guard = self.supervised.read().await;
+        let node = guard.as_ref()?;
+        Some(NodeEffective {
+            binary: node.binary.clone(),
+            binary_candidate: node.binary_candidate,
+            args: node.args.clone(),
+            rpc_url: node.rpc_url.clone(),
+            role: node.role,
+            started_at_unix: node.started_at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+        })
     }
 
     /// The command line for a node in `settings`' network and role.
@@ -954,7 +960,8 @@ impl NodeManager {
             }
         }
 
-        let binary = Self::resolve_kaspad(settings.kaspad_path.as_ref());
+        let resolution = resolve_component(&ComponentId::Kaspad, settings.kaspad_path.as_deref(), None);
+        let binary = resolution.path;
         let rpc_port = default_json_rpc_port(settings.network);
         let mut args = Self::build_args(settings, rpc_port)?;
         if accept_data_loss {
@@ -1001,7 +1008,16 @@ impl NodeManager {
         }
 
         let view_args = std::iter::once(binary.display().to_string()).chain(args.iter().cloned()).collect();
-        *self.supervised.write().await = Some(SupervisedNode { child, rpc_url, role: settings.role, args_shown: view_args });
+        *self.supervised.write().await = Some(SupervisedNode {
+            child,
+            rpc_url,
+            role: settings.role,
+            args_shown: view_args,
+            binary,
+            binary_candidate: resolution.candidate,
+            args,
+            started_at: std::time::SystemTime::now(),
+        });
         self.view(settings).await
     }
 

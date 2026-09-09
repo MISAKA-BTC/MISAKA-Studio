@@ -7,8 +7,10 @@
 //! Command-line flags override the settings file for this run without rewriting it — the right
 //! behaviour for `--port 9000` on a one-off, and the wrong behaviour to persist silently.
 
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{ArgMatches, Command, CommandFactory, FromArgMatches, Parser};
 use misaka_studio_core::settings::{BackendKind, Settings, default_data_dir, default_settings_path};
+use misaka_studio_runtime::effective::SettingOrigins;
 use misaka_studio_runtime::{AppState, api, locate_ui};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -75,9 +77,33 @@ struct Args {
     log: String,
 
     /// Print the resolved configuration and exit. Cheap way to see which settings file and model
-    /// directory are actually in play before starting anything.
+    /// directory are actually in play before starting anything. Includes the components table
+    /// (every binary and artifact the Studio can spawn or map, where each was found) and, when
+    /// `components.manifest` is set, the manifest's findings (ADR-0096 Decision 10).
     #[arg(long)]
     check: bool,
+
+    /// With `--check`: exit non-zero on a component whose bytes do not match the manifest, or on
+    /// a binary the Studio can spawn that the manifest has no row for. The default stays
+    /// informational — a person reading the table is not a release gate, and a gate that fires
+    /// on a laptop with no manifest configured teaches people to ignore it.
+    #[arg(long, requires = "check")]
+    strict: bool,
+}
+
+/// Where a value the daemon applied over the settings file came from: the flag, or the
+/// environment variable clap read it from. `None` when the argument was not given — the file's
+/// value stands and the effective view says so.
+fn origin(matches: &ArgMatches, command: &Command, id: &str) -> Option<String> {
+    match matches.value_source(id)? {
+        ValueSource::CommandLine => Some(format!("--{}", id.replace('_', "-"))),
+        ValueSource::EnvVariable => {
+            let env =
+                command.get_arguments().find(|a| a.get_id() == id).and_then(|a| a.get_env()).map(|e| e.to_string_lossy().into_owned());
+            Some(format!("env {}", env.unwrap_or_else(|| "?".into())))
+        }
+        _ => None,
+    }
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -101,7 +127,11 @@ impl From<BackendArg> for BackendKind {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    // Parsed through the matches rather than `Args::parse()` so each override can also say
+    // whether it came from the flag or the environment — the effective view prints that.
+    let command = Args::command();
+    let matches = command.clone().get_matches();
+    let args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::new(&args.log)).with_target(false).init();
 
@@ -111,24 +141,42 @@ async fn main() -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| if args.data_dir.is_some() { data_dir.join("settings.json") } else { default_settings_path() });
 
+    let mut origins = SettingOrigins::default();
+    let mut note = |path: &str, id: &str| {
+        if let Some(source) = origin(&matches, &command, id) {
+            origins.record(path, source);
+        }
+    };
     let mut settings = Settings::load(&settings_path)?;
     if let Some(host) = args.host.clone() {
         settings.server.host = host;
+        note("server.host", "host");
     }
     if let Some(port) = args.port {
         settings.server.port = port;
+        note("server.port", "port");
     }
     if let Some(dir) = args.models_dir.clone() {
         settings.models_dir = dir;
+        note("models_dir", "models_dir");
     }
     if let Some(kind) = args.backend {
         settings.backend.kind = kind.into();
+        note("backend.kind", "backend");
     }
     if let Some(key) = args.api_key.clone() {
         settings.server.api_key = Some(key);
+        note("server.api_key", "api_key");
     }
     if let Some(path) = args.llama_server.clone() {
         settings.backend.llama_server_path = Some(path);
+        note("backend.llama_server_path", "llama_server");
+    }
+    if args.data_dir.is_some() {
+        note("data_dir", "data_dir");
+    }
+    if args.settings.is_some() {
+        note("settings_path", "settings");
     }
 
     // Refused, not warned about. The failure this prevents — an unauthenticated inference
@@ -182,11 +230,18 @@ async fn main() -> anyhow::Result<()> {
             }
         );
         println!("api key       : {}", if settings.server.api_key.is_some() { "set" } else { "not set" });
+        for (path, source) in &origins.overrides {
+            println!("override      : {path} from {source}");
+        }
+        let failed = print_components(&settings).await;
+        if args.strict && failed {
+            anyhow::bail!("--strict: a component mismatches the manifest, or a spawnable id has no row (see above)");
+        }
         return Ok(());
     }
 
     let cors_origins = settings.server.cors_origins.clone();
-    let state = AppState::new(settings, settings_path, data_dir).await;
+    let state = AppState::with_origins(settings, settings_path, data_dir, origins).await;
     tokio::spawn(state.metrics.clone().run());
     // Before the listener binds, so a first run is already fetching the default class artifact
     // by the time the window has finished opening.
@@ -253,6 +308,64 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("could not stop the engine cleanly: {e}");
     }
     Ok(())
+}
+
+/// The components table and, when a manifest is configured, its findings. Returns whether
+/// `--strict` should fail: a `mismatch` state, a spawnable id the manifest has no row for, or a
+/// configured manifest that could not be read or did not validate — a gate that passed because
+/// its manifest was unreachable would be measuring nothing.
+///
+/// The manifest is read whenever `components.manifest` is set — `--check` is a person asking, so
+/// `components.auto_check` (which governs what the Studio does unasked) does not apply. The
+/// digests are not computed here: a `mismatch` on this path is a size that differs, which is
+/// the cheap check; `GET /api/v1/components?verify=1` is the expensive one.
+async fn print_components(settings: &Settings) -> bool {
+    use misaka_studio_runtime::components::{ComponentState, check_spawnable_ids, load_manifest, report};
+
+    let mut failed = false;
+    let manifest = match &settings.components.manifest {
+        None => {
+            println!("manifest      : not set (components.manifest); everything found is `not-in-manifest`");
+            None
+        }
+        Some(source) => {
+            let catalog = misaka_studio_runtime::catalog::Catalog::new(settings.huggingface.endpoint.clone(), None);
+            match load_manifest(source, &catalog).await {
+                Ok(manifest) => {
+                    println!("manifest      : {source} (release {}, network {})", manifest.release, manifest.network);
+                    Some(manifest)
+                }
+                Err(e) => {
+                    println!("manifest      : {e}");
+                    failed = true;
+                    None
+                }
+            }
+        }
+    };
+    println!("components    : (id · state · path, found where) — platform {}", misaka_studio_runtime::components::HOST_PLATFORM);
+    for row in report(settings, manifest.as_ref(), false).await {
+        failed |= row.state == ComponentState::Mismatch;
+        println!(
+            "  {:<24} {:<22} {} ({}){}",
+            row.id,
+            row.state.as_str(),
+            row.installed.path.display(),
+            row.installed.candidate,
+            row.note.map(|n| format!(" — {n}")).unwrap_or_default()
+        );
+    }
+    if let Some(manifest) = &manifest {
+        let findings = check_spawnable_ids(manifest);
+        if findings.is_empty() {
+            println!("findings      : none — every spawnable id is a row and no retired id is");
+        }
+        for finding in findings {
+            failed |= finding.is_strict_failure();
+            println!("finding       : {finding}");
+        }
+    }
+    failed
 }
 
 /// Resolves when standard input reaches EOF — see `--exit-on-stdin-close`.

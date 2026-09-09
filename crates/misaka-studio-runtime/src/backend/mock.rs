@@ -12,7 +12,10 @@
 //! runtime class tag (`misaka-studio-mock/v1`) is distinct — so a record produced here can never
 //! be confused for one produced by a real engine.
 
-use super::{Availability, GenerationRequest, InferenceBackend, LoadRequest, LoadedModel, StreamEvent, Usage, approximate_tokens};
+use super::{
+    Availability, GenerationRequest, InferenceBackend, LoadRequest, LoadedModel, RuntimeFingerprint, StreamEvent, Usage,
+    approximate_tokens,
+};
 use crate::Result;
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
@@ -32,6 +35,9 @@ pub struct MockBackend {
 }
 
 impl MockBackend {
+    /// The name this backend answers to, everywhere.
+    pub const NAME: &'static str = "mock";
+
     pub fn new(token_delay: Duration) -> Self {
         MockBackend { loaded: Mutex::new(None), token_delay }
     }
@@ -60,7 +66,13 @@ impl Default for MockBackend {
 
 impl InferenceBackend for MockBackend {
     fn name(&self) -> &'static str {
-        "mock"
+        Self::NAME
+    }
+
+    fn fingerprint(&self) -> RuntimeFingerprint {
+        let mut fingerprint = RuntimeFingerprint::new(Self::NAME);
+        fingerprint.extra.insert("token_delay_ms".into(), self.token_delay.as_millis().to_string());
+        fingerprint
     }
 
     fn descriptor(&self) -> BoxFuture<'_, RuntimeDescriptor> {

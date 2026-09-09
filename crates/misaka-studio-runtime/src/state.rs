@@ -10,10 +10,12 @@ use crate::backend::misaka::MisakaBackend;
 use crate::backend::mlx::MlxBackend;
 use crate::backend::mock::MockBackend;
 use crate::backend::{
-    ChatMessage, GenerationRequest, LegLimits, LoadRequest, LoadedModel, SharedBackend, StreamEvent, Usage, merge_misaka,
+    ChatMessage, GenerationRequest, LegLimits, LoadRequest, LoadedModel, RuntimeFingerprint, SharedBackend, StreamEvent, Usage,
+    merge_misaka,
 };
 use crate::catalog::Catalog;
 use crate::download::DownloadManager;
+use crate::effective::SettingOrigins;
 use crate::metrics::MetricsHub;
 use crate::records::{RecordStore, StoredRecord};
 use crate::store::ModelStore;
@@ -61,6 +63,17 @@ pub struct RuntimeStatus {
     pub descriptor: Option<misaka_studio_core::provenance::RuntimeDescriptor>,
 }
 
+/// When each subsystem's running object was (re)built — the `since` of the effective view
+/// (ADR-0096 Decision 11). Unix seconds are what the API prints; the value is taken at the
+/// moment the object is swapped in, in the same critical section, so it cannot describe an
+/// object other than the one it sits beside.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuiltAt {
+    pub backend: SystemTime,
+    pub catalog: SystemTime,
+    pub records: SystemTime,
+}
+
 pub struct AppState {
     pub settings: RwLock<Settings>,
     pub settings_path: PathBuf,
@@ -78,10 +91,20 @@ pub struct AppState {
     loaded: RwLock<Option<LoadedState>>,
     /// The chat history, one file per conversation (ADR-0096 Decision 12).
     pub conversations: Arc<crate::conversations::ConversationStore>,
+    /// Which settings the daemon overrode from a flag or the environment for this run, so the
+    /// effective view can name the source instead of saying "settings file" about a value the
+    /// file does not hold.
+    pub origins: SettingOrigins,
+    built_at: RwLock<BuiltAt>,
 }
 
 impl AppState {
     pub async fn new(settings: Settings, settings_path: PathBuf, data_dir: PathBuf) -> Arc<Self> {
+        Self::with_origins(settings, settings_path, data_dir, SettingOrigins::default()).await
+    }
+
+    /// [`AppState::new`], told which settings came from a flag or the environment.
+    pub async fn with_origins(settings: Settings, settings_path: PathBuf, data_dir: PathBuf, origins: SettingOrigins) -> Arc<Self> {
         let hardware = HardwareSnapshot::probe();
         let store = Arc::new(ModelStore::new(vec![settings.models_dir.clone()]));
         if let Err(e) = store.refresh().await {
@@ -103,6 +126,7 @@ impl AppState {
         let node = Arc::new(crate::node::NodeManager::with_journal(Some(data_dir.join("produced-blocks.jsonl"))));
         let mining = crate::mining_queue::MiningQueue::open(data_dir.join("mining-queue.json")).await;
         let conversations = crate::conversations::ConversationStore::new(data_dir.join("conversations"));
+        let now = SystemTime::now();
         let app = Arc::new(AppState {
             settings: RwLock::new(settings),
             settings_path,
@@ -118,6 +142,8 @@ impl AppState {
             backend: RwLock::new(backend),
             loaded: RwLock::new(None),
             conversations,
+            origins,
+            built_at: RwLock::new(BuiltAt { backend: now, catalog: now, records: now }),
         });
         // The queue's worker lives as long as the app: prompts queued in an earlier run are still
         // owed a claim, and the person may have closed the window on them on purpose.
@@ -265,29 +291,46 @@ impl AppState {
         self.loaded.read().await.clone()
     }
 
+    /// When each running object was built.
+    pub async fn built_at(&self) -> BuiltAt {
+        *self.built_at.read().await
+    }
+
     /// Apply new settings: persist them, then rebuild whatever they changed.
     ///
     /// Changing the backend or the model directory unloads the current model. That is the honest
     /// behaviour — the loaded model may not exist under the new directory, and it certainly is
     /// not loaded in the new engine — and it is stated in the API response rather than left for
     /// the user to discover when generation fails.
+    ///
+    /// **The engine is rebuilt on a fingerprint, not on a list** (ADR-0096 Decision 11). The list
+    /// this replaced lacked the gateway URL and the slot token on 2026-09-05, and the fix was two
+    /// more entries in a list that was still a list. Now three questions are asked, none of which
+    /// names a field:
+    ///
+    /// 1. *Did a routing input change?* `backend.kind` and `node.mining_mode` do not reach a
+    ///    constructor; they decide WHICH engine answers (`build_backend`, `backend_for`), so a
+    ///    change to either re-runs that decision on the next load.
+    /// 2. *Would the setting's own choice build differently?* The fingerprint `backend.kind`
+    ///    builds under the new settings against the one it built under the old — `Auto`
+    ///    resolving to MLX once an MLX server is named, for instance.
+    /// 3. *Would the engine that IS running build differently?* The running engine may have been
+    ///    chosen by the file rather than the setting (a `.palwart` under `Auto` runs on the
+    ///    gateway), so its own kind is rebuilt under the new settings and held against its
+    ///    fingerprint. This is the question whose answer was wrong on 2026-09-05.
     pub async fn apply_settings(&self, new: Settings) -> Result<Settings> {
         let old = self.settings.read().await.clone();
         new.save(&self.settings_path)?;
 
-        // A gateway engine IS its address and its token: `GatewayBackend::new` copies both at
-        // construction and never reads settings again. Joining a new pool slot (or forgetting one)
-        // rewrites exactly those two fields while the kind stays `Gateway`, so without this the
-        // engine kept answering — and mining — for the slot the person had just left, with that
-        // slot's token, while every status panel named the new one.
-        let backend_changed = new.backend.kind != old.backend.kind
-            || new.backend.llama_server_path != old.backend.llama_server_path
-            || new.backend.mlx_server_path != old.backend.mlx_server_path
-            || new.node.palw_gateway_url != old.node.palw_gateway_url
-            || new.node.pool_slot_token != old.node.pool_slot_token
-            // Background mining moves the chat off the gateway and onto the local runtime (when
-            // it is installed); the engine has to follow the switch, in both directions.
-            || new.node.mining_mode != old.node.mining_mode;
+        let running = self.backend().await;
+        let routing_changed = new.backend.kind != old.backend.kind || new.node.mining_mode != old.node.mining_mode;
+        let selection_changed =
+            fingerprint_for(new.backend.kind, &new, &self.hardware) != fingerprint_for(old.backend.kind, &old, &self.hardware);
+        let running_changed = match kind_for_backend_name(running.name()) {
+            Some(kind) => fingerprint_for(kind, &new, &self.hardware) != running.fingerprint(),
+            None => true,
+        };
+        let backend_changed = routing_changed || selection_changed || running_changed;
         let models_dir_changed = new.models_dir != old.models_dir;
         let hub_changed = new.huggingface.endpoint != old.huggingface.endpoint || new.huggingface.token != old.huggingface.token;
         let recording_changed = new.provenance.record_inferences != old.provenance.record_inferences
@@ -296,12 +339,14 @@ impl AppState {
         if backend_changed {
             self.unload().await?;
             *self.backend.write().await = build_backend(&new, &self.hardware);
+            self.built_at.write().await.backend = SystemTime::now();
         }
         if models_dir_changed {
             self.store.set_roots(vec![new.models_dir.clone()]).await?;
         }
         if hub_changed {
             *self.catalog.write().await = Arc::new(Catalog::new(new.huggingface.endpoint.clone(), new.huggingface.token.clone()));
+            self.built_at.write().await.catalog = SystemTime::now();
         }
         if recording_changed {
             *self.records.write().await = RecordStore::open(
@@ -310,6 +355,7 @@ impl AppState {
                 new.provenance.record_inferences,
             )
             .await;
+            self.built_at.write().await.records = SystemTime::now();
         }
 
         *self.settings.write().await = new.clone();
@@ -407,7 +453,13 @@ impl AppState {
         // The engine that answered this load is the one `generate` has to reach, so the choice is
         // recorded rather than recomputed. Unloading does not put the configured one back: what
         // matters is which engine holds the model, and after an unload none does.
-        *self.backend.write().await = backend.clone();
+        {
+            let mut slot = self.backend.write().await;
+            if !Arc::ptr_eq(&*slot, &backend) {
+                self.built_at.write().await.backend = SystemTime::now();
+            }
+            *slot = backend.clone();
+        }
         let state = LoadedState { model, loaded, runtime, identity, backend: backend.name().to_string() };
         *self.loaded.write().await = Some(state.clone());
         Ok(self.status_from(Some(&state), true).await)
@@ -764,6 +816,29 @@ pub fn build_backend(settings: &Settings, hardware: &HardwareSnapshot) -> Shared
     build_backend_kind(settings.backend.kind, settings, hardware)
 }
 
+/// **The fingerprint these settings would build** for `kind`, without keeping the engine.
+///
+/// Constructing an engine spawns nothing and opens no socket — the process starts at `load` —
+/// so building one and reading its fingerprint IS the pure function of settings the rebuild
+/// predicate needs: whatever a constructor copies is compared, by construction, and a field a
+/// future constructor starts copying is compared without anyone remembering to add it here.
+pub fn fingerprint_for(kind: BackendKind, settings: &Settings, hardware: &HardwareSnapshot) -> RuntimeFingerprint {
+    build_backend_kind(kind, settings, hardware).fingerprint()
+}
+
+/// The setting that builds an engine of this name — the inverse of [`build_backend_kind`] over
+/// the engines it can build. `Auto` is never a name: it is the rule that picks one of these.
+pub fn kind_for_backend_name(name: &str) -> Option<BackendKind> {
+    match name {
+        n if n == LlamaCppBackend::NAME => Some(BackendKind::LlamaCpp),
+        n if n == MlxBackend::NAME => Some(BackendKind::Mlx),
+        n if n == MisakaBackend::NAME => Some(BackendKind::Misaka),
+        n if n == crate::backend::gateway::NAME => Some(BackendKind::Gateway),
+        n if n == MockBackend::NAME => Some(BackendKind::Mock),
+        _ => None,
+    }
+}
+
 /// Build one particular engine, from the same settings.
 ///
 /// Split out because the engine is not only a preference: a `.palwart` can be run by the integer
@@ -876,6 +951,24 @@ fn engine_pairing_refusal(model_id: &str, file_name: Option<&str>, backend: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every engine `build_backend_kind` can build names itself back to the setting that built
+    /// it — the map the rebuild predicate uses to ask "what would the running engine's kind build
+    /// under the new settings". A name with no kind would make every save a rebuild.
+    #[test]
+    fn every_buildable_kind_names_itself_back() {
+        let settings = Settings::default();
+        let hardware = machine(16, None);
+        for kind in [BackendKind::LlamaCpp, BackendKind::Mlx, BackendKind::Misaka, BackendKind::Gateway, BackendKind::Mock] {
+            let backend = build_backend_kind(kind, &settings, &hardware);
+            assert_eq!(kind_for_backend_name(backend.name()), Some(kind), "{}", backend.name());
+            assert_eq!(backend.fingerprint().kind, backend.name(), "the fingerprint names the engine");
+            assert_eq!(fingerprint_for(kind, &settings, &hardware), backend.fingerprint(), "building twice fingerprints the same");
+        }
+        let auto = build_backend(&settings, &hardware);
+        assert!(kind_for_backend_name(auto.name()).is_some(), "Auto resolves to a named engine");
+        assert_eq!(kind_for_backend_name("auto"), None);
+    }
 
     /// Both directions of the same mistake. On 2026-09-04 only the first existed as a check, and
     /// only after a `.palwart` reached `llama-server`, which read `PALW` where `GGUF` should be and
