@@ -828,6 +828,76 @@ mod tests {
         ChatCompletionRequest::parse(body.as_bytes())
     }
 
+    /// **ADR-0096 invariant 7: the conformance corpus passes on this entrance too, from the same
+    /// files.** `testdata/openai-surface/v1/` is a byte-for-byte mirror of the node repository's
+    /// `docs/openai-surface/v1/` (misakas, `feat/adr-0096-everyday-lane`), pinned by the same
+    /// directory digest the gateway pins as `OPENAI_SURFACE_V1_CORPUS_SHA256`, so the two
+    /// entrances cannot drift apart without one of the two tests going red. Where Decision 1's
+    /// table makes the entrances differ on purpose, a case carries `expect.studio` and this test
+    /// prefers it; everywhere else the verdict is the gateway's verdict.
+    const OPENAI_SURFACE_V1_CORPUS_SHA256: &str = "5cdf928859dccdc7e841b6f4f9b01dc75a1080f3705e515ef1793cf6d08d72b9";
+
+    #[test]
+    fn the_conformance_corpus_passes_on_the_studios_v1() {
+        use sha2::{Digest, Sha256};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/openai-surface/v1");
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("the mirrored corpus directory exists")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".json"))
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names.len(), 22, "the corpus is 22 cases; a new case lands in the node tree first and is mirrored here");
+        let mut hasher = Sha256::new();
+        for name in &names {
+            let bytes = std::fs::read(dir.join(name)).expect("a corpus file reads");
+            hasher.update(name.as_bytes());
+            hasher.update([0u8]);
+            hasher.update(&bytes);
+            hasher.update([0u8]);
+            let case: Value = serde_json::from_slice(&bytes).expect("a corpus file is JSON");
+            let request = serde_json::to_vec(&case["request"]).expect("the request serializes");
+            let expect = &case["expect"];
+            let studio = expect.get("studio");
+            let verdict = studio
+                .and_then(|s| s.get("verdict"))
+                .or_else(|| expect.get("verdict"))
+                .and_then(Value::as_str)
+                .expect("every case names a verdict");
+            match ChatCompletionRequest::parse(&request) {
+                Ok(parsed) => {
+                    assert_eq!(verdict, "accepted", "{name}: this entrance accepted a request the corpus refuses");
+                    let expected = studio.and_then(|s| s.get("ignored_fields")).or_else(|| expect.get("ignored_fields"));
+                    if let Some(list) = expected.and_then(Value::as_array) {
+                        let mut want: Vec<String> = list.iter().filter_map(Value::as_str).map(str::to_string).collect();
+                        let mut got: Vec<String> = parsed
+                            .notices
+                            .get("ignored_fields")
+                            .and_then(Value::as_array)
+                            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                            .unwrap_or_default();
+                        want.sort();
+                        got.sort();
+                        assert_eq!(got, want, "{name}: misaka.ignored_fields is the exact set the corpus names");
+                    }
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    assert_eq!(verdict, "refused", "{name}: this entrance refused ({message}) a request the corpus accepts");
+                    if let Some(needle) = studio.and_then(|s| s.get("reason_contains")).and_then(Value::as_str) {
+                        assert!(message.contains(needle), "{name}: the refusal must say {needle:?}; it said {message:?}");
+                    }
+                }
+            }
+        }
+        let digest = format!("{:x}", hasher.finalize());
+        assert_eq!(
+            digest, OPENAI_SURFACE_V1_CORPUS_SHA256,
+            "the mirrored corpus is not the node tree's: re-copy docs/openai-surface/v1 from misakas and pin the digest both trees carry"
+        );
+    }
+
     fn refusal(body: &str) -> String {
         match parse(body) {
             Err(Error::BadRequest { message }) => message,
