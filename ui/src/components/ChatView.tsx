@@ -154,7 +154,7 @@ function SamplingNotice({ sampling }: { sampling: MisakaSampling }) {
   )
 }
 
-/** `JSON ✓ advisory`, `JSON ✗ committed` — the shape, whether it held, and who enforced it. */
+/** `JSON ✓ advisory`, `JSON ✓ masked`, `JSON ✗ committed` — the shape, whether it held, and who enforced it. */
 function FormatBadge({ format }: { format: MisakaFormat }) {
   const [open, setOpen] = useState(false)
   const kind = format.requested.type === 'json_object' ? 'JSON' : format.requested.type === 'json_schema' ? 'JSON schema' : format.requested.type
@@ -164,7 +164,9 @@ function FormatBadge({ format }: { format: MisakaFormat }) {
   const title = [
     format.enforcement === 'committed'
       ? 'Committed: the seat replays this constraint and the court can try it.'
-      : 'Advisory: the shape rode the prompt as text and was checked after the fact; nothing constrained the decode.',
+      : format.enforcement === 'masked'
+        ? 'Masked: the decode was constrained to this shape on this machine, so the model could not leave it; nothing was committed to a chain.'
+        : 'Advisory: the shape rode the prompt as text and was checked after the fact; nothing constrained the decode.',
     format.canonical_sha256 ? `canonical sha256 ${format.canonical_sha256}` : null,
     format.errors.length > 0 ? `${format.errors.length} error${format.errors.length === 1 ? '' : 's'} — click to show` : null,
   ]

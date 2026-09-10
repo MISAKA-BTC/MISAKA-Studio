@@ -410,9 +410,10 @@ export type MisakaSampling = {
 /** Decision 3: the shape that was asked for, and whether the chain enforced it or only checked it. */
 export type MisakaFormat = {
   requested: { type: string; constraint_id: string | null }
-  /** `committed` — the seat replays the constraint and the court can try it; `advisory` — the
-   *  schema rode the prompt as text and the answer was validated after the fact. */
-  enforcement: 'advisory' | 'committed'
+  /** `committed` — the seat replays the constraint and the court can try it; `masked` — the
+   *  decode was constrained on this machine and nothing reached a chain (the local engine);
+   *  `advisory` — the schema rode the prompt as text and the answer was validated after the fact. */
+  enforcement: 'advisory' | 'committed' | 'masked'
   valid: boolean
   errors: string[]
   canonical_sha256: string | null
