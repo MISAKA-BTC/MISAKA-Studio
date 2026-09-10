@@ -483,7 +483,11 @@ pub(crate) struct SseParser {
     /// only `choices` drops it, the stream ends with no deltas, and the app shows an empty reply
     /// at 0.0 tok/s: the one failure that looks like nothing happening. Measured on a chat whose
     /// second turn exceeded the class's context.
-    error: Option<String>,
+    ///
+    /// Kept with the whole event it arrived in: the gateway's refusal carries `error.code` and
+    /// `misaka.refusal` beside the sentence (ADR-0097 Decision 2), and a caller that decides by
+    /// the code must not be handed only the sentence.
+    error: Option<(String, serde_json::Value)>,
     /// The `misaka` extension object, from whichever event carried one last.
     ///
     /// The gateway's final event is `{"misaka": {...}, "usage": {...}}` with no `choices` at
@@ -516,7 +520,7 @@ impl SseParser {
                 Some(text) => text.to_string(),
                 None => m.to_string(),
             }) {
-                self.error = Some(message);
+                self.error = Some((message, json.clone()));
                 continue;
             }
 
@@ -568,6 +572,12 @@ impl SseParser {
     /// as it is never presented as exact.
     /// The server's own error, once, if it sent one.
     pub(crate) fn take_error(&mut self) -> Option<String> {
+        self.error.take().map(|(message, _)| message)
+    }
+
+    /// The server's own error with the whole event it arrived in, once — for a caller that reads
+    /// more than the sentence (the gateway's `error.code` and `misaka.refusal`, ADR-0097 D2).
+    pub(crate) fn take_error_event(&mut self) -> Option<(String, serde_json::Value)> {
         self.error.take()
     }
 

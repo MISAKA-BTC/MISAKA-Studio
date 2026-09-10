@@ -107,6 +107,74 @@ pub const NOT_A_RULE_ON_THIS_LANE: [&str; 4] = ["top_p", "top_k", "min_p", "repe
 /// characters, as the gateway spells it.
 pub const GREEDY_SEED_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
+/// **The limits object's schema** (ADR-0097 Decision 2). A gateway that names another schema is
+/// read as one that published no limits, never as one whose fields mean what these meant.
+pub const LIMITS_SCHEMA_V1: &str = "misaka.palw.limits.v1";
+
+/// **What the gateway says its limits are, before the first token** — `/health`'s `limits`
+/// (ADR-0097 Decision 2). Read instead of inferred: the window, the most one job decodes, the
+/// prompt's byte ceiling, the tokenizer the ids are counted in, and whether the committed format
+/// is served. `None` on [`GatewayFacts`] is a gateway from before ADR-0097, read the old way.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GatewayLimits {
+    /// `context_window` — the class's `n_ctx`, prompt and answer together.
+    pub context_window: u32,
+    /// `max_output_tokens` — `min(--max-decode-cap, n_ctx − 1)`: the most ONE job decodes. A
+    /// larger ask is clamped at the gateway, so the lane never sends one.
+    pub max_output_tokens: u32,
+    /// `max_prompt_bytes` — the rendered prompt's byte ceiling.
+    pub max_prompt_bytes: u64,
+    /// `tokenizer_id` — which tokenizer the gateway counts in.
+    pub tokenizer_id: String,
+    /// `features.require_committed_format == "served"`.
+    pub committed_format_served: bool,
+}
+
+/// `/health`'s `limits`, when it is there and names [`LIMITS_SCHEMA_V1`].
+pub fn limits_from_health(health: &Value) -> Option<GatewayLimits> {
+    let limits = health.get("limits")?;
+    if limits.get("schema").and_then(Value::as_str) != Some(LIMITS_SCHEMA_V1) {
+        return None;
+    }
+    let window = |key: &str| limits.get(key).and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0);
+    Some(GatewayLimits {
+        context_window: window("context_window")?,
+        max_output_tokens: window("max_output_tokens")?,
+        max_prompt_bytes: limits.get("max_prompt_bytes").and_then(Value::as_u64).unwrap_or(u64::MAX),
+        tokenizer_id: limits.get("tokenizer_id").and_then(Value::as_str).unwrap_or_default().to_string(),
+        committed_format_served: limits.get("features").and_then(|f| f.get("require_committed_format")).and_then(Value::as_str)
+            == Some("served"),
+    })
+}
+
+/// **A gateway's `/health`, read** — pure, so the precedence is a test and not a comment.
+///
+/// With [`GatewayLimits`] present, the window IS `limits.context_window` and the committed-format
+/// fence IS `limits.features.require_committed_format`: the gateway's statement of what it serves,
+/// one reading rather than two that could disagree. The bare `n_ctx` and `chain.*` flag are read
+/// only from a gateway that predates the limits.
+pub fn facts_from_health(body: &Value) -> GatewayFacts {
+    let string = |key: &str| body.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
+    let chain_flag = |key: &str| body.get("chain").and_then(|c| c.get(key)).and_then(Value::as_bool).unwrap_or(false);
+    let limits = limits_from_health(body);
+    GatewayFacts {
+        class_id: string("class_id"),
+        bond: string("bond"),
+        n_ctx: limits
+            .as_ref()
+            .map(|l| l.context_window)
+            .unwrap_or_else(|| body.get("n_ctx").and_then(Value::as_u64).unwrap_or(0) as u32),
+        runtime_manifest_hash: string("runtime_manifest_hash"),
+        can_submit: body.get("can_submit").and_then(Value::as_bool).unwrap_or(false),
+        fp_certified: chain_flag("fp_certified"),
+        fp_decode_constraint_armed: limits
+            .as_ref()
+            .map(|l| l.committed_format_served)
+            .unwrap_or_else(|| chain_flag("fp_decode_constraint_armed")),
+        limits,
+    }
+}
+
 /// A gateway's `/health`, as much of it as this backend reads.
 #[derive(Clone, Debug, Default)]
 pub struct GatewayFacts {
@@ -123,6 +191,10 @@ pub struct GatewayFacts {
     /// Absent from an older gateway's health is `false`, which is also the truth on every shipped
     /// network: arming needs a build that reports the field.
     pub fp_decode_constraint_armed: bool,
+    /// ADR-0097 Decision 2: the limits the gateway published, or `None` from an older gateway.
+    /// When present, `n_ctx` and `fp_decode_constraint_armed` above were read from it
+    /// ([`facts_from_health`]).
+    pub limits: Option<GatewayLimits>,
 }
 
 pub struct GatewayBackend {
@@ -171,17 +243,7 @@ impl GatewayBackend {
             return Err(format!("{} answered {}", self.url, response.status()));
         }
         let body: Value = response.json().await.map_err(|e| format!("{} did not answer JSON: {e}", self.url))?;
-        let string = |key: &str| body.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
-        let chain_flag = |key: &str| body.get("chain").and_then(|c| c.get(key)).and_then(Value::as_bool).unwrap_or(false);
-        let facts = GatewayFacts {
-            class_id: string("class_id"),
-            bond: string("bond"),
-            n_ctx: body.get("n_ctx").and_then(Value::as_u64).unwrap_or(0) as u32,
-            runtime_manifest_hash: string("runtime_manifest_hash"),
-            can_submit: body.get("can_submit").and_then(Value::as_bool).unwrap_or(false),
-            fp_certified: chain_flag("fp_certified"),
-            fp_decode_constraint_armed: chain_flag("fp_decode_constraint_armed"),
-        };
+        let facts = facts_from_health(&body);
         *self.facts.write().await = Some(facts.clone());
         Ok(facts)
     }
@@ -226,9 +288,10 @@ impl InferenceBackend for GatewayBackend {
             match self.health().await {
                 Ok(facts) => Availability::Available {
                     detail: format!(
-                        "class {}… · n_ctx {} · {}",
+                        "class {}… · n_ctx {}{} · {}",
                         facts.class_id.chars().take(16).collect::<String>(),
                         facts.n_ctx,
+                        facts.limits.as_ref().map(|l| format!(" (one answer ≤ {})", l.max_output_tokens)).unwrap_or_default(),
                         if facts.fp_certified { "free-prompt lane certified" } else { "lane NOT certified on this chain" }
                     ),
                 },
@@ -281,6 +344,9 @@ impl InferenceBackend for GatewayBackend {
         Box::pin(async move {
             let facts = self.facts.read().await.clone();
             let n_ctx = facts.as_ref().map(|f| f.n_ctx as u64).filter(|n| *n > 0);
+            // ADR-0097 Decision 2: the most one job decodes, as the gateway states it. `None` from
+            // a gateway that predates its limits, where the gateway's own clamp was invisible.
+            let max_output = facts.as_ref().and_then(|f| f.limits.as_ref()).map(|l| l.max_output_tokens as u64);
 
             // ADR-0096 Decision 3, before any job runs: an integration that needs the committed
             // guarantee must never receive an advisory lookalike. The fence is the chain's, read
@@ -306,6 +372,7 @@ impl InferenceBackend for GatewayBackend {
                 token: self.token.clone(),
                 url: format!("{}/v1/chat/completions", self.url),
                 n_ctx,
+                max_output,
                 extra_prompt_tokens,
             };
             let mut planner = LegPlanner::new(request.legs);
@@ -335,7 +402,12 @@ impl InferenceBackend for GatewayBackend {
                 Some(leg) => leg,
                 None => {
                     role = LegRole::Answer;
-                    let ceiling = answer_ceiling(prompt_tokens_upper_bound(&context) + extra_prompt_tokens, n_ctx, requested_tokens)?;
+                    let ceiling = answer_ceiling(
+                        prompt_tokens_upper_bound(&context) + extra_prompt_tokens,
+                        n_ctx,
+                        max_output,
+                        requested_tokens,
+                    )?;
                     let response = lane.send(&context, ceiling, &shape).await?;
                     Leg { messages: context.clone(), shape: shape.clone(), response }
                 }
@@ -399,7 +471,7 @@ impl InferenceBackend for GatewayBackend {
                     let leg = match next {
                         LegRole::Answer => {
                             let estimate = prompt_tokens_upper_bound(&context) + extra_prompt_tokens;
-                            match answer_ceiling(estimate, n_ctx, requested_tokens) {
+                            match answer_ceiling(estimate, n_ctx, max_output, requested_tokens) {
                                 Ok(ceiling) => Some((context.clone(), ceiling, shape.clone())),
                                 Err(e) => {
                                     let _ = tx.send(Err(e)).await;
@@ -413,7 +485,7 @@ impl InferenceBackend for GatewayBackend {
                             match continue_leg_messages(&context, &answer, budget) {
                                 Some(messages) => {
                                     let estimate = prompt_tokens_upper_bound(&messages) + extra_prompt_tokens;
-                                    match answer_ceiling(estimate, n_ctx, remaining) {
+                                    match answer_ceiling(estimate, n_ctx, max_output, remaining) {
                                         Ok(ceiling) => Some((messages, ceiling, shape.clone())),
                                         Err(e) => {
                                             jobs.push(job_error(next, e.to_string()));
@@ -457,6 +529,10 @@ impl InferenceBackend for GatewayBackend {
                     "prompt_tokens_estimate": prompt_tokens_upper_bound(&context) + extra_prompt_tokens,
                     "dropped_turns": original_turns.saturating_sub(kept_turns),
                 });
+                if let Some(cap) = max_output {
+                    // ADR-0097 Decision 2: the per-job ceiling the gateway published, beside the window.
+                    report["max_output_tokens"] = json!(cap);
+                }
                 if let Some(covered) = summarized {
                     report["summarized_turns"] = json!(covered);
                 }
@@ -722,8 +798,14 @@ pub fn continue_leg_messages(context: &[ChatMessage], answer_so_far: &str, budge
 /// The prompt is estimated rather than tokenized here — the class's tokenizer lives with the
 /// worker — so a margin is left for the estimate being low and for the chat template's own
 /// markers.
-fn answer_ceiling(prompt_estimate: u64, n_ctx: Option<u64>, asked: u64) -> Result<u64> {
-    let Some(n_ctx) = n_ctx else { return Ok(asked) };
+///
+/// **And never more than one job decodes** (ADR-0097 Decision 2): `max_output` is the gateway's
+/// published `max_output_tokens`, so a ceiling above it would only be clamped at the gateway. The
+/// cap is per JOB: the request's own ask is what the continue legs compare delivery against, and
+/// it is left as the request stated it.
+fn answer_ceiling(prompt_estimate: u64, n_ctx: Option<u64>, max_output: Option<u64>, asked: u64) -> Result<u64> {
+    let cap = |ceiling: u64| max_output.map_or(ceiling, |cap| ceiling.min(cap));
+    let Some(n_ctx) = n_ctx else { return Ok(cap(asked)) };
     let used = prompt_estimate.saturating_add(TEMPLATE_MARGIN_TOKENS);
     let room = n_ctx.saturating_sub(used);
     if room == 0 {
@@ -735,7 +817,7 @@ fn answer_ceiling(prompt_estimate: u64, n_ctx: Option<u64>, asked: u64) -> Resul
             ),
         });
     }
-    Ok(if asked <= room { asked } else { room.min(DEFAULT_ANSWER_TOKENS) })
+    Ok(cap(if asked <= room { asked } else { room.min(DEFAULT_ANSWER_TOKENS) }))
 }
 
 /// One `misaka.jobs[]` entry for a leg that ran.
@@ -865,6 +947,8 @@ struct Lane {
     token: Option<String>,
     url: String,
     n_ctx: Option<u64>,
+    /// The gateway's published `max_output_tokens` (ADR-0097 Decision 2), when it published one.
+    max_output: Option<u64>,
     extra_prompt_tokens: u64,
 }
 
@@ -893,10 +977,8 @@ impl Lane {
         // The gateway's own error body is OpenAI-shaped; the sentence inside it is the one worth
         // repeating. A 4xx is the gateway refusing BY NAME — a temperature on a dormant fence, a
         // role it does not serve — and reaches the client as the 400 it is, not as an engine fault.
-        let message = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| v.get("error").and_then(|e| e.get("message")).and_then(Value::as_str).map(str::to_string))
-            .unwrap_or_else(|| text.trim().to_string());
+        // One reader for that body, here and in the stream and in the mining queue ([`LaneRefusal`]).
+        let message = LaneRefusal::from_text(&text).message;
         if status.is_client_error() {
             return Err(Error::BadRequest { message: format!("the gateway refused the request ({status}): {message}") });
         }
@@ -919,7 +1001,7 @@ impl Lane {
             let mut parser = SseParser::new(true);
             let mut byte_stream = response.bytes_stream();
             let mut text = String::new();
-            let mut refusal = None;
+            let mut refusal: Option<LaneRefusal> = None;
             while let Some(chunk) = byte_stream.next().await {
                 let chunk = chunk.map_err(|e| Error::Engine { backend: NAME, message: format!("stream broke: {e}") })?;
                 for event in parser.push(&chunk) {
@@ -933,19 +1015,27 @@ impl Lane {
                         return Err(Error::Cancelled);
                     }
                 }
-                if let Some(message) = parser.take_error() {
-                    refusal = Some(message);
+                if let Some((message, event)) = parser.take_error_event() {
+                    refusal = Some(LaneRefusal::from_body(&event).unwrap_or(LaneRefusal { message, code: None, numbers: None }));
                     break;
                 }
             }
-            if let Some(message) = refusal {
-                if let (false, Some(room)) = (retried, ceiling_from_refusal(&message)) {
+            if let Some(refusal) = refusal {
+                // ADR-0097 Decision 2: decided by the refusal's code and computed from its numbers;
+                // the sentence is read only from a gateway that coded nothing. And never past what
+                // one job decodes, which the gateway published beside its window.
+                let room = refusal.retry_ceiling().map(|room| self.max_output.map_or(room, |cap| room.min(cap)));
+                if let (false, Some(room)) = (retried, room) {
                     retried = true;
-                    tracing::info!(ceiling = room, "retrying at the ceiling the worker named");
+                    tracing::info!(
+                        ceiling = room,
+                        code = refusal.code.as_deref().unwrap_or("none"),
+                        "retrying at the ceiling the refusal names"
+                    );
                     response = self.send(&messages, room, &shape).await?;
                     continue;
                 }
-                return Err(Error::Engine { backend: NAME, message });
+                return Err(Error::Engine { backend: NAME, message: refusal.message });
             }
             let (usage, finish_reason, misaka) = parser.finish_parts(fallback_prompt_tokens);
             return Ok(LegResult { text, usage, finish_reason, misaka });
@@ -953,7 +1043,88 @@ impl Lane {
     }
 }
 
-/// **The ceiling the worker's own refusal implies.**
+// ---------------------------------------------------------------------------------------------
+// The gateway's refusals, read by code (ADR-0097 Decision 2)
+// ---------------------------------------------------------------------------------------------
+
+/// The code the gateway puts in `error.code` when a job's prompt and ceiling do not fit the
+/// class's window — OpenAI's own code for the same refusal.
+pub const CONTEXT_LENGTH_EXCEEDED: &str = "context_length_exceeded";
+
+/// **A refusal from the gateway, as the gateway coded it.**
+///
+/// ADR-0097 Decision 2: the gateway's error body is OpenAI's `{"error": {"message", "type"}}`,
+/// plus `error.code` and `misaka.refusal` (the numbers) for the two bounds a request meets before
+/// the chain. This app branches on the code and computes from the numbers. The sentence is read
+/// only from a refusal that carries no code — a gateway from before ADR-0097, which is the case
+/// [`ceiling_from_refusal`] was written for and is kept for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LaneRefusal {
+    /// `error.message` — what a person reads.
+    pub message: String,
+    /// `error.code`, when the gateway coded the refusal.
+    pub code: Option<String>,
+    /// `misaka.refusal`, when the gateway sent the numbers.
+    pub numbers: Option<Value>,
+}
+
+impl LaneRefusal {
+    /// From an error body — a 400's JSON or an SSE error event. `None` for a body with no `error`.
+    pub fn from_body(body: &Value) -> Option<Self> {
+        let error = body.get("error")?;
+        let message = match error.get("message").and_then(Value::as_str) {
+            Some(message) => message.to_string(),
+            // A server (or a proxy in front of one) that put the sentence in `error` itself.
+            None => error.as_str().map(str::to_string).unwrap_or_else(|| error.to_string()),
+        };
+        Some(LaneRefusal {
+            message,
+            code: error.get("code").and_then(Value::as_str).map(str::to_string),
+            numbers: body.get("misaka").and_then(|m| m.get("refusal")).filter(|r| r.is_object()).cloned(),
+        })
+    }
+
+    /// From a response's text: the body when it is JSON with an `error`; otherwise the text
+    /// itself, cut at 400 characters (a proxy's HTML error page is not a sentence for a person).
+    pub fn from_text(text: &str) -> Self {
+        serde_json::from_str::<Value>(text).ok().and_then(|body| Self::from_body(&body)).unwrap_or_else(|| LaneRefusal {
+            message: text.trim().chars().take(400).collect(),
+            code: None,
+            numbers: None,
+        })
+    }
+
+    /// **The ceiling a retry of the same messages would fit at, if one would.**
+    ///
+    /// By the code when the gateway sent one: `context_length_exceeded` with its numbers is the
+    /// arithmetic, and any other code is a refusal no ceiling fixes — a coded prompt-bytes refusal
+    /// is never retried because its sentence happens to contain digits. By the sentence only when
+    /// the refusal carries no code.
+    pub fn retry_ceiling(&self) -> Option<u64> {
+        match self.code.as_deref() {
+            Some(CONTEXT_LENGTH_EXCEEDED) => {
+                let number = |key: &str| self.numbers.as_ref()?.get(key)?.as_u64();
+                match (number("prompt_tokens"), number("context_window")) {
+                    (Some(prompt), Some(window)) => retry_ceiling_for(prompt, window),
+                    // The code without its numbers: the sentence is the same refusal's.
+                    _ => ceiling_from_refusal(&self.message),
+                }
+            }
+            Some(_) => None,
+            None => ceiling_from_refusal(&self.message),
+        }
+    }
+}
+
+/// One spelling of the retry arithmetic, whoever supplied the two numbers: the window less the
+/// prompt, less one token of slack for a marker the prompt count did not include; nothing when
+/// the prompt alone fills the window.
+fn retry_ceiling_for(prompt_tokens: u64, context_window: u64) -> Option<u64> {
+    context_window.checked_sub(prompt_tokens.saturating_add(1)).filter(|room| *room > 0)
+}
+
+/// **The ceiling the worker's own refusal implies — from the sentence**, for a gateway that sent
+/// no code (before ADR-0097).
 ///
 /// The refusal names all three numbers — "prompt 51 + decode ceiling 476 exceeds
 /// max_context_tokens 512" — so the request that fits is arithmetic, not another guess. Retrying
@@ -966,8 +1137,7 @@ pub(crate) fn ceiling_from_refusal(message: &str) -> Option<u64> {
     };
     let prompt = after("prompt ")?;
     let ctx = after("max_context_tokens ")?;
-    // One token of slack: the template can add a marker the prompt count did not include.
-    ctx.checked_sub(prompt + 1).filter(|room| *room > 0)
+    retry_ceiling_for(prompt, ctx)
 }
 
 #[cfg(test)]
@@ -1246,11 +1416,11 @@ mod tests {
     /// no room at all is a refusal that names the numbers; no context is no rule.
     #[test]
     fn the_answer_ceiling_fits_the_class_and_names_a_full_context() {
-        assert_eq!(answer_ceiling(50, Some(512), 100).expect("fits"), 100);
-        assert_eq!(answer_ceiling(50, Some(512), 2048).expect("sized"), DEFAULT_ANSWER_TOKENS);
-        assert_eq!(answer_ceiling(400, Some(512), 2048).expect("sized"), 512 - 424);
-        assert_eq!(answer_ceiling(50, None, 2048).expect("no rule"), 2048);
-        match answer_ceiling(500, Some(512), 10) {
+        assert_eq!(answer_ceiling(50, Some(512), None, 100).expect("fits"), 100);
+        assert_eq!(answer_ceiling(50, Some(512), None, 2048).expect("sized"), DEFAULT_ANSWER_TOKENS);
+        assert_eq!(answer_ceiling(400, Some(512), None, 2048).expect("sized"), 512 - 424);
+        assert_eq!(answer_ceiling(50, None, None, 2048).expect("no rule"), 2048);
+        match answer_ceiling(500, Some(512), None, 10) {
             Err(Error::BadRequest { message }) => assert!(message.contains("512") && message.contains("524"), "{message}"),
             other => panic!("expected a refusal, got {other:?}"),
         }
@@ -1305,5 +1475,219 @@ mod tests {
         assert_eq!(misaka["fp_claim_id"], "bb", "the answer leg's object stays the top-level one");
         assert_eq!(misaka["jobs"].as_array().map(Vec::len), Some(2));
         assert_eq!(misaka["context"]["n_ctx"], 512);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // ADR-0097 Decision 2: the limits, read; the refusal, branched on by its code
+    // -----------------------------------------------------------------------------------------
+
+    /// The body `misaka-palw-gateway` serves for the worker's window refusal — the shape its
+    /// `surface::refusal_body` builds and its test
+    /// `a_context_refusal_carries_a_code_and_its_numbers_and_the_body_is_the_gateways_own` pins.
+    fn gateway_window_refusal(message: &str, prompt_tokens: u64, context_window: u64) -> Value {
+        json!({
+            "error": { "message": message, "type": "invalid_request_error", "code": CONTEXT_LENGTH_EXCEEDED },
+            "misaka": { "refusal": {
+                "code": CONTEXT_LENGTH_EXCEEDED,
+                "prompt_tokens": prompt_tokens,
+                "decode_ceiling": 476,
+                "context_window": context_window,
+                "room_for_answer": context_window.saturating_sub(prompt_tokens),
+            } },
+        })
+    }
+
+    /// `/health` with the gateway's limits object, as `surface::limits_body` builds it.
+    fn health_with_limits(context_window: u64, max_output_tokens: u64, committed: &str) -> Value {
+        json!({
+            "status": "ok",
+            "class_id": "ab".repeat(64),
+            "n_ctx": 4096,
+            "runtime_manifest_hash": "00",
+            "can_submit": false,
+            "chain": { "fp_certified": true, "fp_decode_constraint_armed": true },
+            "limits": {
+                "schema": LIMITS_SCHEMA_V1,
+                "context_window": context_window,
+                "max_output_tokens": max_output_tokens,
+                "default_output_tokens": 256,
+                "max_prompt_bytes": 65_536,
+                "tokenizer_id": "cd".repeat(64),
+                "features": { "require_committed_format": committed },
+            },
+        })
+    }
+
+    /// **ADR-0097 invariant 7's Studio half.** The window is the limits' `context_window` — the
+    /// bare `n_ctx` beside it deliberately disagrees, and loses — and the committed-format fence is
+    /// the limits' word, not the chain flag beside it. A gateway without limits (or with another
+    /// schema) is read the old way, field for field.
+    #[test]
+    fn the_health_limits_are_the_window_and_an_older_gateway_is_read_the_old_way() {
+        let facts = facts_from_health(&health_with_limits(512, 511, "refused"));
+        assert_eq!(facts.n_ctx, 512, "the limits' window, not the bare n_ctx beside it");
+        let limits = facts.limits.clone().expect("limits read");
+        assert_eq!(limits.max_output_tokens, 511);
+        assert_eq!(limits.max_prompt_bytes, 65_536);
+        assert_eq!(limits.tokenizer_id, "cd".repeat(64));
+        assert!(!facts.fp_decode_constraint_armed, "the limits say refused; the chain flag beside them does not decide");
+        assert!(facts.fp_certified);
+
+        let served = facts_from_health(&health_with_limits(512, 511, "served"));
+        assert!(served.fp_decode_constraint_armed);
+
+        let mut older = health_with_limits(512, 511, "refused");
+        older.as_object_mut().unwrap().remove("limits");
+        let facts = facts_from_health(&older);
+        assert_eq!(facts.limits, None);
+        assert_eq!(facts.n_ctx, 4096, "no limits: the bare n_ctx, as before");
+        assert!(facts.fp_decode_constraint_armed, "no limits: the chain flag, as before");
+
+        let mut other_schema = health_with_limits(512, 511, "refused");
+        other_schema["limits"]["schema"] = json!("misaka.palw.limits.v2");
+        assert_eq!(facts_from_health(&other_schema).limits, None, "a schema this build does not know is not read as v1");
+        let mut zero = health_with_limits(512, 0, "refused");
+        zero["limits"]["max_output_tokens"] = json!(0);
+        assert_eq!(facts_from_health(&zero).limits, None, "a zero ceiling is not a limit this lane can plan with");
+    }
+
+    /// The ceiling never asks one job for more than the gateway runs; the request's own ask is
+    /// untouched (the continue legs compare delivery against it).
+    #[test]
+    fn the_answer_ceiling_never_asks_one_job_for_more_than_the_gateway_runs() {
+        assert_eq!(answer_ceiling(50, Some(512), Some(64), 2048).expect("capped"), 64);
+        assert_eq!(answer_ceiling(50, Some(512), Some(64), 40).expect("under the cap"), 40);
+        assert_eq!(answer_ceiling(50, Some(512), Some(511), 100).expect("fits"), 100);
+        assert_eq!(answer_ceiling(50, Some(512), Some(511), 2048).expect("sized like an answer"), DEFAULT_ANSWER_TOKENS);
+        assert_eq!(answer_ceiling(50, None, Some(64), 2048).expect("no window, still the cap"), 64);
+        assert_eq!(answer_ceiling(50, None, None, 2048).expect("nothing known"), 2048);
+    }
+
+    /// **ADR-0097 invariant 8's Studio half.** The retry is decided by the CODE and computed from
+    /// its numbers: a coded refusal whose sentence names no numbers still retries at the right
+    /// ceiling, and a coded refusal that is not the window never retries even when its sentence
+    /// happens to parse. Only a refusal with no code — a gateway from before ADR-0097 — is read
+    /// from its sentence.
+    #[test]
+    fn a_refusal_is_read_by_its_code_and_the_sentence_only_without_one() {
+        let sentence = "the worker refused the job: prompt 51 + decode ceiling 476 exceeds max_context_tokens 512";
+        let coded = LaneRefusal::from_body(&gateway_window_refusal(sentence, 51, 512)).expect("an error body");
+        assert_eq!(coded.message, sentence, "error.message is the sentence a person reads");
+        assert_eq!(coded.code.as_deref(), Some(CONTEXT_LENGTH_EXCEEDED));
+        assert_eq!(coded.retry_ceiling(), Some(460));
+
+        let reworded = LaneRefusal::from_body(&gateway_window_refusal("this job does not fit the class", 51, 512)).unwrap();
+        assert_eq!(reworded.retry_ceiling(), Some(460), "the code and its numbers, not the sentence, decide");
+        assert_eq!(ceiling_from_refusal(&reworded.message), None, "the sentence alone could not have");
+
+        let bytes = LaneRefusal::from_body(&json!({
+            "error": { "message": sentence, "type": "invalid_request_error", "code": "prompt_bytes_exceeded" },
+            "misaka": { "refusal": { "code": "prompt_bytes_exceeded", "prompt_bytes": 70_000, "max_prompt_bytes": 65_536 } },
+        }))
+        .unwrap();
+        assert_eq!(bytes.retry_ceiling(), None, "a coded refusal no ceiling fixes is never retried, whatever its sentence says");
+
+        let older = LaneRefusal::from_body(&json!({ "error": { "message": sentence, "type": "invalid_request_error" } })).unwrap();
+        assert_eq!(older.code, None);
+        assert_eq!(older.retry_ceiling(), Some(460), "no code: the sentence, as before ADR-0097");
+
+        let flat = LaneRefusal::from_body(&json!({ "error": sentence })).unwrap();
+        assert_eq!(flat.message, sentence, "a sentence put in `error` itself is still the sentence");
+        assert_eq!(LaneRefusal::from_body(&json!({ "choices": [] })), None);
+        let proxy = LaneRefusal::from_text(&format!("<html>{}</html>", "x".repeat(1_000)));
+        assert_eq!(proxy.message.chars().count(), 400, "a proxy's page is cut, not repeated whole");
+        assert_eq!(LaneRefusal::from_text(&gateway_window_refusal(sentence, 51, 512).to_string()), coded);
+    }
+
+    /// A gateway on a real socket: `/health` publishes its limits, and the first job is refused in
+    /// the stream with a coded window refusal whose SENTENCE NAMES NO NUMBERS. Every request body
+    /// is recorded, so the test reads what the backend actually sent.
+    async fn coded_refusal_gateway() -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use axum::extract::State;
+        use axum::routing::{get, post};
+        type Seen = std::sync::Arc<std::sync::Mutex<Vec<Value>>>;
+        let seen: Seen = Default::default();
+        let app = axum::Router::new()
+            .route("/health", get(|| async { axum::Json(health_with_limits(512, 511, "refused")) }))
+            .route(
+                "/v1/chat/completions",
+                post(|State(seen): State<Seen>, axum::Json(body): axum::Json<Value>| async move {
+                    let first = {
+                        let mut seen = seen.lock().unwrap();
+                        seen.push(body);
+                        seen.len() == 1
+                    };
+                    let events = if first {
+                        // After the 200 head, as the gateway does for `stream: true`.
+                        vec![gateway_window_refusal("the worker refused the job: it does not fit this class", 100, 512)]
+                    } else {
+                        vec![
+                            json!({ "choices": [{ "index": 0, "delta": { "content": "ok" }, "finish_reason": null }] }),
+                            json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] }),
+                            json!({ "misaka": { "fp_job_id": "j1", "fp_claim_id": "c1", "committed": false },
+                                    "usage": { "prompt_tokens": 100, "completion_tokens": 1, "total_tokens": 101 } }),
+                        ]
+                    };
+                    let mut sse: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+                    sse.push_str("data: [DONE]\n\n");
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse)
+                }),
+            )
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// **End to end: the retry follows the code.** The refusal's sentence names no numbers, so a
+    /// sentence parser would have given up and shown an empty reply; the backend retries once at
+    /// `window − prompt − 1` from the numbers the code carries, and the answer arrives.
+    #[tokio::test]
+    async fn a_coded_refusal_is_retried_at_its_numbers_even_when_the_sentence_names_none() {
+        use futures_util::StreamExt;
+        let (url, seen) = coded_refusal_gateway().await;
+        let backend = GatewayBackend::new(url, None);
+        let loaded = backend
+            .load(LoadRequest {
+                model_id: "class".into(),
+                model_path: std::path::PathBuf::new(),
+                context_size: 4096,
+                gpu_layers: None,
+                threads: None,
+                flash_attention: misaka_studio_core::settings::FlashAttention::default(),
+                use_mmap: true,
+                use_mlock: false,
+                needs_default_chat_template: false,
+                extra_args: Vec::new(),
+            })
+            .await
+            .expect("the gateway is up");
+        assert_eq!(loaded.context_size, 512, "the window the limits state, not the request's 4096 or the bare n_ctx");
+
+        let request = GenerationRequest::plain("class", vec![ChatMessage::new("user", "hello")], None, Default::default());
+        let mut stream = backend.generate(request).await.expect("the first job was sent");
+        let mut text = String::new();
+        let mut done = None;
+        while let Some(event) = stream.next().await {
+            match event.expect("no error reaches the client: the retry fitted") {
+                StreamEvent::Delta(delta) => text.push_str(&delta),
+                StreamEvent::Done { misaka, .. } => done = misaka,
+                StreamEvent::ToolCallDelta(_) => {}
+            }
+        }
+        assert_eq!(text, "ok");
+        let misaka = done.expect("the answer's misaka object");
+        assert_eq!(misaka["fp_claim_id"], "c1");
+        assert_eq!(misaka["context"]["max_output_tokens"], 511, "the published per-job ceiling rides the context report");
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "one refusal, one retry, nothing more");
+        let first = seen[0]["max_tokens"].as_u64().expect("a ceiling");
+        assert!(first <= 511, "no job is asked for more than the gateway runs: {first}");
+        assert_eq!(seen[1]["max_tokens"], 512 - 100 - 1, "the retry's ceiling is the code's arithmetic");
+        assert_eq!(seen[1]["messages"], seen[0]["messages"], "the same messages, retried");
     }
 }

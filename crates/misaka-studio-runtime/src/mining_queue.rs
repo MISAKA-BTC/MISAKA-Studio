@@ -440,18 +440,19 @@ async fn run_job(job: &MiningJob, url: &str, token: Option<&str>) -> std::result
         let status = response.status();
         let text = response.text().await.map_err(|e| Outcome::Transient(format!("the gateway's answer was cut off: {e}")))?;
         if !status.is_success() {
-            let message = serde_json::from_str::<serde_json::Value>(&text)
-                .ok()
-                .and_then(|v| v.get("error").map(|e| e.as_str().map(str::to_string).unwrap_or_else(|| e.to_string())))
-                .unwrap_or_else(|| text.trim().chars().take(400).collect());
+            // One reader for the gateway's error body (ADR-0097 Decision 2): the sentence from
+            // `error.message` — this used to stringify the whole `error` object, so a refusal was
+            // recorded as JSON — and the retry from `error.code` with its numbers.
+            let refusal = crate::backend::gateway::LaneRefusal::from_text(&text);
             // The worker's refusal for an ask that does not fit the class carries the numbers that
             // make the retry exact; one retry with those numbers, then it is the lane's answer.
             if pass == 0
-                && let Some(room) = crate::backend::gateway::ceiling_from_refusal(&message)
+                && let Some(room) = refusal.retry_ceiling()
             {
                 ceiling = room.clamp(1, ANSWER_TOKENS);
                 continue;
             }
+            let message = refusal.message;
             let transient = status.is_server_error()
                 || status.as_u16() == 429
                 || message.contains("Connection refused")

@@ -140,6 +140,13 @@ else — and what the lane cannot honour is refused BY NAME before anything runs
   trimmed, a summary job runs past `node.summarize_after_turns`, and up to
   `node.continue_max_legs` continue legs follow a `length` stop. Every leg is in
   `misaka.jobs[]`; the trim is in `misaka.context`.
+* The limits are the gateway's, read before the first token (ADR-0097 Decision 2): the window
+  is `/health`'s `limits.context_window`, no job is asked for more than
+  `limits.max_output_tokens`, and whether a committed format is served is `limits.features`'
+  word. A refusal is branched on by its code — `error.code: "context_length_exceeded"` with the
+  numbers under `misaka.refusal` is retried once at `window − prompt − 1`, any other code is not
+  retried — and the sentence is read only from a gateway old enough to send no code. A gateway
+  that predates the limits is read the old way (`n_ctx`, the `chain.*` flags).
 * Refused by name: `n` other than 1, `logprobs`, the legacy `functions` / `function_call`, and
   any field the table does not name. Accepted and listed in `misaka.ignored_fields`: `user`,
   `metadata`, `store`, `parallel_tool_calls`, `max_completion_tokens` (an alias of `max_tokens`).
