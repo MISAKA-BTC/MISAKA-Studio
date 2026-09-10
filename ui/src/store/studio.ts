@@ -30,7 +30,7 @@ import type {
   SystemInfo,
 } from '../lib/types'
 
-export type View = 'chat' | 'models' | 'network' | 'monitor' | 'settings'
+export type View = 'chat' | 'models' | 'network' | 'monitor' | 'components' | 'settings'
 
 /** A message shown to the user about something that just happened. */
 export type Toast = { id: string; kind: 'info' | 'error' | 'success'; text: string }
@@ -51,6 +51,13 @@ type StudioState = {
   activeConversationId: string | null
 
   setView: (view: View) => void
+  /**
+   * A class card the Network tab should scroll to once it has rendered — set by a link from
+   * another view (the Components page's artifact rows). The Network tab reads it after its
+   * overview arrives, scrolls, and clears it; it is never persisted.
+   */
+  classFocus: string | null
+  focusClass: (name: string | null) => void
   toast: (kind: Toast['kind'], text: string) => void
   dismissToast: (id: string) => void
 
@@ -146,6 +153,8 @@ export const useStudio = create<StudioState>()(
       miningQueue: null,
 
       setView: (view) => set({ view }),
+      classFocus: null,
+      focusClass: (name) => set({ classFocus: name }),
 
       toast: (kind, text) => {
         const toast: Toast = { id: uid(), kind, text }

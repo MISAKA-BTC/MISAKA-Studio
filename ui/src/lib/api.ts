@@ -9,11 +9,13 @@ import type {
   BackendInfo,
   CatalogEntry,
   CatalogRepo,
+  ComponentsListing,
   Conversation,
   ConversationExport,
   ConversationImportReport,
   ConversationSummary,
   DownloadProgress,
+  EffectiveSettings,
   InferenceRecord,
   MisakaExtension,
   ModelRequestPrefill,
@@ -116,6 +118,21 @@ export const api = {
 
   settings: () => request<Settings>('/api/v1/settings'),
   saveSettings: (settings: Settings) => request<Settings>('/api/v1/settings', { method: 'PUT', body: JSON.stringify(settings) }),
+  // ADR-0096 Decision 11 — what the running objects were built from, beside what the file says.
+  // Read-only: nothing here rebuilds or restarts anything.
+  settingsEffective: () => request<EffectiveSettings>('/api/v1/settings/effective'),
+
+  // ADR-0096 Decision 10 — every binary and artifact the Studio can spawn or map, held to the
+  // manifest. `verify` hashes every found file and asks every binary for `--version` (minutes,
+  // on a class artifact); `check` fetches the manifest even when `components.auto_check` is off.
+  components: (options: { verify?: boolean; check?: boolean } = {}) => {
+    const flags = [options.verify ? 'verify=1' : null, options.check ? 'check=1' : null].filter(Boolean)
+    return request<ComponentsListing>(`/api/v1/components${flags.length > 0 ? `?${flags.join('&')}` : ''}`)
+  },
+  /** Starts the install; the runtime refuses by name (400) a retired id, another platform's row,
+   *  an archive member. The download is then a resource like any model download. */
+  installComponent: (id: string) =>
+    request<DownloadProgress>(`/api/v1/components/${encodeURIComponent(id)}/install`, { method: 'POST' }),
 
   network: () => request<NetworkOverview>('/api/v1/network'),
   producedBlocks: () => request<{ blocks: ProducedBlock[] }>('/api/v1/network/blocks'),

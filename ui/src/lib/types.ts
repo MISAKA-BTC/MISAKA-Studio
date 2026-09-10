@@ -250,6 +250,107 @@ export type Settings = {
   huggingface: { endpoint: string; token: string | null; max_concurrent_downloads: number }
   ui: { theme: 'system' | 'light' | 'dark'; show_provenance: boolean; show_performance: boolean }
   provenance: { record_inferences: boolean; keep_transcripts: boolean; max_records: number }
+  /**
+   * ADR-0096 Decision 10 — where the components manifest is (a local path or an `https://` URL;
+   * null means the Studio only knows what is on disk) and whether `GET /api/v1/components` fetches
+   * it unasked. Optional because a settings file written before the manifest existed has no
+   * `components` key, and the runtime fills the default in; a window talking to an older runtime
+   * must not crash on its absence.
+   */
+  components?: { manifest: string | null; auto_check: boolean }
+}
+
+// --- ADR-0096 Decision 11: what the running objects were built from ---------
+
+/** JSON as the runtime hands it over untyped: `configured` and `effective` are `serde_json::Value`. */
+export type Json = string | number | boolean | null | Json[] | { [key: string]: Json }
+
+/**
+ * One subsystem of `GET /api/v1/settings/effective`. `configured` is what the settings the
+ * process holds would build; `effective` is read from the RUNNING object and is null when nothing
+ * runs (`source.effective` then says why); `source` names, per effective field, the file, flag,
+ * environment variable or discovery step that produced it; `since` is when the running object was
+ * built (unix seconds); `differs` is the runtime's own verdict — configured and effective disagree
+ * in a field the running object's fingerprint covers. The runtime says THAT they differ, not which
+ * fields: naming them is this window's job (`lib/effective.ts`).
+ */
+export type EffectiveSubsystem = {
+  configured: Json
+  effective: Json | null
+  source: Record<string, string>
+  since: number | null
+  differs: boolean
+}
+
+export type EffectiveSettings = {
+  backend: EffectiveSubsystem
+  node: EffectiveSubsystem
+  records: EffectiveSubsystem
+  catalog: EffectiveSubsystem
+  pool: EffectiveSubsystem
+  gateway: EffectiveSubsystem
+}
+
+export type EffectiveSubsystemName = keyof EffectiveSettings
+
+// --- ADR-0096 Decision 10: the components table -----------------------------
+
+export type ComponentKind = 'node' | 'cli' | 'worker' | 'gateway' | 'rail' | 'engine' | 'artifact' | 'tokenizer-table' | 'runtime' | 'shell'
+
+/** Which step of the one search order found a file — the runtime's own spellings, verbatim. */
+export type ComponentCandidate = 'configured' | 'beside the executable' | 'engines/' | 'models_dir' | 'PATH' | 'not found'
+
+/**
+ * Where a component stands against the manifest. `installed-unverified` is found with the right
+ * size and no digest computed (that is `?verify=1`); `mismatch` is found with the wrong size or
+ * digest — not this component, whatever its name; `not-in-manifest` is found with no row to hold
+ * it to; `retired` is an id the node tree stopped building.
+ */
+export type ComponentState = 'installed' | 'installed-unverified' | 'mismatch' | 'missing' | 'retired' | 'not-in-manifest'
+
+export type ComponentReport = {
+  id: string
+  kind: ComponentKind
+  installed: {
+    path: string
+    candidate: ComponentCandidate
+    found: boolean
+    size?: number
+    /** Only on `?verify=1` — a class artifact is 34 GiB. */
+    sha256?: string
+    /** The first line of `--version`, on `?verify=1`, when the binary answered. */
+    version?: string
+  }
+  manifest: { version: string; sha256: string; size: number; url: string; platform: string; member?: string } | null
+  state: ComponentState
+  /** Why the state is what it is, when a word is not enough (a retirement, a platform, a size). */
+  note?: string
+}
+
+/** The cross-repository check over the loaded manifest (ADR-0096 invariant 10), by name. */
+export type ComponentFinding =
+  | { finding: 'missing_spawnable'; id: string; kind: ComponentKind }
+  | { finding: 'retired_still_spawned'; id: string; note: string }
+  | { finding: 'retired_in_manifest'; id: string; note: string }
+
+export type ManifestStatus = {
+  /** `components.manifest`, as configured. */
+  source: string | null
+  release: string | null
+  network: string | null
+  loaded: boolean
+  /** Why it is not loaded: unset, switched off, unreachable, or refused by the validator. */
+  error?: string
+  findings: ComponentFinding[]
+}
+
+/** `GET /api/v1/components` — `ComponentsView` in the runtime; named for the table here so the
+ *  page component can keep the runtime's name. */
+export type ComponentsListing = {
+  components: ComponentReport[]
+  manifest: ManifestStatus
+  /** The triple this runtime was built for, so a row's `platform` can be read against it. */
+  host_platform: string
 }
 
 export type InferenceRecord = {

@@ -9,6 +9,7 @@ import { subscribe } from './lib/api'
 import type { DownloadProgress, RuntimeSample } from './lib/types'
 import { useStudio } from './store/studio'
 import { ChatView } from './components/ChatView'
+import { ComponentsView } from './components/ComponentsView'
 import { ModelsView } from './components/ModelsView'
 import { MonitorView } from './components/MonitorView'
 import { NetworkView } from './components/NetworkView'
@@ -72,6 +73,7 @@ export default function App() {
         {view === 'models' && <ModelsView />}
         {view === 'network' && <NetworkView />}
         {view === 'monitor' && <MonitorView />}
+        {view === 'components' && <ComponentsView />}
         {view === 'settings' && <SettingsView />}
       </main>
       <Toasts />

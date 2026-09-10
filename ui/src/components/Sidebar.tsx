@@ -149,6 +149,8 @@ const NAV: { view: View; label: string; icon: IconName }[] = [
   { view: 'models', label: 'Models', icon: 'cube' },
   { view: 'network', label: 'Network', icon: 'globe' },
   { view: 'monitor', label: 'Monitor', icon: 'gauge' },
+  // ADR-0096 Decision 10: every binary and artifact, held to the manifest's digests.
+  { view: 'components', label: 'Components', icon: 'shield' },
   { view: 'settings', label: 'Settings', icon: 'settings' },
 ]
 

@@ -56,6 +56,22 @@ export function NetworkView() {
     }
   }, [])
 
+  // A class card another view asked for (the Components page's artifact rows link here). Read
+  // once the overview has rendered the cards, scrolled to, lit for a moment, and cleared — the
+  // request must not outlive one visit, or the tab would jump on every later open.
+  const classFocus = useStudio((s) => s.classFocus)
+  const focusClass = useStudio((s) => s.focusClass)
+  useEffect(() => {
+    if (!overview || !classFocus) return
+    const element = document.getElementById(classCardId(classFocus))
+    if (element) {
+      element.scrollIntoView({ block: 'center' })
+      element.classList.add('ring-2', 'ring-arc-500')
+      setTimeout(() => element.classList.remove('ring-2', 'ring-arc-500'), 2500)
+    }
+    focusClass(null)
+  }, [overview, classFocus, focusClass])
+
   // Poll while the tab is open. The node's numbers (DAA score, peers, activity) move on their
   // own; a static snapshot of a chain is stale by definition.
   useEffect(() => {
@@ -854,6 +870,11 @@ function matchesSpec(spec: PalwClassStatus['spec'], row: NodeClassRow): boolean 
   return spec.is_base ? row.base : spec.class_id_hex ? row.class_id.startsWith(spec.class_id_hex.slice(0, 16)) : false
 }
 
+/** The DOM id of a class card, so another view can ask this tab to scroll to it. */
+function classCardId(name: string): string {
+  return `class-${name}`
+}
+
 /** A class this chain carries that the Studio ships no description for — registered after genesis. */
 function ChainClassCard({ row }: { row: NodeClassRow }) {
   const active = row.status === 'Active'
@@ -937,7 +958,7 @@ function ClassCard({
     )
 
   return (
-    <div className="rounded-xl border border-ink-200 p-4 dark:border-ink-800">
+    <div id={classCardId(spec.name)} className="scroll-mt-4 rounded-xl border border-ink-200 p-4 dark:border-ink-800">
       <div className="flex flex-wrap items-center gap-2">
         <h4 className="mono text-sm font-semibold">{spec.name}</h4>
         <span className="badge bg-arc-500/15 text-arc-700 dark:text-arc-300">{spec.share_permille}‰ share</span>
