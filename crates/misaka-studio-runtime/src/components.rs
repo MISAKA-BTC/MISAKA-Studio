@@ -350,6 +350,22 @@ pub fn resolve_component(id: &ComponentId, configured: Option<&Path>, models_dir
     locate(id, configured, models_dir, executable_dir().as_deref(), &path_dirs)
 }
 
+/// **A component that ships beside another one**, looked for there first and by the one search
+/// order after that. The family workers come in one release directory with the gateway, so a
+/// gateway found at a configured path names where its workers are (ADR-0096 Decision 10). The
+/// step reports the sibling's candidate, because that is how the directory was found.
+pub fn resolve_beside(id: &ComponentId, sibling: &Resolution) -> Resolution {
+    if sibling.found
+        && let Some(dir) = sibling.path.parent()
+    {
+        let beside = dir.join(id.file_name());
+        if beside.is_file() {
+            return Resolution { path: beside, found: true, candidate: sibling.candidate };
+        }
+    }
+    resolve_component(id, None, None)
+}
+
 /// The search order over an explicit environment — what [`resolve_component`] binds to this
 /// process's, and what the tests drive over a directory they built.
 pub(crate) fn locate(
@@ -1183,11 +1199,15 @@ mod tests {
     #[test]
     fn the_search_order_is_spelled_once() {
         let allowed: BTreeMap<&str, Vec<&str>> = BTreeMap::from([
-            ("src/components.rs", vec!["resolve_component"]),
+            // `resolve_beside`: a component that ships beside another (the family workers beside
+            // the gateway, ADR-0096 Decision 10) — here, so the step is spelled once.
+            ("src/components.rs", vec!["resolve_component", "resolve_beside"]),
             // Wrappers: the same public signatures the callers had.
             ("src/backend/llamacpp.rs", vec!["resolve_program"]),
-            // `resolve_tokenizer` finds `tokenizer.json` beside an artifact — a file, not a component.
-            ("src/backend/misaka.rs", vec!["resolve_program", "resolve_tokenizer"]),
+            // `resolve_tokenizer` finds `tokenizer.json` beside an artifact — a file, not a
+            // component. The retired server's `resolve_program` wrapper went with the engine's
+            // move to the gateway (ADR-0096 Decision 10).
+            ("src/backend/misaka.rs", vec!["resolve_tokenizer"]),
             ("src/node.rs", vec!["resolve_kaspad", "resolve_misaka_cli"]),
             // Hashes a loaded model to its chain identity — not a search for a file.
             ("src/state.rs", vec!["resolve_identity"]),

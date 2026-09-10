@@ -115,9 +115,17 @@ pub struct BackendSettings {
     pub llama_server_path: Option<PathBuf>,
     /// Path to the MLX server entry point (macOS).
     pub mlx_server_path: Option<PathBuf>,
-    /// Path to `misaka-palw-serve`, the integer runtime's OpenAI server. `None` looks beside the
-    /// Studio's own executable and on PATH, the same way the other engines are found.
+    /// Path to the RETIRED `misaka-palw-serve` (deleted from the node tree on 2026-09-02, misakas
+    /// `2f688bc1`). Kept so a settings file that names it still loads, and so the `misaka` engine
+    /// can fall back to it — by name — for an artifact that declares no tokenizer (ADR-0096
+    /// Decision 10). The engine itself is `misaka_gateway_path`.
     pub misaka_serve_path: Option<PathBuf>,
+    /// Path to `misaka-palw-gateway`, which the `misaka` engine runs in `--answer-never-commit`
+    /// mode over the family worker (ADR-0096 Decision 10). The workers (`palw-a16-fp-worker`,
+    /// `palw-qwen36-fp-worker`) are looked for beside it first. `None` uses the one search order:
+    /// beside the Studio, `engines/`, PATH.
+    #[serde(default)]
+    pub misaka_gateway_path: Option<PathBuf>,
     /// The tokenizer the MISAKA runtime renders prompts with. `None` looks for `tokenizer.json`
     /// beside the artifact — a `.palwart` carries weights and a tokenizer COMMITMENT, never the
     /// tokenizer file itself (the class identity includes what the ids mean; consensus never runs
@@ -147,6 +155,7 @@ impl Default for BackendSettings {
             llama_server_path: None,
             mlx_server_path: None,
             misaka_serve_path: None,
+            misaka_gateway_path: None,
             misaka_tokenizer_path: None,
             gpu_layers: GpuLayers::Auto,
             threads: None,

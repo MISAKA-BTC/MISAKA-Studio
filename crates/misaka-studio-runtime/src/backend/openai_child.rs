@@ -47,6 +47,11 @@ const HEALTH_POLL: Duration = Duration::from_millis(250);
 /// backends has a name where the reader meets it.
 pub type ArgsBuilder = Box<dyn Fn(&LoadRequest, u16) -> Vec<String> + Send + Sync>;
 
+/// Environment that depends on the load — the file being loaded, where its tokenizer is. For an
+/// engine that takes a model by environment variable rather than by flag (the family workers do:
+/// `MISAKA_PALW_ARTIFACT`), a fixed `env` cannot say which file.
+pub type LoadEnvBuilder = Box<dyn Fn(&LoadRequest) -> Vec<(String, String)> + Send + Sync>;
+
 /// What a concrete backend must supply.
 pub struct ChildEngineConfig {
     /// Backend name, as it appears in records: `llamacpp`, `mlx`.
@@ -64,6 +69,9 @@ pub struct ChildEngineConfig {
     pub startup_timeout: Duration,
     /// Extra environment for the child.
     pub env: Vec<(String, String)>,
+    /// Environment computed per load, applied after `env`. `None` for an engine that takes its
+    /// model on the command line.
+    pub load_env: Option<LoadEnvBuilder>,
 }
 
 struct Running {
@@ -161,11 +169,13 @@ impl ChildEngine {
         let started = Instant::now();
         let port = free_port()?;
         let args = (self.config.args)(&request, port);
+        let load_env = self.config.load_env.as_ref().map(|build| build(&request)).unwrap_or_default();
 
         let mut command = tokio::process::Command::new(&self.config.program);
         command
             .args(&args)
             .envs(self.config.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .envs(load_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // If the Studio dies, the engine must not survive holding 20 GB of VRAM.
@@ -245,7 +255,9 @@ impl ChildEngine {
         self.running.read().await.as_ref().map(|r| r.model.clone())
     }
 
-    async fn base_url(&self) -> Result<String> {
+    /// The running child's base URL — for a backend that talks to the child through its own
+    /// request side rather than through [`Self::generate`].
+    pub async fn base_url(&self) -> Result<String> {
         let guard = self.running.read().await;
         let running = guard.as_ref().ok_or(Error::NoModelLoaded)?;
         Ok(format!("http://127.0.0.1:{}", running.port))

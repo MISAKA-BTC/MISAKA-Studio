@@ -247,9 +247,21 @@ pub enum StreamEvent {
 /// RAN, and the app's notice is describing what it asked for, so the gateway's value is the one
 /// that must survive: a notice that overwrote the lane's own report would be the app lying about
 /// the chain. Objects merge key by key (so `sampling.requested` from the app and
-/// `sampling.enforced` from the gateway both live); anything else is replaced whole.
+/// `sampling.enforced` from the gateway both live). A list of NAMES — `ignored_fields`,
+/// `not_a_rule_on_this_lane` — is a list of facts each entrance observed, so the two lists are
+/// united (the app's first, then what the gateway adds); replacing one with the other erased the
+/// app's facts, measured 2026-09-10 (`metadata` vanished behind the gateway's empty list). Any
+/// other value is replaced whole.
 pub fn merge_misaka(base: &mut Value, over: &Value) {
+    let names = |items: &[Value]| items.iter().all(Value::is_string);
     match (base, over) {
+        (Value::Array(base), Value::Array(over)) if names(base) && names(over) => {
+            for item in over {
+                if !base.contains(item) {
+                    base.push(item.clone());
+                }
+            }
+        }
         (Value::Object(base), Value::Object(over)) => {
             for (key, value) in over {
                 match base.get_mut(key) {
@@ -598,7 +610,7 @@ mod wire_shape_tests {
     /// The merge rule: the app's notice and the gateway's report become one object, objects
     /// merge key by key, and where they collide the gateway is describing what ran.
     #[test]
-    fn merge_misaka_lets_the_gateway_win_on_conflict_and_keeps_the_rest() {
+    fn merge_misaka_lets_the_gateway_win_on_conflict_and_unites_the_lists_of_names() {
         let mut base = serde_json::json!({
             "ignored_fields": ["store"],
             "sampling": { "requested": { "temperature": 0.7 }, "reason": "the app's sentence" }
@@ -613,7 +625,19 @@ mod wire_shape_tests {
         assert_eq!(base["sampling"]["requested"]["temperature"], 0.7, "the app's nested keys survive");
         assert_eq!(base["sampling"]["enforced"], "greedy");
         assert_eq!(base["sampling"]["reason"], "the gateway's sentence", "on conflict the gateway wins");
-        assert_eq!(base["ignored_fields"], serde_json::json!(["user"]), "a non-object is replaced whole");
+        assert_eq!(
+            base["ignored_fields"],
+            serde_json::json!(["store", "user"]),
+            "a list of names is united: each entrance's facts survive"
+        );
+        // A list that is not names — ids, numbers — is still the gateway's, whole.
+        let mut ids = serde_json::json!({ "output_token_ids": [1, 2] });
+        merge_misaka(&mut ids, &serde_json::json!({ "output_token_ids": [3] }));
+        assert_eq!(ids["output_token_ids"], serde_json::json!([3]));
+        // An empty list from the gateway erases nothing.
+        let mut kept = serde_json::json!({ "ignored_fields": ["metadata"] });
+        merge_misaka(&mut kept, &serde_json::json!({ "ignored_fields": [] }));
+        assert_eq!(kept["ignored_fields"], serde_json::json!(["metadata"]));
     }
 
     #[test]

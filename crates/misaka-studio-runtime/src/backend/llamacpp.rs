@@ -54,6 +54,7 @@ impl LlamaCppBackend {
                 health_path: "/health",
                 startup_timeout,
                 env: Vec::new(),
+                load_env: None,
             }),
         }
     }

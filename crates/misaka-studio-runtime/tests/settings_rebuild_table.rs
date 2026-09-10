@@ -49,6 +49,8 @@ fn table() -> Vec<Row> {
             Some(PathBuf::from(format!("/engines/mlx_lm.server-{n}")))),
         row!("backend.misaka_serve_path", [BackendKind::Misaka], |s, n, _t| s.backend.misaka_serve_path =
             Some(PathBuf::from(format!("/engines/misaka-palw-serve-{n}")))),
+        row!("backend.misaka_gateway_path", [BackendKind::Misaka], |s, n, _t| s.backend.misaka_gateway_path =
+            Some(PathBuf::from(format!("/engines/misaka-palw-gateway-{n}")))),
         row!("backend.misaka_tokenizer_path", [BackendKind::Misaka], |s, n, _t| s.backend.misaka_tokenizer_path =
             Some(PathBuf::from(format!("/models/tokenizer-{n}.json")))),
         row!("backend.startup_timeout_secs", CHILD_ENGINES, |s, n, _t| s.backend.startup_timeout_secs = 100 + n),
@@ -77,7 +79,9 @@ fn table() -> Vec<Row> {
         row!("node.misaka_rpc", NONE, |s, n, _t| s.node.misaka_rpc = Some(format!("127.0.0.1:{}", 17000 + n))),
         row!("node.misaka_cli_path", NONE, |s, n, _t| s.node.misaka_cli_path = Some(PathBuf::from(format!("/bin/misaka-{n}")))),
         row!("node.rpc_url", NONE, |s, n, _t| s.node.rpc_url = Some(format!("ws://127.0.0.1:{}", 18000 + n))),
-        row!("node.network", NONE, |s, _n, _t| s.node.network = flip(s.node.network, NodeNetwork::Testnet11, NodeNetwork::Devnet)),
+        // The `misaka` engine hands the network's id to its worker (`MISAKA_PALW_NETWORK_ID`,
+        // ADR-0096 Decision 10), so the network is one of that engine's constructor inputs.
+        row!("node.network", [BackendKind::Misaka], |s, _n, _t| s.node.network = flip(s.node.network, NodeNetwork::Testnet11, NodeNetwork::Devnet)),
         row!("node.role", NONE, |s, _n, _t| s.node.role = flip(s.node.role, NetworkRole::Observer, NetworkRole::Verifier)),
         row!("node.mining_address", NONE, |s, n, _t| s.node.mining_address = Some(format!("misakatest:addr{n}"))),
         row!("node.producer_key_path", NONE, |s, n, _t| s.node.producer_key_path =

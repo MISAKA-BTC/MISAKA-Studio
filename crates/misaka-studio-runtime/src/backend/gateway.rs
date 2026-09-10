@@ -830,7 +830,7 @@ pub fn sampling_notice(params: &SamplingCommitment, network: &str) -> Value {
 pub fn sampling_refusal(divergence: &[(&'static str, Value)], network: &str) -> String {
     let asked: Vec<String> = divergence.iter().map(|(name, value)| format!("{name}={value}")).collect();
     format!(
-        "node.sampling_policy is `refuse`, and this request asks for sampling the free-prompt lane cannot honour: {}. \
+        "node.sampling_policy is `refuse`, and this request — with the Studio's generation defaults filling what it did not send — resolves to sampling the free-prompt lane cannot honour: {}. \
          The lane replays a greedy decode while palw_fp_decode_rules is not armed on {network} (ADR-0082 Decision 11, \
          ADR-0096 Decision 4). Send temperature 0, top_p 1, top_k 0, min_p 0, repeat_penalty 1 and no seed — or set \
          node.sampling_policy to greedy_with_notice to have the knobs dropped and reported under misaka.sampling.",

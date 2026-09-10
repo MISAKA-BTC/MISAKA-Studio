@@ -45,6 +45,7 @@ impl MlxBackend {
                 health_path: "/v1/models",
                 startup_timeout,
                 env: Vec::new(),
+                load_env: None,
             }),
         }
     }

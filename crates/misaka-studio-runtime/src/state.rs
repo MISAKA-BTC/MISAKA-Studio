@@ -105,6 +105,9 @@ impl AppState {
 
     /// [`AppState::new`], told which settings came from a flag or the environment.
     pub async fn with_origins(settings: Settings, settings_path: PathBuf, data_dir: PathBuf, origins: SettingOrigins) -> Arc<Self> {
+        // ADR-0096 Decision 10: the local answer-only gateway keeps its identity, anchor and outbox
+        // under THIS data directory — which `--data-dir` may have moved — so it is set here, once.
+        crate::backend::misaka::set_local_gateway_workdir(data_dir.join("local-gateway"));
         let hardware = HardwareSnapshot::probe();
         let store = Arc::new(ModelStore::new(vec![settings.models_dir.clone()]));
         if let Err(e) = store.refresh().await {
@@ -165,11 +168,10 @@ impl AppState {
         };
         let is_artifact = loaded.model.path.file_name().and_then(|n| n.to_str()).is_some_and(palw::is_artifact_filename);
         if is_artifact {
-            let serve = settings.backend.misaka_serve_path.clone();
-            match serve {
-                Some(path) if path.is_file() => Ok(()),
-                Some(path) => Err(format!("the local integer runtime is not at {}", path.display())),
-                None => Err("the local integer runtime (misaka-palw-serve) is not installed; the chat can only be answered by the pool's gateway".to_string()),
+            if local_integer_engine_installed(&settings) {
+                Ok(())
+            } else {
+                Err("no local integer engine is installed (misaka-palw-gateway and the family worker, ADR-0096 Decision 10); the chat can only be answered by the pool's gateway".to_string())
             }
         } else {
             let backend = build_backend_kind(BackendKind::Auto, &settings, &self.hardware);
@@ -379,7 +381,7 @@ impl AppState {
         // but only when the local integer runtime is actually installed. Otherwise the gateway
         // stays the chat's engine and the queue is told not to double up (see
         // `local_engine_for_loaded_model`).
-        let local_serve_installed = settings.backend.misaka_serve_path.as_deref().is_some_and(|p| p.is_file());
+        let local_serve_installed = local_integer_engine_installed(settings);
         let background = settings.node.mining_mode == misaka_studio_core::settings::MiningMode::Background;
         let prefer_local = is_artifact && background && local_serve_installed;
         if prefer_local && configured.name() == crate::backend::gateway::NAME {
@@ -564,7 +566,12 @@ impl AppState {
                 },
             )
         };
+        // Only the gateway backend can carry a committed format; the local `misaka` engine is an
+        // answer-only gateway (or its retired fallback) and commits nothing, so it refuses the ask.
         let lane = backend.name() == crate::backend::gateway::NAME;
+        // But BOTH decode greedily — the lane by rule, the local engine because it runs the lane's
+        // own worker (ADR-0096 Decision 10) — so a sampling ask is noticed or refused on both.
+        let greedy_engine = lane || backend.name() == MisakaBackend::NAME;
         if crate::backend::gateway::requires_committed_format(misaka.as_ref()) && !lane {
             return Err(Error::BadRequest {
                 message: format!(
@@ -575,7 +582,7 @@ impl AppState {
                 ),
             });
         }
-        if lane {
+        if greedy_engine {
             let notice = lane_sampling_gate(policy, &params, network)?;
             let mut sampling = notices.remove("sampling").unwrap_or_else(|| Value::Object(Default::default()));
             merge_misaka(&mut sampling, &notice);
@@ -844,6 +851,20 @@ pub fn kind_for_backend_name(name: &str) -> Option<BackendKind> {
 /// Split out because the engine is not only a preference: a `.palwart` can be run by the integer
 /// runtime or a gateway and by nothing else, and a GGUF by neither. The setting says which engine
 /// to prefer FOR THE FILES IT CAN RUN; the file decides the rest.
+/// **Is there a local integer engine on this machine** — the answer-only gateway over a family
+/// worker, or the retired server it falls back to (ADR-0096 Decision 10). Asked of the backend the
+/// settings would build, so the predicate and the engine resolve paths the one way.
+pub fn local_integer_engine_installed(settings: &Settings) -> bool {
+    MisakaBackend::new(
+        settings.backend.misaka_gateway_path.clone(),
+        settings.backend.misaka_serve_path.clone(),
+        settings.backend.misaka_tokenizer_path.clone(),
+        settings.node.network.id(),
+        Duration::from_secs(settings.backend.startup_timeout_secs),
+    )
+    .any_installed()
+}
+
 pub fn build_backend_kind(kind: BackendKind, settings: &Settings, hardware: &HardwareSnapshot) -> SharedBackend {
     let timeout = Duration::from_secs(settings.backend.startup_timeout_secs);
     let tag = accelerator_tag(hardware);
@@ -861,8 +882,10 @@ pub fn build_backend_kind(kind: BackendKind, settings: &Settings, hardware: &Har
             settings.node.pool_slot_token.clone(),
         )),
         BackendKind::Misaka => Arc::new(MisakaBackend::new(
+            settings.backend.misaka_gateway_path.clone(),
             settings.backend.misaka_serve_path.clone(),
             settings.backend.misaka_tokenizer_path.clone(),
+            settings.node.network.id(),
             timeout,
         )),
         // Auto: MLX where it can run, llama.cpp everywhere else. MLX is chosen only on Apple
