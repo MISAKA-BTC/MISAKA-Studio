@@ -144,6 +144,18 @@ else — and what the lane cannot honour is refused BY NAME before anything runs
   any field the table does not name. Accepted and listed in `misaka.ignored_fields`: `user`,
   `metadata`, `store`, `parallel_tool_calls`, `max_completion_tokens` (an alias of `max_tokens`).
 
+### The `misaka` engine (ADR-0096 Decision 10)
+
+A class artifact (`.palwart`, `.palwq36`) is run by the network's own binaries, not by a
+chat-only server: `misaka-palw-gateway --answer-never-commit` over the family worker
+(`palw-a16-fp-worker`, `palw-qwen36-fp-worker`), with an identity of `{}` — no bond, no key,
+nothing filed. Install the three from the Components page, or set `backend.misaka_gateway_path`
+to a directory that holds them. The artifact must declare its tokenizer: the published
+`qwen25-1.5b-a16.palwart` does not yet, and the worker refuses it at boot, so bind it once with
+the node tree's `palw-class bind-tokenizer` (the refusal prints the exact command; the output is
+byte-identical to the file the testnet-11 fleet runs). A machine that still has the retired
+`misaka-palw-serve` falls back to it for an unbound artifact, and the engine's descriptor says so.
+
 Conversations are the runtime's, not the window's: `GET /api/v1/conversations`,
 `GET|PUT|DELETE /api/v1/conversations/{id}`, `GET /api/v1/conversations/export`,
 `POST /api/v1/conversations/import` (the Studio's export, OpenAI's `conversations.json`, or a
