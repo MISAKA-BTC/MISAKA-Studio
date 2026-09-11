@@ -111,6 +111,22 @@ impl RecordStore {
             .await
             .map_err(|e| Error::io(self.path.display(), e))?;
         file.write_all(line.as_bytes()).await.map_err(|e| Error::io(self.path.display(), e))?;
+        // **`write_all` is not the write.** `tokio::fs::File` buffers, and dropping it does NOT
+        // flush — the bytes are handed to a background blocking task and a `File` that goes out of
+        // scope with work outstanding simply loses it. So this returned `Ok(())` for a record that
+        // had not reached the file, and whether it ever did was a race with the scheduler: the
+        // store's in-memory list showed the record, a reopen read the file and did not.
+        //
+        // Seen as a flaky `records_append_and_survive_a_reopen` — one ubuntu runner red and another
+        // green on the same commit — which is the honest shape of this bug rather than a bad test.
+        // An operator loses the record silently, because the only report was a `warn!` that never
+        // fired.
+        //
+        // `flush` and not `sync_all`: this pushes tokio's buffer into the OS, which is what makes
+        // the next open see the line. `sync_all` would additionally force the disk, and an fsync
+        // per inference record is a cost this log does not need — it is a local history, not
+        // consensus state.
+        file.flush().await.map_err(|e| Error::io(self.path.display(), e))?;
         Ok(())
     }
 
