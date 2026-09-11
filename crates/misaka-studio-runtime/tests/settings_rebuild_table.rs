@@ -81,7 +81,8 @@ fn table() -> Vec<Row> {
         row!("node.rpc_url", NONE, |s, n, _t| s.node.rpc_url = Some(format!("ws://127.0.0.1:{}", 18000 + n))),
         // The `misaka` engine hands the network's id to its worker (`MISAKA_PALW_NETWORK_ID`,
         // ADR-0096 Decision 10), so the network is one of that engine's constructor inputs.
-        row!("node.network", [BackendKind::Misaka], |s, _n, _t| s.node.network = flip(s.node.network, NodeNetwork::Testnet11, NodeNetwork::Devnet)),
+        row!("node.network", [BackendKind::Misaka], |s, _n, _t| s.node.network =
+            flip(s.node.network, NodeNetwork::Testnet11, NodeNetwork::Devnet)),
         row!("node.role", NONE, |s, _n, _t| s.node.role = flip(s.node.role, NetworkRole::Observer, NetworkRole::Verifier)),
         row!("node.mining_address", NONE, |s, n, _t| s.node.mining_address = Some(format!("misakatest:addr{n}"))),
         row!("node.producer_key_path", NONE, |s, n, _t| s.node.producer_key_path =

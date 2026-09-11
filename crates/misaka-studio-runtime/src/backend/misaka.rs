@@ -563,23 +563,33 @@ mod tests {
     /// of llama.cpp's arithmetic knobs, because this engine's execution is the artifact's.
     #[test]
     fn the_gateway_command_line_is_exactly_the_answer_only_flag_set() {
-        let args = gateway_args(Path::new("/data/local-gateway"), Path::new("/engines/palw-a16-fp-worker"), 1339);
+        let workdir = Path::new("/data/local-gateway");
+        let worker = Path::new("/engines/palw-a16-fp-worker");
+        let args = gateway_args(workdir, worker, 1339);
+        // **The three workdir paths are spelled the way the PLATFORM spells them.** This used to
+        // write `/data/local-gateway/outbox` as a literal, which made the assertion a Unix fact:
+        // `gateway_args` builds them with `Path::join`, so on Windows they come back with `\`, and
+        // the test failed there while the code was right. The separator handed to the gateway must
+        // be the one its own OS will open, so the expectation is built the same way rather than
+        // typed — and a slash typed into the WRONG half of this comparison is exactly what the
+        // Windows runner exists to catch.
+        let entry = |name: &str| workdir.join(name).display().to_string();
         assert_eq!(
             args,
             vec![
-                "--listen",
-                "127.0.0.1:1339",
-                "--worker",
-                "/engines/palw-a16-fp-worker",
-                "--outbox",
-                "/data/local-gateway/outbox",
-                "--identity",
-                "/data/local-gateway/identity.json",
-                "--anchor",
-                "/data/local-gateway/anchor.json",
-                "--answer-never-commit",
-                "--max-decode-cap",
-                "512",
+                "--listen".to_string(),
+                "127.0.0.1:1339".to_string(),
+                "--worker".to_string(),
+                worker.display().to_string(),
+                "--outbox".to_string(),
+                entry("outbox"),
+                "--identity".to_string(),
+                entry("identity.json"),
+                "--anchor".to_string(),
+                entry("anchor.json"),
+                "--answer-never-commit".to_string(),
+                "--max-decode-cap".to_string(),
+                "512".to_string(),
             ]
         );
         for forbidden in ["--rpc", "--derive-seed", "--n-gpu-layers", "--threads", "--temperature"] {
