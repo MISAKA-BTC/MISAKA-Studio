@@ -273,6 +273,13 @@ pub(crate) fn parse_registered_bond(line: &str) -> Option<String> {
 /// A line worth surfacing in the activity feed: production, panel work, holds, and the identity
 /// lines an operator is told to check.
 pub(crate) fn is_activity_line(line: &str) -> bool {
+    // **One line per draw is not activity.** The producer reports what each draw read from storage
+    // (`this draw read 0.0 MiB from storage …`), several times a second on a floor producer — and a
+    // 120-line panel of those had pushed out every hold, draw report and produced block, which are
+    // the lines this panel exists to show.
+    if line.contains("[palw-producer] this draw read ") {
+        return false;
+    }
     [
         "[palw-producer]",
         "[palw-panel]",
@@ -327,7 +334,53 @@ pub(crate) fn parse_effort(line: &str) -> Option<Effort> {
     let draws = number_before(" draws this run")?;
     let produced = number_before(" produced").unwrap_or(0);
     let ticket_one_in = line.split("(1 in ").nth(1).and_then(|rest| rest.split(')').next()).and_then(|n| n.trim().parse::<f64>().ok());
-    Some(Effort { draws, produced, ticket_one_in })
+    let network_lost = number_before(" won the class ticket").unwrap_or(0);
+    Some(Effort {
+        draws,
+        produced,
+        ticket_one_in,
+        ticket_wins: produced + network_lost,
+        draws_per_min: None,
+        stamp_secs: log_stamp_secs(line),
+    })
+}
+
+/// The pace between two draw reports of one run, in draws per minute.
+///
+/// From the reports' own timestamps rather than the time they reached the app, so a node whose
+/// log is read back in a burst still gets the pace it actually drew at. `None` across a restart
+/// (the counter went backwards) or when either line carries no time.
+pub(crate) fn draw_rate(prev: Option<&Effort>, next: &Effort) -> Option<f64> {
+    let prev = prev?;
+    let (t0, t1) = (prev.stamp_secs?, next.stamp_secs?);
+    (next.draws >= prev.draws && t1 > t0).then(|| (next.draws - prev.draws) as f64 * 60.0 / (t1 - t0))
+}
+
+/// Seconds since the epoch of a log line's leading `YYYY-MM-DD HH:MM:SS[.mmm]` stamp, ignoring the
+/// offset: only differences between two lines of one log are taken, and they share it.
+fn log_stamp_secs(line: &str) -> Option<f64> {
+    let stamp = line.get(..19)?;
+    let b = stamp.as_bytes();
+    if b[4] != b'-' || b[7] != b'-' || b[10] != b' ' || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| stamp.get(r)?.parse::<i64>().ok();
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hh, mm, ss) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    // Days from civil (Howard Hinnant's algorithm), valid for every proleptic Gregorian date.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let frac = line
+        .get(19..)
+        .filter(|rest| rest.starts_with('.'))
+        .map(|rest| rest[1..].chars().take_while(char::is_ascii_digit).collect::<String>())
+        .and_then(|digits| format!("0.{digits}").parse::<f64>().ok())
+        .unwrap_or(0.0);
+    Some((days * 86_400 + hh * 3_600 + mm * 60 + ss) as f64 + frac)
 }
 
 /// **What the log has said about mining, folded as the lines arrive.**
@@ -601,6 +654,16 @@ pub struct Effort {
     /// One in how many draws wins the class ticket, from the node's own `1 in N`. The ticket is
     /// the first of two gates: a winner still has to beat the network's bits.
     pub ticket_one_in: Option<f64>,
+    /// Class tickets won this run: the blocks produced plus the tickets that then lost the
+    /// network's draw. With `draws` and `ticket_one_in` this is the one count a person can hold
+    /// against the odds — "0 won" after 7,000 draws at 1 in 38,570 is the likeliest outcome, and
+    /// only the expected number says so.
+    pub ticket_wins: u64,
+    /// Draws per minute between this report and the previous one of the same run. `None` for a
+    /// run's first report.
+    pub draws_per_min: Option<f64>,
+    #[serde(skip)]
+    pub(crate) stamp_secs: Option<f64>,
 }
 
 /// One row of the Studio's own block explorer: a block this machine produced, described by the
@@ -1178,7 +1241,8 @@ async fn drain_node<R: tokio::io::AsyncRead + Unpin>(stream: R, logs: Arc<Mutex<
         if let Some(outpoint) = parse_registered_bond(&line) {
             state.registered_bond = Some(outpoint);
         }
-        if let Some(effort) = parse_effort(&line) {
+        if let Some(mut effort) = parse_effort(&line) {
+            effort.draws_per_min = draw_rate(state.effort.as_ref(), &effort);
             state.effort = Some(effort);
         }
         state.mining.observe(&line);
@@ -1222,6 +1286,41 @@ mod tests {
         // A line with no odds is still a draw count — the odds are absent, not zero.
         assert_eq!(parse_effort("[palw-producer] 7 draws this run, 0 produced").map(|e| (e.draws, e.ticket_one_in)), Some((7, None)));
         assert!(parse_effort("[palw-producer] holding: no bond").is_none(), "no report, no claim");
+    }
+
+    #[test]
+    fn two_reports_of_one_run_give_the_pace_and_the_ticket_count() {
+        // The two reports a pool floor slot printed five minutes apart on 2026-09-12.
+        let first = parse_effort(
+            "2026-09-12 12:32:31.485+02:00 [INFO ] [palw-producer] 36011 draws this run, 1 produced, 1 won the class \
+             ticket and lost the network draw against bits; class ticket p = 2.592e-5 per draw (1 in 3.857e4)",
+        )
+        .unwrap();
+        let second = parse_effort(
+            "2026-09-12 12:37:31.636+02:00 [INFO ] [palw-producer] 36514 draws this run, 1 produced, 1 won the class \
+             ticket and lost the network draw against bits; class ticket p = 2.592e-5 per draw (1 in 3.857e4)",
+        )
+        .unwrap();
+        assert_eq!(second.ticket_wins, 2, "a produced block is a ticket won too");
+        let rate = draw_rate(Some(&first), &second).expect("two stamped reports give a pace");
+        assert!((rate - 503.0 * 60.0 / 300.151).abs() < 1e-6, "{rate}");
+        assert_eq!(draw_rate(None, &second), None, "a run's first report has no pace");
+        assert_eq!(draw_rate(Some(&second), &first), None, "a counter that went back is a restart, not a pace");
+
+        // A stamp that crosses midnight and a month end is still a difference of seconds.
+        let a = log_stamp_secs("2026-08-31 23:59:59.500+02:00 x").unwrap();
+        let b = log_stamp_secs("2026-09-01 00:00:01.000+02:00 x").unwrap();
+        assert!((b - a - 1.5).abs() < 1e-9);
+        assert_eq!(log_stamp_secs("2026-09-04 [INFO ] x"), None);
+    }
+
+    #[test]
+    fn a_per_draw_storage_line_is_not_activity() {
+        assert!(!is_activity_line(
+            "2026-09-12 12:40:38.470+02:00 [INFO ] [palw-producer] this draw read 0.0 MiB from storage (no mapped class \
+             holds a residency: the page cache decides)"
+        ));
+        assert!(is_activity_line("[palw-producer] 36514 draws this run, 1 produced"));
     }
 
     #[test]

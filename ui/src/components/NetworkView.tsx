@@ -166,7 +166,7 @@ export function NetworkView() {
 
   return (
     <div className="h-full overflow-y-auto p-4">
-      <MiningBanner mining={node.mining} effort={node.effort} pool={pool} />
+      <MiningBanner mining={node.mining} effort={node.effort} pool={pool} commandLine={node.command_line} />
       {(node.pay_address || node.registered_bond) && <ProducerIdentityCard node={node} />}
       <div className="grid gap-4 xl:grid-cols-3">
         <div className="space-y-4 xl:col-span-2">
@@ -375,12 +375,52 @@ function ModelRequestDoor() {
   )
 }
 
-/** One draw is one complete inference the node ran to buy a ticket. */
-function effortLine(effort: Effort): string {
+/**
+ * The class the running node draws on, read from the command line the Studio actually ran — not from
+ * the settings, which may have changed since. `null` when the node is not supervised: then we do not
+ * know, and say nothing.
+ */
+function minedClass(commandLine: string[] | null): { floor: boolean; id: string | null } | null {
+  if (!commandLine) return null
+  const flag = commandLine.find((arg) => arg.startsWith('--palw-producer-class='))
+  return flag ? { floor: false, id: flag.slice('--palw-producer-class='.length) } : { floor: true, id: null }
+}
+
+function hoursText(hours: number): string {
+  if (hours < 1) return `${Math.max(1, Math.round(hours * 60))} min`
+  if (hours < 48) return `${hours.toFixed(hours < 10 ? 1 : 0)} h`
+  return `${(hours / 24).toFixed(1)} days`
+}
+
+/**
+ * One draw is one complete inference the node ran to buy a ticket.
+ *
+ * **"0 won" has to arrive with what was expected.** A tester reported 7,000 draws and nothing won,
+ * on a machine drawing the floor class at 1 in 38,570: 0.18 tickets were expected and no ticket at
+ * all was the likeliest outcome (83 %). The screen gave the odds and left the arithmetic to them, and
+ * the loaded chat model made it look as though that model was the one mining. So this states the
+ * class being drawn, the expected count so far, the chance of none, and the pace in wall-clock time.
+ */
+function effortLine(effort: Effort, mined: { floor: boolean; id: string | null } | null): string {
   const draws = `${effort.draws.toLocaleString()} draw${effort.draws === 1 ? '' : 's'} this run`
-  if (effort.ticket_one_in === null) return `Working: ${draws}.`
-  const one_in = Math.round(effort.ticket_one_in).toLocaleString()
-  return `Working: ${draws}. One draw in ${one_in} wins this class's ticket, and a ticket still has to beat the network's difficulty.`
+  const on = mined === null ? '' : mined.floor ? ' on the floor class (PALW-BASE-0)' : ` on class ${mined.id?.slice(0, 8)}…`
+  const pace = effort.draws_per_min !== null ? ` at ${effort.draws_per_min < 10 ? effort.draws_per_min.toFixed(1) : Math.round(effort.draws_per_min)} a minute` : ''
+  if (effort.ticket_one_in === null) return `Working: ${draws}${on}${pace}.`
+  const oneIn = effort.ticket_one_in
+  const expected = effort.draws / oneIn
+  const none = Math.exp(-expected)
+  const won = `${effort.ticket_wins} ticket${effort.ticket_wins === 1 ? '' : 's'} won`
+  const odds =
+    ` One draw in ${Math.round(oneIn).toLocaleString()} wins the class ticket, so ${expected < 10 ? expected.toFixed(2) : Math.round(expected)} were expected by now` +
+    ` (${won}${effort.ticket_wins === 0 ? `; no ticket yet happens ${Math.round(none * 100)} % of the time at this count` : ''}).`
+  const perTicket =
+    effort.draws_per_min && effort.draws_per_min > 0
+      ? ` At this pace a ticket comes about every ${hoursText(oneIn / effort.draws_per_min / 60)} on average, and a ticket still has to beat the network's difficulty to become a block.`
+      : ` A ticket still has to beat the network's difficulty to become a block.`
+  const floorNote = mined?.floor
+    ? ' The chat model is not what draws here: with no producer class set, this node mines the integer floor, whatever model is loaded for chat.'
+    : ''
+  return `Working: ${draws}${on}${pace}.${odds}${perTicket}${floorNote}`
 }
 
 const LANE_NAMES: Record<number, string> = {
@@ -613,7 +653,17 @@ function ChainClock({ status }: { status: NodeStatus }) {
   )
 }
 
-function MiningBanner({ mining, effort, pool }: { mining: MiningState; effort: Effort | null; pool: PoolStatus | null }) {
+function MiningBanner({
+  mining,
+  effort,
+  pool,
+  commandLine,
+}: {
+  mining: MiningState
+  effort: Effort | null
+  pool: PoolStatus | null
+  commandLine: string[] | null
+}) {
   if (mining.state === 'producing') {
     return (
       <div className="mb-4 flex flex-wrap items-center gap-3 rounded-xl border border-emerald-300 bg-emerald-50 p-4 dark:border-emerald-900 dark:bg-emerald-950/40">
@@ -648,7 +698,7 @@ function MiningBanner({ mining, effort, pool }: { mining: MiningState; effort: E
                 The node says: <span className="mono">{mining.holding}</span>
               </>
             ) : (
-              <>{effort && effort.draws > 0 ? effortLine(effort) : 'Syncing, or waiting for its first win. The node states a reason here as soon as it has one.'}</>
+              <>{effort && effort.draws > 0 ? effortLine(effort, minedClass(commandLine)) : 'Syncing, or waiting for its first win. The node states a reason here as soon as it has one.'}</>
             )}
           </p>
         </div>

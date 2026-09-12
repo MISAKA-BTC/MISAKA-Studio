@@ -1,0 +1,20 @@
+[Unit]
+Description=MISAKA pool slot %i — carries this slot's commitments to the chain
+After=network-online.target misaka-pool-fp@%i.service
+Wants=misaka-pool-fp@%i.service
+
+[Service]
+Type=simple
+Environment=FP_SLOT_DIR=/var/lib/misaka-minerpool/slots/slot-%i
+Environment=FP_RPC=127.0.0.1:26313
+Environment=FP_WRPC_PORT=26314
+Environment=FP_CLASS_LEAVES=6630544
+ExecStart=/usr/bin/python3 /opt/misaka-minerpool/fp-autosubmit.py
+Restart=always
+RestartSec=15
+MemoryMax=512M
+StandardOutput=append:/var/lib/misaka-minerpool/slots/slot-%i/fp/submit.log
+StandardError=append:/var/lib/misaka-minerpool/slots/slot-%i/fp/submit.log
+
+[Install]
+WantedBy=multi-user.target

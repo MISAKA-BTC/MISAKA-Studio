@@ -22,10 +22,36 @@ trade is the product; on mainnet it would be a custody business, which is why th
 ```
 /opt/misaka-minerpool/pool.py        # the API, 127.0.0.1:8799, nginx-proxied at /pool/
 /opt/misaka-minerpool/run-slot.sh    # slot lifecycle: register → capture outpoint → produce
+/opt/misaka-minerpool/run-fp.sh      # a free-prompt slot's gateway (holds no key)
+/opt/misaka-minerpool/wrpc.py        # the explorer node's JSON wRPC, for pool.py's chain reads
 /etc/systemd/system/misaka-minerpool.service
 /etc/systemd/system/misaka-pool-slot@.service
-/var/lib/misaka-minerpool/slots/slot-NN/   # seed.key, slot.json, appdir/, kaspad.log
+/etc/systemd/system/misaka-pool-fp@.service
+/etc/systemd/system/misaka-pool-fpsubmit@.service
+/etc/systemd/system/misaka-pool-fpsubmit@.service.d/watch.conf   # runs misaka-palw-fp-rail --watch
+/var/lib/misaka-minerpool/slots/slot-NN/   # seed.key, slot.json, appdir/, kaspad.log, fp/
+/var/lib/misaka-minerpool/slots/archived/  # reclaimed slots, kept whole (their seeds are custody)
 ```
+
+The files here are the ones deployed on the pool host (synced 2026-09-12; the copy had fallen
+behind by the whole free-prompt mode). `misaka-pool-fpsubmit@.service` still names the retired
+`fp-autosubmit.py`; the drop-in replaces its `ExecStart`, and is what runs.
+
+## Capacity: what holds a slot, and what the host can carry
+
+A slot number is held while the slot **runs, holds a bond, holds any coins, or is less than a day
+old**. Anything else — stopped, never bonded, 0 sompi, older than a day — is reclaimed by the next
+join: its units are disabled and its directory is moved to `slots/archived/`, never deleted. Every
+test keeps the slot when in doubt (an unreadable balance, a bond the node logged but slot.json does
+not yet name). A reclaimed slot's token answers `410` with what happened, not a bare `403`.
+
+Before this, the pool counted directories: two slots stopped on 2026-09-05 during the host's OOM
+incident (never funded, units dead) made every join answer "the pool is full" for a week.
+
+The slot count is not the only limit. A join is refused while the host's `MemAvailable` is under
+3 GiB (floor) or 8 GiB (free-prompt), because the explorer node shares this host and was OOM-killed
+there on 2026-09-05. `/pool/v1/info` reports `slots_used` (running or holding something),
+`slots_reclaimable`, `host_memory_available_bytes`, and per mode `accepting` and `refusal`.
 
 Expectations the scripts encode: `/root/t11/kaspad` is the fleet build (the slots must
 announce the live fingerprint), `/root/misaka` answers `key gen` and `wallet utxo list`,
@@ -36,7 +62,7 @@ and a TERM'd node drops RocksDB on the floor.
 ## API
 
 ```
-GET  /pool/v1/info                → capacity, network, minimum funding, the custody sentence
+GET  /pool/v1/info                → capacity (and why a join would be refused), minimum funding, custody
 POST /pool/v1/slots               → create a slot: {slot_id, token, address, seed_hex (once)}
 GET  /pool/v1/slots/<id>          → X-Pool-Token: phase, balance, bond, blocks_won, activity
 ```
