@@ -1,0 +1,18 @@
+[Unit]
+Description=MISAKA pool slot %i — free-prompt gateway (the answer is the work)
+After=network-online.target misaka-pool-slot@%i.service
+Wants=misaka-pool-slot@%i.service
+
+[Service]
+Type=simple
+ExecStart=/opt/misaka-minerpool/run-fp.sh /var/lib/misaka-minerpool/slots/slot-%i
+Restart=always
+RestartSec=15
+# A job allocates its workspace on a host that already runs five nodes. Capped so the kernel takes
+# a chat, never a producer: a lost answer is recoverable, an OOM-killed node loses its mempool.
+MemoryMax=3G
+StandardOutput=append:/var/lib/misaka-minerpool/slots/slot-%i/fp/gateway.log
+StandardError=append:/var/lib/misaka-minerpool/slots/slot-%i/fp/gateway.log
+
+[Install]
+WantedBy=multi-user.target

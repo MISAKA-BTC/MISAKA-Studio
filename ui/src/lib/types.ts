@@ -387,6 +387,10 @@ export type Effort = {
   draws: number
   produced: number
   ticket_one_in: number | null
+  /** Class tickets won this run: blocks produced plus tickets that then lost the network's draw. */
+  ticket_wins: number
+  /** Draws per minute between the last two reports of this run; null for a run's first report. */
+  draws_per_min: number | null
 }
 
 /** What the chain has actually paid this producer, from the node's own utxo index. */
