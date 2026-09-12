@@ -7,11 +7,10 @@
 //!
 //! # Finding the binary
 //!
-//! Three places, in order, because each is right for a different kind of user:
-//!
-//! 1. **The configured path** — someone who built llama.cpp with flags they care about.
-//! 2. **Next to the Studio executable** — the packaged desktop app ships an engine beside itself.
-//! 3. **`PATH`** — a developer with `llama-server` installed system-wide.
+//! The one search order every component shares (`crate::components::resolve_component`,
+//! ADR-0096 Decision 10): the configured path — someone who built llama.cpp with flags they care
+//! about — then beside the Studio executable and its `engines/`, where the packaged app ships or
+//! installs an engine, then `PATH` for a developer with `llama-server` system-wide.
 //!
 //! When none of them has it, the backend reports unavailable *with the remedy*, and the app
 //! keeps running on the mock backend rather than failing to start. A local-LLM app that refuses
@@ -19,8 +18,9 @@
 //! the app.
 
 use super::openai_child::{ChildEngine, ChildEngineConfig};
-use super::{Availability, GenerationRequest, InferenceBackend, LoadRequest, LoadedModel, StreamEvent};
+use super::{Availability, GenerationRequest, InferenceBackend, LoadRequest, LoadedModel, RuntimeFingerprint, StreamEvent};
 use crate::Result;
+use crate::components::{ComponentId, resolve_component};
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use misaka_studio_core::provenance::RuntimeDescriptor;
@@ -34,22 +34,27 @@ pub struct LlamaCppBackend {
 }
 
 impl LlamaCppBackend {
+    /// The name this backend answers to, everywhere.
+    pub const NAME: &'static str = "llamacpp";
+
     /// `configured` is `backend.llama_server_path`; `accelerator_tag` is `cuda`, `metal`, `rocm`
     /// or `cpu` and becomes part of the determinism class, because the same source built for a
     /// different accelerator is different arithmetic.
     pub fn new(configured: Option<PathBuf>, accelerator_tag: impl Into<String>, startup_timeout: Duration) -> Self {
-        let program = resolve_program(configured);
+        let resolution = resolve_component(&ComponentId::LlamaServer, configured.as_deref(), None);
         LlamaCppBackend {
             accelerator_tag: accelerator_tag.into(),
             engine: ChildEngine::new(ChildEngineConfig {
-                name: "llamacpp",
-                program,
+                name: Self::NAME,
+                program: resolution.path,
+                program_candidate: resolution.candidate,
                 args: Box::new(build_args),
                 // llama-server answers /health with 503 while the model loads and 200 once it is
                 // ready, which is exactly the signal a supervisor needs.
                 health_path: "/health",
                 startup_timeout,
                 env: Vec::new(),
+                load_env: None,
             }),
         }
     }
@@ -59,35 +64,11 @@ impl LlamaCppBackend {
     }
 }
 
-/// Where the engine binary is.
+/// Where the engine binary is — the one search order, for this component. Kept under its old
+/// name and signature for the callers that had it; the order itself is spelled once, in
+/// `crate::components`.
 pub fn resolve_program(configured: Option<PathBuf>) -> PathBuf {
-    let exe_name = if cfg!(windows) { "llama-server.exe" } else { "llama-server" };
-
-    if let Some(path) = configured {
-        return path;
-    }
-    // Beside the Studio's own executable: how the packaged app ships an engine.
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        for candidate in [dir.join(exe_name), dir.join("engines").join(exe_name)] {
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
-    }
-    if let Some(found) = which(exe_name) {
-        return found;
-    }
-    // Not found: return the bare name so the error names the thing that is missing rather than
-    // an absolute path that never existed.
-    PathBuf::from(exe_name)
-}
-
-/// A minimal `which`, to avoid a dependency for eleven lines.
-fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|dir| dir.join(name)).find(|c| c.is_file())
+    resolve_component(&ComponentId::LlamaServer, configured.as_deref(), None).path
 }
 
 /// The command line.
@@ -149,7 +130,13 @@ fn build_args(request: &LoadRequest, port: u16) -> Vec<String> {
 
 impl InferenceBackend for LlamaCppBackend {
     fn name(&self) -> &'static str {
-        "llamacpp"
+        Self::NAME
+    }
+
+    fn fingerprint(&self) -> RuntimeFingerprint {
+        let mut fingerprint = self.engine.fingerprint();
+        fingerprint.extra.insert("accelerator_tag".into(), self.accelerator_tag.clone());
+        fingerprint
     }
 
     fn descriptor(&self) -> BoxFuture<'_, RuntimeDescriptor> {
@@ -282,5 +269,28 @@ mod tests {
     fn a_configured_path_wins() {
         let configured = PathBuf::from("/opt/llama/llama-server");
         assert_eq!(resolve_program(Some(configured.clone())), configured);
+    }
+
+    /// The fingerprint is the constructor's inputs and nothing else: the program as resolved,
+    /// where it was found, the timeout and the accelerator tag. Two instances built from the
+    /// same inputs agree; a different input shows up as a different value, not as a rebuild
+    /// nobody can explain.
+    #[test]
+    fn the_fingerprint_is_the_constructors_inputs() {
+        let a = LlamaCppBackend::new(Some(PathBuf::from("/opt/llama/llama-server")), "metal", Duration::from_secs(30)).fingerprint();
+        let b = LlamaCppBackend::new(Some(PathBuf::from("/opt/llama/llama-server")), "metal", Duration::from_secs(30)).fingerprint();
+        assert_eq!(a, b);
+        assert_eq!(a.kind, "llamacpp");
+        assert_eq!(a.program.as_deref(), Some(Path::new("/opt/llama/llama-server")));
+        assert_eq!(a.startup_timeout_secs, Some(30));
+        assert_eq!(a.extra.get("accelerator_tag").map(String::as_str), Some("metal"));
+        assert_eq!(a.extra.get("program_candidate").map(String::as_str), Some("configured"));
+        assert!(a.url.is_none() && a.token_sha256_prefix.is_none() && a.tokenizer.is_none());
+
+        let timeout =
+            LlamaCppBackend::new(Some(PathBuf::from("/opt/llama/llama-server")), "metal", Duration::from_secs(31)).fingerprint();
+        assert_ne!(a, timeout);
+        let tag = LlamaCppBackend::new(Some(PathBuf::from("/opt/llama/llama-server")), "cuda", Duration::from_secs(30)).fingerprint();
+        assert_ne!(a, tag);
     }
 }

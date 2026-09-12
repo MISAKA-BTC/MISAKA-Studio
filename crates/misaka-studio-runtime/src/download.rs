@@ -81,6 +81,32 @@ struct Job {
     cancel: Arc<AtomicBool>,
 }
 
+/// What a verified file becomes.
+enum Completion {
+    /// A model: gets its provenance sidecar and appears in the model list.
+    Model { store: Arc<ModelStore>, source: ModelSource },
+    /// A component from the manifest: a binary gets its executable bit; an artifact landing in
+    /// the models directory gets the list rescanned.
+    Component { executable: bool, store: Option<Arc<ModelStore>> },
+}
+
+/// `chmod u+x,g+x,o+x`, unix only; a no-op elsewhere, where the extension decides.
+async fn mark_executable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = tokio::fs::metadata(path).await.map_err(|e| Error::io(path.display(), e))?;
+        let mut permissions = meta.permissions();
+        permissions.set_mode(permissions.mode() | 0o111);
+        tokio::fs::set_permissions(path, permissions).await.map_err(|e| Error::io(path.display(), e))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 /// Every download, running or finished.
 pub struct DownloadManager {
     jobs: RwLock<HashMap<String, Job>>,
@@ -241,7 +267,6 @@ impl DownloadManager {
 
         let url = catalog.download_url(&repo, &revision, &file);
         let token = catalog.token().map(str::to_string);
-        let manager = self.clone();
         let source = ModelSource {
             repo: Some(repo),
             revision: Some(revision),
@@ -252,20 +277,101 @@ impl DownloadManager {
             base_revision: None,
             origin: Some("huggingface".into()),
         };
+        self.spawn_job(id, url, token, destination, expected_sha256, cancel, Completion::Model { store, source });
+        Ok(progress)
+    }
 
+    /// Begin a component download: a binary or a class artifact named by a components manifest
+    /// row (ADR-0096 Decision 10), verified against the row's digest and size by the same
+    /// transfer every model download uses.
+    ///
+    /// Not a model: no sidecar is written and no repository is recorded, because the row is the
+    /// provenance and the manifest is where it lives. `executable` sets the mode bits once the
+    /// file is verified — a binary that landed without them is a file the spawn cannot run, and
+    /// the error would name a permission rather than the download. `store` is rescanned when
+    /// given, for an artifact that lands in the models directory and belongs in the list.
+    pub async fn start_component(
+        self: &Arc<Self>,
+        url: String,
+        destination: PathBuf,
+        expected_sha256: String,
+        expected_size: u64,
+        executable: bool,
+        store: Option<Arc<ModelStore>>,
+    ) -> Result<DownloadProgress> {
+        let file_name = destination.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let id = format!("component/{file_name}");
+        if destination.exists() {
+            return Err(Error::bad_request(format!("{} already exists — delete it first to install it again", destination.display())));
+        }
+        {
+            let jobs = self.jobs.read().await;
+            if let Some(job) = jobs.get(&id)
+                && matches!(job.progress.status, DownloadStatus::Downloading | DownloadStatus::Verifying)
+            {
+                return Ok(job.progress.clone());
+            }
+        }
+        let dest_dir = destination.parent().map(Path::to_path_buf).unwrap_or_default();
+        tokio::fs::create_dir_all(&dest_dir).await.map_err(|e| Error::io(dest_dir.display(), e))?;
+        let progress = DownloadProgress {
+            id: id.clone(),
+            repo: url.clone(),
+            file: file_name.clone(),
+            model_id: file_name.rsplit_once('.').map(|(stem, _)| stem.to_string()).unwrap_or(file_name),
+            destination: destination.clone(),
+            downloaded: 0,
+            total: Some(expected_size),
+            bytes_per_second: 0.0,
+            status: DownloadStatus::Downloading,
+            error: None,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.jobs.write().await.insert(id.clone(), Job { progress: progress.clone(), cancel: cancel.clone() });
+        let _ = self.events.send(progress.clone());
+        self.spawn_job(id, url, None, destination, Some(expected_sha256), cancel, Completion::Component { executable, store });
+        Ok(progress)
+    }
+
+    /// The transfer as a task, and what happens to the verified file afterwards.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_job(
+        self: &Arc<Self>,
+        id: String,
+        url: String,
+        token: Option<String>,
+        destination: PathBuf,
+        expected_sha256: Option<String>,
+        cancel: Arc<AtomicBool>,
+        completion: Completion,
+    ) {
+        let manager = self.clone();
         tokio::spawn(async move {
             let outcome = manager.run(&id, url, token, destination.clone(), expected_sha256, cancel).await;
             match outcome {
                 Ok(digest) => {
-                    let mut sidecar = Sidecar::load(&destination);
-                    sidecar.source = source;
-                    sidecar.sha256 = digest;
-                    sidecar.hashed_size = tokio::fs::metadata(&destination).await.ok().map(|m| m.len());
-                    if let Err(e) = sidecar.save(&destination) {
-                        tracing::warn!("could not write the sidecar for {}: {e}", destination.display());
-                    }
+                    let store = match completion {
+                        Completion::Model { store, source } => {
+                            let mut sidecar = Sidecar::load(&destination);
+                            sidecar.source = source;
+                            sidecar.sha256 = digest;
+                            sidecar.hashed_size = tokio::fs::metadata(&destination).await.ok().map(|m| m.len());
+                            if let Err(e) = sidecar.save(&destination) {
+                                tracing::warn!("could not write the sidecar for {}: {e}", destination.display());
+                            }
+                            Some(store)
+                        }
+                        Completion::Component { executable, store } => {
+                            if executable && let Err(e) = mark_executable(&destination).await {
+                                tracing::warn!("could not mark {} executable: {e}", destination.display());
+                            }
+                            store
+                        }
+                    };
                     manager.finish(&id, DownloadStatus::Completed, None).await;
-                    if let Err(e) = store.refresh().await {
+                    if let Some(store) = store
+                        && let Err(e) = store.refresh().await
+                    {
                         tracing::warn!("model rescan after download failed: {e}");
                     }
                 }
@@ -273,8 +379,6 @@ impl DownloadManager {
                 Err(e) => manager.finish(&id, DownloadStatus::Failed, Some(e.to_string())).await,
             }
         });
-
-        Ok(progress)
     }
 
     /// The transfer itself. Returns the verified digest when one could be established.
@@ -435,6 +539,15 @@ pub fn part_path(destination: &Path) -> PathBuf {
     let mut name = destination.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     name.push_str(".part");
     destination.with_file_name(name)
+}
+
+/// The SHA-256 of a file, hex, off the async runtime — what the components table computes on
+/// `?verify=1` and what a download is checked with.
+pub async fn sha256_file(path: &Path) -> Result<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || sha256_file_sync(&path))
+        .await
+        .map_err(|e| Error::Download { message: format!("hashing did not run: {e}") })?
 }
 
 fn sha256_file_sync(path: &Path) -> Result<String> {

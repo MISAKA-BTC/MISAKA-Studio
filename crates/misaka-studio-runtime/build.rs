@@ -20,4 +20,12 @@ fn main() {
     // reach a sibling directory two levels up.
     println!("cargo:rerun-if-changed={}", dist.display());
     println!("cargo:rerun-if-changed=build.rs");
+
+    // The target triple this binary is built for, as the components manifest spells a row's
+    // `platform` (`aarch64-apple-darwin`, `x86_64-unknown-linux-musl`, ADR-0096 Decision 10).
+    // Only the build knows it exactly — `std::env::consts` has the OS and the arch but not the
+    // vendor or the libc — and a runtime that guessed the triple would compare manifest rows
+    // against a string nobody published.
+    println!("cargo:rustc-env=MISAKA_STUDIO_TARGET={}", std::env::var("TARGET").unwrap_or_else(|_| "unknown".into()));
+    println!("cargo:rerun-if-env-changed=TARGET");
 }

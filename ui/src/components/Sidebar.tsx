@@ -4,7 +4,7 @@
 // process is not there every other part of the UI is showing stale data. Saying so in one place,
 // permanently, beats a toast that has already faded by the time someone looks up.
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import logo from '../assets/misaka-logo.png'
 import { api } from '../lib/api'
 import { relativeTime } from '../lib/format'
@@ -129,11 +129,28 @@ function MiningLight() {
   )
 }
 
+/**
+ * Hand the browser a file. A blob URL and a click is the one way a page starts a download without
+ * a server round-trip; the URL is revoked once the click has had its moment.
+ */
+function downloadJson(name: string, value: unknown) {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], { type: 'application/json' }))
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = name
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
 const NAV: { view: View; label: string; icon: IconName }[] = [
   { view: 'chat', label: 'Chat', icon: 'chat' },
   { view: 'models', label: 'Models', icon: 'cube' },
   { view: 'network', label: 'Network', icon: 'globe' },
   { view: 'monitor', label: 'Monitor', icon: 'gauge' },
+  // ADR-0096 Decision 10: every binary and artifact, held to the manifest's digests.
+  { view: 'components', label: 'Components', icon: 'shield' },
   { view: 'settings', label: 'Settings', icon: 'settings' },
 ]
 
@@ -145,11 +162,43 @@ export function Sidebar() {
   const newConversation = useStudio((s) => s.newConversation)
   const selectConversation = useStudio((s) => s.selectConversation)
   const deleteConversation = useStudio((s) => s.deleteConversation)
+  const importConversations = useStudio((s) => s.importConversations)
+  const toast = useStudio((s) => s.toast)
   const connected = useStudio((s) => s.connected)
   const runtime = useStudio((s) => s.runtime)
   const downloads = useStudio((s) => s.downloads)
+  const fileInput = useRef<HTMLInputElement>(null)
 
   const active = downloads.filter((d) => d.status === 'downloading' || d.status === 'verifying').length
+
+  // ADR-0096 Decision 12: the conversations are the person's — a file out, a file in. Both go
+  // through the runtime, which holds them; the window's cache is not the copy worth exporting.
+  const exportAll = async () => {
+    try {
+      const exported = await api.exportConversations()
+      // The desktop shell's window has no file-save path (no filesystem or dialog plugin is
+      // granted), so a blob download there ends nowhere. Inside the shell the export goes to the
+      // clipboard and says so; in a browser the download is the natural thing.
+      if ('__TAURI_INTERNALS__' in window) {
+        await navigator.clipboard.writeText(JSON.stringify(exported, null, 2))
+        toast('success', `Copied ${exported.conversations.length} conversations to the clipboard as JSON — paste them into a file to keep them.`)
+        return
+      }
+      downloadJson('misaka-studio-conversations.json', exported)
+    } catch (error) {
+      toast('error', `Export failed: ${(error as Error).message}`)
+    }
+  }
+  const importFile = async (file: File) => {
+    let body: unknown
+    try {
+      body = JSON.parse(await file.text())
+    } catch {
+      toast('error', `${file.name} is not JSON`)
+      return
+    }
+    await importConversations(body)
+  }
 
   return (
     <aside className="flex h-full w-64 shrink-0 flex-col border-r border-ink-200 bg-white dark:border-ink-800 dark:bg-ink-900">
@@ -193,17 +242,49 @@ export function Sidebar() {
 
       <div className="mt-1 flex items-center justify-between px-4 pb-1">
         <span className="text-[0.7rem] font-semibold uppercase tracking-wide text-ink-500 dark:text-ink-400">Conversations</span>
-        <button
-          type="button"
-          className="btn-ghost px-1.5 py-1"
-          title="New chat"
-          onClick={() => {
-            newConversation()
-            setView('chat')
-          }}
-        >
-          <Icon name="plus" className="size-3.5" />
-        </button>
+        <div className="flex items-center gap-0.5">
+          <button
+            type="button"
+            className="btn-ghost px-1.5 py-1 text-[0.7rem]"
+            title="Export every conversation as misaka-studio-conversations.json"
+            disabled={conversations.length === 0}
+            onClick={() => void exportAll()}
+          >
+            Export
+          </button>
+          <button
+            type="button"
+            className="btn-ghost px-1.5 py-1 text-[0.7rem]"
+            title="Import conversations: the Studio's own export, OpenAI's conversations.json, or a list of {title, messages}"
+            onClick={() => fileInput.current?.click()}
+          >
+            Import
+          </button>
+          <input
+            ref={fileInput}
+            type="file"
+            accept=".json,application/json"
+            className="hidden"
+            onChange={(event) => {
+              const file = event.target.files?.[0]
+              // Cleared so the same file can be chosen again; a picker that ignores a repeat
+              // choice looks like an import that silently did nothing.
+              event.target.value = ''
+              if (file) void importFile(file)
+            }}
+          />
+          <button
+            type="button"
+            className="btn-ghost px-1.5 py-1"
+            title="New chat"
+            onClick={() => {
+              newConversation()
+              setView('chat')
+            }}
+          >
+            <Icon name="plus" className="size-3.5" />
+          </button>
+        </div>
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-3">

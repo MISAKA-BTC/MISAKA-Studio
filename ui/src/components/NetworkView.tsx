@@ -19,7 +19,21 @@ import { MiningQueuePanel } from './MiningQueuePanel'
 import { PromptMiningPanel } from './PromptMiningPanel'
 import { api } from '../lib/api'
 import { bytes, count, shortHash } from '../lib/format'
-import type { Effort, MiningState, NetworkOverview, NodeClassRow, NodeStatus, NodeView, PalwClassStatus, PoolBlock, PoolFunds, PoolStatus, ProducedBlock, Settings } from '../lib/types'
+import type {
+  Effort,
+  MiningState,
+  ModelRequestPrefill,
+  NetworkOverview,
+  NodeClassRow,
+  NodeStatus,
+  NodeView,
+  PalwClassStatus,
+  PoolBlock,
+  PoolFunds,
+  PoolStatus,
+  ProducedBlock,
+  Settings,
+} from '../lib/types'
 import { useStudio } from '../store/studio'
 import { CopyButton, EmptyState, Field, Icon, Section, Spinner, Toggle } from './common'
 
@@ -41,6 +55,22 @@ export function NetworkView() {
       setError((e as Error).message)
     }
   }, [])
+
+  // A class card another view asked for (the Components page's artifact rows link here). Read
+  // once the overview has rendered the cards, scrolled to, lit for a moment, and cleared — the
+  // request must not outlive one visit, or the tab would jump on every later open.
+  const classFocus = useStudio((s) => s.classFocus)
+  const focusClass = useStudio((s) => s.focusClass)
+  useEffect(() => {
+    if (!overview || !classFocus) return
+    const element = document.getElementById(classCardId(classFocus))
+    if (element) {
+      element.scrollIntoView({ block: 'center' })
+      element.classList.add('ring-2', 'ring-arc-500')
+      setTimeout(() => element.classList.remove('ring-2', 'ring-arc-500'), 2500)
+    }
+    focusClass(null)
+  }, [overview, classFocus, focusClass])
 
   // Poll while the tab is open. The node's numbers (DAA score, peers, activity) move on their
   // own; a static snapshot of a chain is stale by definition.
@@ -171,6 +201,7 @@ export function NetworkView() {
                   <ChainClassCard key={row.class_id} row={row} />
                 ))}
             </div>
+            <ModelRequestDoor />
           </section>
 
           <ProducedBlocksCard />
@@ -224,6 +255,126 @@ export function NetworkView() {
  * only the producer's own `produced block #N`, states the answer in one word, and when the answer
  * is no it carries the node's own reason rather than making the user go looking for it.
  */
+/**
+ * **The door for a model that does not exist yet** (ADR-0096 Decision 13).
+ *
+ * Adding a model has a path end to end — conversion, registration, certification, a line with an
+ * owner — and had no place for the person who will do none of that to ask. The runtime builds
+ * the issue form's URL from what this machine knows (RAM, accelerator, the classes it holds); the
+ * fields are shown here first, because a link that quietly carries a hardware description to a
+ * public tracker is the kind of thing a person should read before clicking. A request is public,
+ * buys no priority and moves nothing on chain.
+ *
+ * The prefill is fetched when the card mounts, not on the click: a browser only lets a page open
+ * a new tab from inside the click itself, and a click that first awaits a fetch is no longer
+ * inside it.
+ */
+function ModelRequestDoor() {
+  const toast = useStudio((s) => s.toast)
+  const [prefill, setPrefill] = useState<ModelRequestPrefill | null>(null)
+  const [failure, setFailure] = useState<string | null>(null)
+  // The desktop shell grants its window no opener plugin (`desktop/src-tauri/capabilities/
+  // default.json`), so `window.open` there returns null and nothing happens. The link is then
+  // shown instead of opened — a button that silently does nothing is the one outcome a person
+  // cannot act on.
+  const [link, setLink] = useState<string | null>(null)
+
+  useEffect(() => {
+    let live = true
+    api
+      .modelRequest()
+      .then((p) => {
+        if (live) setPrefill(p)
+      })
+      .catch((e: unknown) => {
+        if (live) setFailure((e as Error).message)
+      })
+    return () => {
+      live = false
+    }
+  }, [])
+
+  const open = async () => {
+    let target = prefill
+    if (!target) {
+      try {
+        target = await api.modelRequest()
+        setPrefill(target)
+        setFailure(null)
+      } catch (e) {
+        toast('error', `Cannot build the request: ${(e as Error).message}`)
+        return
+      }
+    }
+    const opened = window.open(target.url, '_blank', 'noopener')
+    if (!opened) setLink(target.url)
+  }
+
+  return (
+    <div className="mt-4 border-t border-ink-200 pt-3 dark:border-ink-800">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-xs text-ink-500 dark:text-ink-400">
+          Want a model this network does not run yet? Ask in the open: a request is public, buys no priority and moves
+          nothing on chain — the queue is the tracker.
+        </p>
+        <button
+          type="button"
+          className="btn-outline"
+          onClick={() => void open()}
+          title={failure ?? 'Opens the model-request form on GitHub, prefilled with what this machine knows'}
+        >
+          <Icon name="external" className="size-3.5" />
+          Request a model…
+        </button>
+      </div>
+      {link && (
+        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+          <span className="text-ink-500 dark:text-ink-400">This window cannot open links. Copy the form's address and open it in a browser:</span>
+          <CopyButton text={link} label="Copy link" />
+          <span className="mono max-w-full truncate text-[0.68rem] text-ink-500 dark:text-ink-400" title={link}>
+            {link}
+          </span>
+        </div>
+      )}
+      {prefill && (
+        <details className="mt-2 text-xs">
+          <summary className="cursor-pointer text-ink-500 dark:text-ink-400">What the form is prefilled with — read it before you click</summary>
+          {/* Every field of the form is in the URL, empty ones included; the filled ones are
+              what leaves this machine, the empty ones are the questions the person answers. */}
+          <dl className="mt-2 space-y-2">
+            {Object.entries(prefill.fields)
+              .filter(([, value]) => value.trim() !== '')
+              .map(([key, value]) => (
+                <div key={key}>
+                  <dt className="text-[0.7rem] font-medium text-ink-600 dark:text-ink-300">{key}</dt>
+                  <dd>
+                    <pre className="mono whitespace-pre-wrap rounded-lg bg-ink-100 p-2 text-[0.68rem] leading-relaxed dark:bg-ink-800">{value}</pre>
+                  </dd>
+                </div>
+              ))}
+          </dl>
+          {Object.entries(prefill.fields).some(([, value]) => value.trim() === '') && (
+            <p className="mt-2 text-[0.7rem] text-ink-500 dark:text-ink-400">
+              Left for you to fill in on the form:{' '}
+              {Object.entries(prefill.fields)
+                .filter(([, value]) => value.trim() === '')
+                .map(([key]) => key)
+                .join(', ')}
+              .
+            </p>
+          )}
+          <p className="mono mt-2 truncate text-[0.65rem] text-ink-500 dark:text-ink-400" title={prefill.url}>
+            {prefill.url}
+          </p>
+        </details>
+      )}
+      {failure && !prefill && (
+        <p className="mt-2 text-[0.7rem] text-ink-500 dark:text-ink-400">The runtime could not prefill the form: {failure}</p>
+      )}
+    </div>
+  )
+}
+
 /**
  * The class the running node draws on, read from the command line the Studio actually ran — not from
  * the settings, which may have changed since. `null` when the node is not supervised: then we do not
@@ -769,6 +920,11 @@ function matchesSpec(spec: PalwClassStatus['spec'], row: NodeClassRow): boolean 
   return spec.is_base ? row.base : spec.class_id_hex ? row.class_id.startsWith(spec.class_id_hex.slice(0, 16)) : false
 }
 
+/** The DOM id of a class card, so another view can ask this tab to scroll to it. */
+function classCardId(name: string): string {
+  return `class-${name}`
+}
+
 /** A class this chain carries that the Studio ships no description for — registered after genesis. */
 function ChainClassCard({ row }: { row: NodeClassRow }) {
   const active = row.status === 'Active'
@@ -852,7 +1008,7 @@ function ClassCard({
     )
 
   return (
-    <div className="rounded-xl border border-ink-200 p-4 dark:border-ink-800">
+    <div id={classCardId(spec.name)} className="scroll-mt-4 rounded-xl border border-ink-200 p-4 dark:border-ink-800">
       <div className="flex flex-wrap items-center gap-2">
         <h4 className="mono text-sm font-semibold">{spec.name}</h4>
         <span className="badge bg-arc-500/15 text-arc-700 dark:text-arc-300">{spec.share_permille}‰ share</span>

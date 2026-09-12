@@ -74,10 +74,8 @@ pub fn health_check(port: u16, timeout: Duration) -> bool {
     // branch and spawned a rival runtime on a random port: two Studios, two model loads, and a
     // window pointed at the one that had just started rather than the one already working.
     // Measured on 2026-09-04 against a runtime that answered `HTTP/1.0 200 OK` in 3 ms.
-    let status_ok = response
-        .lines()
-        .next()
-        .is_some_and(|line| line.starts_with("HTTP/") && line.split_whitespace().nth(1) == Some("200"));
+    let status_ok =
+        response.lines().next().is_some_and(|line| line.starts_with("HTTP/") && line.split_whitespace().nth(1) == Some("200"));
     status_ok && response.contains(RUNTIME_NAME)
 }
 
@@ -245,10 +243,8 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
             let port = listener.local_addr().expect("addr").port();
             let body = format!("{{\"status\":\"ok\",\"name\":\"{RUNTIME_NAME}\"}}");
-            let response = format!(
-                "{version} 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
-                body.len()
-            );
+            let response =
+                format!("{version} 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len());
             let server = std::thread::spawn(move || {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let mut sink = [0u8; 1024];

@@ -107,7 +107,8 @@ async fn a_real_engine_loads_streams_and_identifies_itself() {
     while let Some(event) = stream.next().await {
         match event.expect("no stream error") {
             StreamEvent::Delta(delta) => text.push_str(&delta),
-            StreamEvent::Done { usage, finish_reason } => done = Some((usage, finish_reason)),
+            StreamEvent::Done { usage, finish_reason, .. } => done = Some((usage, finish_reason)),
+            StreamEvent::ToolCallDelta(call) => panic!("no tools were offered, yet the engine called one: {call}"),
         }
     }
     let (usage, finish_reason) = done.expect("the stream ends with a Done event");

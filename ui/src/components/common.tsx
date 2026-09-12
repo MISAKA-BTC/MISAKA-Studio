@@ -176,10 +176,20 @@ export function FitBadge({ fit, summary }: { fit: FitVerdict; summary: string })
   )
 }
 
-export function Section({ title, description, children }: { title: string; description?: string; children: ReactNode }) {
+/** `marker` sits on the header line, right of the title — where a section says the running values
+ *  differ from the file's (ADR-0096 Decision 11). Absent, the header is what it always was. */
+export function Section({ title, description, marker, children }: { title: string; description?: string; marker?: ReactNode; children: ReactNode }) {
+  const heading = <h3 className="text-sm font-semibold">{title}</h3>
   return (
     <section className="card p-5">
-      <h3 className="text-sm font-semibold">{title}</h3>
+      {marker ? (
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          {heading}
+          {marker}
+        </div>
+      ) : (
+        heading
+      )}
       {description && <p className="mt-1 text-xs text-ink-500 dark:text-ink-400">{description}</p>}
       <div className="mt-4 space-y-4">{children}</div>
     </section>

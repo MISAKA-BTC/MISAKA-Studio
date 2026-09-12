@@ -9,9 +9,13 @@ use crate::backend::llamacpp::{LlamaCppBackend, accelerator_tag};
 use crate::backend::misaka::MisakaBackend;
 use crate::backend::mlx::MlxBackend;
 use crate::backend::mock::MockBackend;
-use crate::backend::{ChatMessage, GenerationRequest, LoadRequest, LoadedModel, SharedBackend, StreamEvent, Usage};
+use crate::backend::{
+    ChatMessage, GenerationRequest, LegLimits, LoadRequest, LoadedModel, RuntimeFingerprint, SharedBackend, StreamEvent, Usage,
+    merge_misaka,
+};
 use crate::catalog::Catalog;
 use crate::download::DownloadManager;
+use crate::effective::SettingOrigins;
 use crate::metrics::MetricsHub;
 use crate::records::{RecordStore, StoredRecord};
 use crate::store::ModelStore;
@@ -25,8 +29,9 @@ use misaka_studio_core::provenance::{
     InferenceInputs, InferenceRecord, ModelIdentity, RuntimeIdentity, SamplingCommitment, canonical_prompt_bytes,
     canonical_raw_prompt_bytes,
 };
-use misaka_studio_core::settings::{BackendKind, GpuLayers, Settings};
+use misaka_studio_core::settings::{BackendKind, GpuLayers, SamplingPolicy, Settings};
 use serde::Serialize;
+use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -58,6 +63,17 @@ pub struct RuntimeStatus {
     pub descriptor: Option<misaka_studio_core::provenance::RuntimeDescriptor>,
 }
 
+/// When each subsystem's running object was (re)built — the `since` of the effective view
+/// (ADR-0096 Decision 11). Unix seconds are what the API prints; the value is taken at the
+/// moment the object is swapped in, in the same critical section, so it cannot describe an
+/// object other than the one it sits beside.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuiltAt {
+    pub backend: SystemTime,
+    pub catalog: SystemTime,
+    pub records: SystemTime,
+}
+
 pub struct AppState {
     pub settings: RwLock<Settings>,
     pub settings_path: PathBuf,
@@ -73,10 +89,25 @@ pub struct AppState {
     catalog: RwLock<Arc<Catalog>>,
     backend: RwLock<SharedBackend>,
     loaded: RwLock<Option<LoadedState>>,
+    /// The chat history, one file per conversation (ADR-0096 Decision 12).
+    pub conversations: Arc<crate::conversations::ConversationStore>,
+    /// Which settings the daemon overrode from a flag or the environment for this run, so the
+    /// effective view can name the source instead of saying "settings file" about a value the
+    /// file does not hold.
+    pub origins: SettingOrigins,
+    built_at: RwLock<BuiltAt>,
 }
 
 impl AppState {
     pub async fn new(settings: Settings, settings_path: PathBuf, data_dir: PathBuf) -> Arc<Self> {
+        Self::with_origins(settings, settings_path, data_dir, SettingOrigins::default()).await
+    }
+
+    /// [`AppState::new`], told which settings came from a flag or the environment.
+    pub async fn with_origins(settings: Settings, settings_path: PathBuf, data_dir: PathBuf, origins: SettingOrigins) -> Arc<Self> {
+        // ADR-0096 Decision 10: the local answer-only gateway keeps its identity, anchor and outbox
+        // under THIS data directory — which `--data-dir` may have moved — so it is set here, once.
+        crate::backend::misaka::set_local_gateway_workdir(data_dir.join("local-gateway"));
         let hardware = HardwareSnapshot::probe();
         let store = Arc::new(ModelStore::new(vec![settings.models_dir.clone()]));
         if let Err(e) = store.refresh().await {
@@ -97,6 +128,8 @@ impl AppState {
 
         let node = Arc::new(crate::node::NodeManager::with_journal(Some(data_dir.join("produced-blocks.jsonl"))));
         let mining = crate::mining_queue::MiningQueue::open(data_dir.join("mining-queue.json")).await;
+        let conversations = crate::conversations::ConversationStore::new(data_dir.join("conversations"));
+        let now = SystemTime::now();
         let app = Arc::new(AppState {
             settings: RwLock::new(settings),
             settings_path,
@@ -111,6 +144,9 @@ impl AppState {
             catalog: RwLock::new(catalog),
             backend: RwLock::new(backend),
             loaded: RwLock::new(None),
+            conversations,
+            origins,
+            built_at: RwLock::new(BuiltAt { backend: now, catalog: now, records: now }),
         });
         // The queue's worker lives as long as the app: prompts queued in an earlier run are still
         // owed a claim, and the person may have closed the window on them on purpose.
@@ -132,11 +168,10 @@ impl AppState {
         };
         let is_artifact = loaded.model.path.file_name().and_then(|n| n.to_str()).is_some_and(palw::is_artifact_filename);
         if is_artifact {
-            let serve = settings.backend.misaka_serve_path.clone();
-            match serve {
-                Some(path) if path.is_file() => Ok(()),
-                Some(path) => Err(format!("the local integer runtime is not at {}", path.display())),
-                None => Err("the local integer runtime (misaka-palw-serve) is not installed; the chat can only be answered by the pool's gateway".to_string()),
+            if local_integer_engine_installed(&settings) {
+                Ok(())
+            } else {
+                Err("no local integer engine is installed (misaka-palw-gateway and the family worker, ADR-0096 Decision 10); the chat can only be answered by the pool's gateway".to_string())
             }
         } else {
             let backend = build_backend_kind(BackendKind::Auto, &settings, &self.hardware);
@@ -258,29 +293,46 @@ impl AppState {
         self.loaded.read().await.clone()
     }
 
+    /// When each running object was built.
+    pub async fn built_at(&self) -> BuiltAt {
+        *self.built_at.read().await
+    }
+
     /// Apply new settings: persist them, then rebuild whatever they changed.
     ///
     /// Changing the backend or the model directory unloads the current model. That is the honest
     /// behaviour — the loaded model may not exist under the new directory, and it certainly is
     /// not loaded in the new engine — and it is stated in the API response rather than left for
     /// the user to discover when generation fails.
+    ///
+    /// **The engine is rebuilt on a fingerprint, not on a list** (ADR-0096 Decision 11). The list
+    /// this replaced lacked the gateway URL and the slot token on 2026-09-05, and the fix was two
+    /// more entries in a list that was still a list. Now three questions are asked, none of which
+    /// names a field:
+    ///
+    /// 1. *Did a routing input change?* `backend.kind` and `node.mining_mode` do not reach a
+    ///    constructor; they decide WHICH engine answers (`build_backend`, `backend_for`), so a
+    ///    change to either re-runs that decision on the next load.
+    /// 2. *Would the setting's own choice build differently?* The fingerprint `backend.kind`
+    ///    builds under the new settings against the one it built under the old — `Auto`
+    ///    resolving to MLX once an MLX server is named, for instance.
+    /// 3. *Would the engine that IS running build differently?* The running engine may have been
+    ///    chosen by the file rather than the setting (a `.palwart` under `Auto` runs on the
+    ///    gateway), so its own kind is rebuilt under the new settings and held against its
+    ///    fingerprint. This is the question whose answer was wrong on 2026-09-05.
     pub async fn apply_settings(&self, new: Settings) -> Result<Settings> {
         let old = self.settings.read().await.clone();
         new.save(&self.settings_path)?;
 
-        // A gateway engine IS its address and its token: `GatewayBackend::new` copies both at
-        // construction and never reads settings again. Joining a new pool slot (or forgetting one)
-        // rewrites exactly those two fields while the kind stays `Gateway`, so without this the
-        // engine kept answering — and mining — for the slot the person had just left, with that
-        // slot's token, while every status panel named the new one.
-        let backend_changed = new.backend.kind != old.backend.kind
-            || new.backend.llama_server_path != old.backend.llama_server_path
-            || new.backend.mlx_server_path != old.backend.mlx_server_path
-            || new.node.palw_gateway_url != old.node.palw_gateway_url
-            || new.node.pool_slot_token != old.node.pool_slot_token
-            // Background mining moves the chat off the gateway and onto the local runtime (when
-            // it is installed); the engine has to follow the switch, in both directions.
-            || new.node.mining_mode != old.node.mining_mode;
+        let running = self.backend().await;
+        let routing_changed = new.backend.kind != old.backend.kind || new.node.mining_mode != old.node.mining_mode;
+        let selection_changed =
+            fingerprint_for(new.backend.kind, &new, &self.hardware) != fingerprint_for(old.backend.kind, &old, &self.hardware);
+        let running_changed = match kind_for_backend_name(running.name()) {
+            Some(kind) => fingerprint_for(kind, &new, &self.hardware) != running.fingerprint(),
+            None => true,
+        };
+        let backend_changed = routing_changed || selection_changed || running_changed;
         let models_dir_changed = new.models_dir != old.models_dir;
         let hub_changed = new.huggingface.endpoint != old.huggingface.endpoint || new.huggingface.token != old.huggingface.token;
         let recording_changed = new.provenance.record_inferences != old.provenance.record_inferences
@@ -289,12 +341,14 @@ impl AppState {
         if backend_changed {
             self.unload().await?;
             *self.backend.write().await = build_backend(&new, &self.hardware);
+            self.built_at.write().await.backend = SystemTime::now();
         }
         if models_dir_changed {
             self.store.set_roots(vec![new.models_dir.clone()]).await?;
         }
         if hub_changed {
             *self.catalog.write().await = Arc::new(Catalog::new(new.huggingface.endpoint.clone(), new.huggingface.token.clone()));
+            self.built_at.write().await.catalog = SystemTime::now();
         }
         if recording_changed {
             *self.records.write().await = RecordStore::open(
@@ -303,6 +357,7 @@ impl AppState {
                 new.provenance.record_inferences,
             )
             .await;
+            self.built_at.write().await.records = SystemTime::now();
         }
 
         *self.settings.write().await = new.clone();
@@ -326,7 +381,7 @@ impl AppState {
         // but only when the local integer runtime is actually installed. Otherwise the gateway
         // stays the chat's engine and the queue is told not to double up (see
         // `local_engine_for_loaded_model`).
-        let local_serve_installed = settings.backend.misaka_serve_path.as_deref().is_some_and(|p| p.is_file());
+        let local_serve_installed = local_integer_engine_installed(settings);
         let background = settings.node.mining_mode == misaka_studio_core::settings::MiningMode::Background;
         let prefer_local = is_artifact && background && local_serve_installed;
         if prefer_local && configured.name() == crate::backend::gateway::NAME {
@@ -400,7 +455,13 @@ impl AppState {
         // The engine that answered this load is the one `generate` has to reach, so the choice is
         // recorded rather than recomputed. Unloading does not put the configured one back: what
         // matters is which engine holds the model, and after an unload none does.
-        *self.backend.write().await = backend.clone();
+        {
+            let mut slot = self.backend.write().await;
+            if !Arc::ptr_eq(&*slot, &backend) {
+                self.built_at.write().await.backend = SystemTime::now();
+            }
+            *slot = backend.clone();
+        }
         let state = LoadedState { model, loaded, runtime, identity, backend: backend.name().to_string() };
         *self.loaded.write().await = Some(state.clone());
         Ok(self.status_from(Some(&state), true).await)
@@ -465,12 +526,8 @@ impl AppState {
         }
     }
 
-    /// Generate, with metrics and provenance attached.
-    ///
-    /// The returned stream is the backend's, wrapped: text is accumulated as it passes so the
-    /// completion can be committed to, and the record is written when the stream ends. Wrapping
-    /// rather than buffering matters — the user sees tokens as they arrive, and the record still
-    /// covers the whole answer.
+    /// Generate, with metrics and provenance attached — the plain form: messages or a prompt,
+    /// the sampling, the stop strings, and nothing of the tool, format or notice surface.
     pub async fn generate(
         self: &Arc<Self>,
         messages: Vec<ChatMessage>,
@@ -478,8 +535,59 @@ impl AppState {
         params: SamplingCommitment,
         stop: Vec<String>,
     ) -> Result<BoxStream<'static, Result<StreamEvent>>> {
+        self.generate_with(GenerateInputs { messages, prompt, params, stop, ..GenerateInputs::default() }).await
+    }
+
+    /// Generate, with metrics and provenance attached.
+    ///
+    /// The returned stream is the backend's, wrapped: text is accumulated as it passes so the
+    /// completion can be committed to, and the record is written when the stream ends. Wrapping
+    /// rather than buffering matters — the user sees tokens as they arrive, and the record still
+    /// covers the whole answer.
+    ///
+    /// Two refusals happen here, BEFORE the engine is asked, because both are about what this
+    /// engine can honour rather than about the request's shape (ADR-0096 Decisions 3 and 4): a
+    /// request that requires the committed format on an engine that commits nothing, and — under
+    /// `node.sampling_policy: refuse` — a non-greedy request bound for the lane. Under the default
+    /// policy the lane request goes through and the answer's `misaka.sampling` says what was
+    /// dropped; `finalize_misaka` is where that notice and the gateway's own report become one.
+    pub async fn generate_with(self: &Arc<Self>, inputs: GenerateInputs) -> Result<BoxStream<'static, Result<StreamEvent>>> {
+        let GenerateInputs { messages, prompt, params, stop, tools, tool_choice, response_format, misaka, mut notices } = inputs;
         let state = self.loaded().await.ok_or(Error::NoModelLoaded)?;
         let backend = self.backend().await;
+        let (policy, network, legs) = {
+            let settings = self.settings.read().await;
+            (
+                settings.node.sampling_policy,
+                settings.node.network.id(),
+                LegLimits {
+                    summarize_after_turns: settings.node.summarize_after_turns,
+                    continue_max_legs: settings.node.continue_max_legs,
+                },
+            )
+        };
+        // Only the gateway backend can carry a committed format; the local `misaka` engine is an
+        // answer-only gateway (or its retired fallback) and commits nothing, so it refuses the ask.
+        let lane = backend.name() == crate::backend::gateway::NAME;
+        // But BOTH decode greedily — the lane by rule, the local engine because it runs the lane's
+        // own worker (ADR-0096 Decision 10) — so a sampling ask is noticed or refused on both.
+        let greedy_engine = lane || backend.name() == MisakaBackend::NAME;
+        if crate::backend::gateway::requires_committed_format(misaka.as_ref()) && !lane {
+            return Err(Error::BadRequest {
+                message: format!(
+                    "misaka.require_committed_format: the `{}` engine commits nothing — an answer whose shape is committed \
+                     needs the gateway backend, on a network that armed palw_fp_decode_constraint (ADR-0096 Decision 3). \
+                     Drop require_committed_format to have this engine enforce the format on its own, uncommitted.",
+                    backend.name()
+                ),
+            });
+        }
+        if greedy_engine {
+            let notice = lane_sampling_gate(policy, &params, network)?;
+            let mut sampling = notices.remove("sampling").unwrap_or_else(|| Value::Object(Default::default()));
+            merge_misaka(&mut sampling, &notice);
+            notices.insert("sampling".into(), sampling);
+        }
 
         // The bytes the record commits to. Canonical and length-prefixed — see
         // `canonical_prompt_bytes`, which exists because the obvious `role: content` flattening
@@ -492,14 +600,24 @@ impl AppState {
             }
         };
 
-        let request = GenerationRequest { model: state.model.id.clone(), messages, prompt, params, stop };
+        let request = GenerationRequest {
+            model: state.model.id.clone(),
+            messages,
+            prompt,
+            params,
+            stop,
+            tools,
+            tool_choice,
+            response_format,
+            misaka,
+            legs,
+        };
         // Kept for the context retry below, which has to rebuild the request after `request` moves.
-        let (retry_model, retry_messages, retry_params, retry_stop) =
-            (request.model.clone(), request.messages.clone(), request.params, request.stop.clone());
+        let retry_template = request.clone();
         let request_messages_len = if request.prompt.is_some() { 0 } else { request.messages.len() };
 
         self.metrics.generation_started();
-        let inner = match backend.generate(request.clone()).await {
+        let inner = match backend.generate(request).await {
             Ok(stream) => stream,
             // **A conversation that outgrew the model is not a dead end.**
             //
@@ -533,20 +651,14 @@ impl AppState {
                 Some(limit) if request_messages_len > 1 => {
                     const ANSWER_ROOM_TOKENS: u64 = 96;
                     let budget = limit.saturating_sub(ANSWER_ROOM_TOKENS);
-                    let (fitted, dropped) = crate::backend::fit_messages_to_budget(&retry_messages, budget);
+                    let (fitted, dropped) = crate::backend::fit_messages_to_budget(&retry_template.messages, budget);
                     if dropped == 0 {
                         (inner, first)
                     } else {
                         tracing::info!(
                             "context {limit}: dropped {dropped} older message(s) and retried — a class's context is its artifact's"
                         );
-                        let retry = GenerationRequest {
-                            model: retry_model.clone(),
-                            messages: fitted,
-                            prompt: None,
-                            params: retry_params,
-                            stop: retry_stop.clone(),
-                        };
+                        let retry = GenerationRequest { messages: fitted, prompt: None, ..retry_template.clone() };
                         match backend.generate(retry).await {
                             Ok(mut s2) => {
                                 let f2 = s2.next().await;
@@ -571,21 +683,30 @@ impl AppState {
             let mut text = String::new();
             let mut first_token: Option<Duration> = None;
             let mut usage = Usage::default();
+            let mut misaka: Option<Value> = None;
 
             while let Some(event) = match pending_first.take() {
                 Some(e) => Some(e),
                 None => inner.next().await,
             } {
-                match &event {
+                let event = match event {
                     Ok(StreamEvent::Delta(delta)) => {
                         if first_token.is_none() {
                             first_token = Some(started.elapsed());
                         }
-                        text.push_str(delta);
+                        text.push_str(&delta);
+                        Ok(StreamEvent::Delta(delta))
                     }
-                    Ok(StreamEvent::Done { usage: u, .. }) => usage = *u,
-                    Err(_) => {}
-                }
+                    // The one place the app's notices and the engine's report meet: the client
+                    // and the record both read the merged object, so neither can see a `sampling`
+                    // the other did not.
+                    Ok(StreamEvent::Done { usage: u, finish_reason, misaka: from_engine }) => {
+                        usage = u;
+                        misaka = finalize_misaka(&notices, from_engine);
+                        Ok(StreamEvent::Done { usage: u, finish_reason, misaka: misaka.clone() })
+                    }
+                    other => other,
+                };
                 if tx.send(event).await.is_err() {
                     break; // client hung up
                 }
@@ -595,7 +716,7 @@ impl AppState {
             let ttft = first_token.map(|d| d.as_millis() as u64);
             let tps = if duration_ms > 0 { usage.completion_tokens as f64 * 1000.0 / duration_ms as f64 } else { 0.0 };
             app.metrics.generation_finished(usage.completion_tokens, tps, ttft.unwrap_or(0));
-            app.record(&state, &prompt_bytes, &text, usage, started_at_unix_ms, duration_ms, ttft, params).await;
+            app.record(&state, &prompt_bytes, &text, usage, started_at_unix_ms, duration_ms, ttft, params, misaka).await;
         });
 
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
@@ -612,6 +733,7 @@ impl AppState {
         duration_ms: u64,
         time_to_first_token_ms: Option<u64>,
         params: SamplingCommitment,
+        misaka: Option<Value>,
     ) {
         let records = self.records.read().await.clone();
         if !records.is_enabled() {
@@ -645,9 +767,55 @@ impl AppState {
                 prompt: keep_transcripts.then(|| String::from_utf8_lossy(prompt).into_owned()),
                 completion: keep_transcripts.then(|| completion.to_string()),
                 model_id: Some(state.model.id.clone()),
+                misaka,
             })
             .await;
     }
+}
+
+/// Everything one `/v1` request hands to [`AppState::generate_with`].
+///
+/// `notices` is the Studio's own half of the answer's `misaka` object — `ignored_fields`, the
+/// identity-valued knobs the parser accepted — which the generate path extends with its
+/// `sampling` notice and merges under the engine's report ([`finalize_misaka`]).
+#[derive(Clone, Debug, Default)]
+pub struct GenerateInputs {
+    pub messages: Vec<ChatMessage>,
+    pub prompt: Option<String>,
+    pub params: SamplingCommitment,
+    pub stop: Vec<String>,
+    pub tools: Option<Value>,
+    pub tool_choice: Option<Value>,
+    pub response_format: Option<Value>,
+    /// The request's `misaka` extension object, for the gateway backend.
+    pub misaka: Option<Value>,
+    pub notices: serde_json::Map<String, Value>,
+}
+
+/// **Decision 4 at the entrance.** For a request bound for the lane: the `misaka.sampling` notice
+/// under `greedy_with_notice`, or the refusal under `refuse` when any knob asks for something the
+/// lane will not run. A greedy request under `refuse` is not refused — it asks for exactly what
+/// runs — and still carries the notice, because every answer that went to the lane says so.
+pub fn lane_sampling_gate(policy: SamplingPolicy, params: &SamplingCommitment, network: &str) -> Result<Value> {
+    let divergence = crate::backend::gateway::sampling_divergence(params);
+    if policy == SamplingPolicy::Refuse && !divergence.is_empty() {
+        return Err(Error::BadRequest { message: crate::backend::gateway::sampling_refusal(&divergence, network) });
+    }
+    Ok(crate::backend::gateway::sampling_notice(params, network))
+}
+
+/// The answer's `misaka` object: the Studio's notices under the engine's report (the engine's
+/// keys win, [`merge_misaka`]). `None` when neither side had anything to say, so a local engine's
+/// answer carries no empty object.
+pub fn finalize_misaka(notices: &serde_json::Map<String, Value>, from_engine: Option<Value>) -> Option<Value> {
+    if notices.is_empty() && from_engine.is_none() {
+        return None;
+    }
+    let mut merged = Value::Object(notices.clone());
+    if let Some(report) = from_engine {
+        merge_misaka(&mut merged, &report);
+    }
+    Some(merged)
 }
 
 /// Build the backend a settings value asks for.
@@ -655,11 +823,48 @@ pub fn build_backend(settings: &Settings, hardware: &HardwareSnapshot) -> Shared
     build_backend_kind(settings.backend.kind, settings, hardware)
 }
 
+/// **The fingerprint these settings would build** for `kind`, without keeping the engine.
+///
+/// Constructing an engine spawns nothing and opens no socket — the process starts at `load` —
+/// so building one and reading its fingerprint IS the pure function of settings the rebuild
+/// predicate needs: whatever a constructor copies is compared, by construction, and a field a
+/// future constructor starts copying is compared without anyone remembering to add it here.
+pub fn fingerprint_for(kind: BackendKind, settings: &Settings, hardware: &HardwareSnapshot) -> RuntimeFingerprint {
+    build_backend_kind(kind, settings, hardware).fingerprint()
+}
+
+/// The setting that builds an engine of this name — the inverse of [`build_backend_kind`] over
+/// the engines it can build. `Auto` is never a name: it is the rule that picks one of these.
+pub fn kind_for_backend_name(name: &str) -> Option<BackendKind> {
+    match name {
+        n if n == LlamaCppBackend::NAME => Some(BackendKind::LlamaCpp),
+        n if n == MlxBackend::NAME => Some(BackendKind::Mlx),
+        n if n == MisakaBackend::NAME => Some(BackendKind::Misaka),
+        n if n == crate::backend::gateway::NAME => Some(BackendKind::Gateway),
+        n if n == MockBackend::NAME => Some(BackendKind::Mock),
+        _ => None,
+    }
+}
+
 /// Build one particular engine, from the same settings.
 ///
 /// Split out because the engine is not only a preference: a `.palwart` can be run by the integer
 /// runtime or a gateway and by nothing else, and a GGUF by neither. The setting says which engine
 /// to prefer FOR THE FILES IT CAN RUN; the file decides the rest.
+/// **Is there a local integer engine on this machine** — the answer-only gateway over a family
+/// worker, or the retired server it falls back to (ADR-0096 Decision 10). Asked of the backend the
+/// settings would build, so the predicate and the engine resolve paths the one way.
+pub fn local_integer_engine_installed(settings: &Settings) -> bool {
+    MisakaBackend::new(
+        settings.backend.misaka_gateway_path.clone(),
+        settings.backend.misaka_serve_path.clone(),
+        settings.backend.misaka_tokenizer_path.clone(),
+        settings.node.network.id(),
+        Duration::from_secs(settings.backend.startup_timeout_secs),
+    )
+    .any_installed()
+}
+
 pub fn build_backend_kind(kind: BackendKind, settings: &Settings, hardware: &HardwareSnapshot) -> SharedBackend {
     let timeout = Duration::from_secs(settings.backend.startup_timeout_secs);
     let tag = accelerator_tag(hardware);
@@ -677,8 +882,10 @@ pub fn build_backend_kind(kind: BackendKind, settings: &Settings, hardware: &Har
             settings.node.pool_slot_token.clone(),
         )),
         BackendKind::Misaka => Arc::new(MisakaBackend::new(
+            settings.backend.misaka_gateway_path.clone(),
             settings.backend.misaka_serve_path.clone(),
             settings.backend.misaka_tokenizer_path.clone(),
+            settings.node.network.id(),
             timeout,
         )),
         // Auto: MLX where it can run, llama.cpp everywhere else. MLX is chosen only on Apple
@@ -768,6 +975,24 @@ fn engine_pairing_refusal(model_id: &str, file_name: Option<&str>, backend: &str
 mod tests {
     use super::*;
 
+    /// Every engine `build_backend_kind` can build names itself back to the setting that built
+    /// it — the map the rebuild predicate uses to ask "what would the running engine's kind build
+    /// under the new settings". A name with no kind would make every save a rebuild.
+    #[test]
+    fn every_buildable_kind_names_itself_back() {
+        let settings = Settings::default();
+        let hardware = machine(16, None);
+        for kind in [BackendKind::LlamaCpp, BackendKind::Mlx, BackendKind::Misaka, BackendKind::Gateway, BackendKind::Mock] {
+            let backend = build_backend_kind(kind, &settings, &hardware);
+            assert_eq!(kind_for_backend_name(backend.name()), Some(kind), "{}", backend.name());
+            assert_eq!(backend.fingerprint().kind, backend.name(), "the fingerprint names the engine");
+            assert_eq!(fingerprint_for(kind, &settings, &hardware), backend.fingerprint(), "building twice fingerprints the same");
+        }
+        let auto = build_backend(&settings, &hardware);
+        assert!(kind_for_backend_name(auto.name()).is_some(), "Auto resolves to a named engine");
+        assert_eq!(kind_for_backend_name("auto"), None);
+    }
+
     /// Both directions of the same mistake. On 2026-09-04 only the first existed as a check, and
     /// only after a `.palwart` reached `llama-server`, which read `PALW` where `GGUF` should be and
     /// aborted with fifteen lines of stderr that landed in a notification the window was too short
@@ -792,6 +1017,50 @@ mod tests {
         // An MLX model is a directory: no file name, and no artifact, so no refusal from here.
         assert!(engine_pairing_refusal("c", None, "mlx").is_none());
     }
+    /// Under `refuse`, a request that asks for a temperature is refused BEFORE the lane is asked,
+    /// and the refusal names the knob and the way back; a greedy request passes and still carries
+    /// the notice. Under the default, everything passes and the notice prints what was dropped.
+    #[test]
+    fn the_sampling_policy_refuses_or_notices_before_the_lane_is_asked() {
+        let asked = SamplingCommitment { temperature: 0.7, top_k: 40, ..SamplingCommitment::default() };
+        match lane_sampling_gate(SamplingPolicy::Refuse, &asked, "testnet-11") {
+            Err(Error::BadRequest { message }) => {
+                assert!(message.contains("temperature=0.7") && message.contains("top_k=40"), "{message}");
+                assert!(message.contains("greedy_with_notice"), "the way back is named: {message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let greedy =
+            SamplingCommitment { temperature: 0.0, top_p: 1.0, top_k: 0, min_p: 0.0, repeat_penalty: 1.0, seed: None, max_tokens: 64 };
+        let notice = lane_sampling_gate(SamplingPolicy::Refuse, &greedy, "testnet-11").expect("greedy asks for what runs");
+        assert_eq!(notice["applied"]["temperature"], 0);
+
+        let notice = lane_sampling_gate(SamplingPolicy::GreedyWithNotice, &asked, "devnet").expect("passes");
+        assert_eq!(notice["requested"]["temperature"], 0.7);
+        assert_eq!(notice["applied"]["temperature"], 0);
+        assert!(notice["reason"].as_str().is_some_and(|r| r.contains("devnet")), "{notice}");
+        assert_eq!(notice["not_a_rule_on_this_lane"][0], "top_p");
+    }
+
+    /// The merge rule, from the record's side: the app's notices and the gateway's report become
+    /// one object, the gateway wins on conflict, and an engine with nothing to say leaves no
+    /// object at all.
+    #[test]
+    fn the_studios_notices_and_the_engines_report_become_one_misaka() {
+        let mut notices = serde_json::Map::new();
+        notices.insert("ignored_fields".into(), serde_json::json!(["store"]));
+        notices.insert("sampling".into(), serde_json::json!({"requested": {"temperature": 0.7}, "reason": "app"}));
+        let report = serde_json::json!({"fp_claim_id": "d673", "sampling": {"reason": "gateway"}});
+        let merged = finalize_misaka(&notices, Some(report)).expect("something to say");
+        assert_eq!(merged["fp_claim_id"], "d673");
+        assert_eq!(merged["ignored_fields"][0], "store");
+        assert_eq!(merged["sampling"]["requested"]["temperature"], 0.7);
+        assert_eq!(merged["sampling"]["reason"], "gateway", "the engine's word wins");
+
+        assert_eq!(finalize_misaka(&serde_json::Map::new(), None), None, "a local engine's answer carries no empty object");
+        assert_eq!(finalize_misaka(&notices, None).map(|m| m["sampling"]["reason"].clone()), Some(serde_json::json!("app")));
+    }
+
     use misaka_studio_core::hardware::{Accelerator, AcceleratorKind};
     use misaka_studio_core::model::ModelSource;
 

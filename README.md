@@ -115,6 +115,54 @@ The Studio's own API lives under `/api/v1` — models with fit verdicts, catalog
 metrics, settings, provenance records. `misaka-studiod --help` lists the flags;
 `misaka-studiod --check` prints where everything resolved to.
 
+### What a stock client can send (ADR-0096)
+
+The surface is the one ADR-0096 Decision 1 spells for the Studio and for `misaka-palw-gateway`
+alike, so an app written against `api.openai.com` works with the base URL changed and nothing
+else — and what the lane cannot honour is refused BY NAME before anything runs, never dropped:
+
+* `messages[].content` as a string or as a list of `{"type":"text"}` parts (flattened); a
+  non-text part (`image_url`, `input_audio`, …) is refused with its index.
+* `tools`, `tool_choice`, assistant `tool_calls` and `tool` turns. A local engine that speaks
+  them (llama-server does) gets them verbatim; on the lane they are the model's own text
+  (`<tools>` in the system turn, `<tool_call>` blocks in the answer, `<tool_response>` turns).
+* `response_format` (`json_object` / `json_schema`). On the lane the answer says which
+  enforcement it got: `misaka.format.enforcement` is `advisory` on every network that has not
+  armed `palw_fp_decode_constraint`, and a request that sets
+  `misaka.require_committed_format: true` there is refused before the inference.
+* Sampling on the lane: the gateway replays a greedy decode and refuses anything else by name;
+  the Studio, being your own app, maps a non-greedy ask to greedy and SAYS so in
+  `misaka.sampling` (`node.sampling_policy = greedy_with_notice`, or `refuse` to behave like the
+  gateway). `top_p`, `top_k`, `min_p`, `repeat_penalty` have no consensus rule on the lane and
+  are listed as `not_a_rule_on_this_lane`. `frequency_penalty` / `presence_penalty` are accepted
+  at 0 and refused otherwise — the engine's repetition control is `repeat_penalty`.
+* A long thread on a 512-token class is a chain of jobs, each its own claim: the history is
+  trimmed, a summary job runs past `node.summarize_after_turns`, and up to
+  `node.continue_max_legs` continue legs follow a `length` stop. Every leg is in
+  `misaka.jobs[]`; the trim is in `misaka.context`.
+* Refused by name: `n` other than 1, `logprobs`, the legacy `functions` / `function_call`, and
+  any field the table does not name. Accepted and listed in `misaka.ignored_fields`: `user`,
+  `metadata`, `store`, `parallel_tool_calls`, `max_completion_tokens` (an alias of `max_tokens`).
+
+### The `misaka` engine (ADR-0096 Decision 10)
+
+A class artifact (`.palwart`, `.palwq36`) is run by the network's own binaries, not by a
+chat-only server: `misaka-palw-gateway --answer-never-commit` over the family worker
+(`palw-a16-fp-worker`, `palw-qwen36-fp-worker`), with an identity of `{}` — no bond, no key,
+nothing filed. Install the three from the Components page, or set `backend.misaka_gateway_path`
+to a directory that holds them. The artifact must declare its tokenizer: the published
+`qwen25-1.5b-a16.palwart` does not yet, and the worker refuses it at boot, so bind it once with
+the node tree's `palw-class bind-tokenizer` (the refusal prints the exact command; the output is
+byte-identical to the file the testnet-11 fleet runs). A machine that still has the retired
+`misaka-palw-serve` falls back to it for an unbound artifact, and the engine's descriptor says so.
+
+Conversations are the runtime's, not the window's: `GET /api/v1/conversations`,
+`GET|PUT|DELETE /api/v1/conversations/{id}`, `GET /api/v1/conversations/export`,
+`POST /api/v1/conversations/import` (the Studio's export, OpenAI's `conversations.json`, or a
+list of `{title, messages}`), one JSON file per conversation under the data directory. And a
+model this network does not run yet has a door: `GET /api/v1/network/model-request` builds the
+issue-form URL prefilled with what this machine knows (the Network tab's "Request a model").
+
 **The default bind is `127.0.0.1` and there is no authentication.** Binding anywhere else without
 `--api-key` is refused at startup rather than served: an open inference endpoint on a shared
 network is the kind of mistake that stays open for a week before anyone notices.

@@ -49,11 +49,14 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/downloads/{*id}", delete(cancel_download))
         .route("/settings", get(get_settings).route_layer(axum::middleware::from_fn(pass)).put(put_settings))
         .route("/settings/reset", post(reset_settings))
+        .route("/settings/effective", get(effective_settings))
+        .nest("/components", crate::api::components::router())
         .nest("/network", crate::api::network::router())
         .nest("/network/pool", crate::api::pool::router())
         .nest("/network/model-market", crate::api::model_market::router())
         .nest("/network/prompt-mining", crate::api::prompt_mining::router())
         .nest("/network/mining-queue", crate::api::mining_queue::router())
+        .nest("/conversations", crate::api::conversations::router())
         .route("/records", get(list_records))
         .route("/records/{id}", get(get_record))
 }
@@ -336,6 +339,12 @@ async fn put_settings(State(state): State<Arc<AppState>>, Json(new): Json<Settin
 
 async fn reset_settings(State(state): State<Arc<AppState>>) -> Result<Json<Settings>> {
     Ok(Json(state.apply_settings(Settings::default()).await?))
+}
+
+/// What the running objects were built from, beside what the settings say — ADR-0096
+/// Decision 11. See `crate::effective`.
+async fn effective_settings(State(state): State<Arc<AppState>>) -> Json<crate::effective::EffectiveSettings> {
+    Json(crate::effective::effective_settings(&state).await)
 }
 
 #[derive(Deserialize)]

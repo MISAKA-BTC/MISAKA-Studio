@@ -9,8 +9,16 @@ import type {
   BackendInfo,
   CatalogEntry,
   CatalogRepo,
+  ComponentsListing,
+  Conversation,
+  ConversationExport,
+  ConversationImportReport,
+  ConversationSummary,
   DownloadProgress,
+  EffectiveSettings,
   InferenceRecord,
+  MisakaExtension,
+  ModelRequestPrefill,
   ModelView,
   NetworkOverview,
   NodeView,
@@ -73,7 +81,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   })
   if (!response.ok) throw await parseError(response)
   if (response.status === 204) return undefined as T
-  return (await response.json()) as T
+  // An OK answer with nothing in it is also "done" — a DELETE says so that way — and
+  // `response.json()` on an empty body is a SyntaxError dressed up as a failure.
+  const text = await response.text()
+  if (text.length === 0) return undefined as T
+  return JSON.parse(text) as T
 }
 
 export const api = {
@@ -106,6 +118,21 @@ export const api = {
 
   settings: () => request<Settings>('/api/v1/settings'),
   saveSettings: (settings: Settings) => request<Settings>('/api/v1/settings', { method: 'PUT', body: JSON.stringify(settings) }),
+  // ADR-0096 Decision 11 — what the running objects were built from, beside what the file says.
+  // Read-only: nothing here rebuilds or restarts anything.
+  settingsEffective: () => request<EffectiveSettings>('/api/v1/settings/effective'),
+
+  // ADR-0096 Decision 10 — every binary and artifact the Studio can spawn or map, held to the
+  // manifest. `verify` hashes every found file and asks every binary for `--version` (minutes,
+  // on a class artifact); `check` fetches the manifest even when `components.auto_check` is off.
+  components: (options: { verify?: boolean; check?: boolean } = {}) => {
+    const flags = [options.verify ? 'verify=1' : null, options.check ? 'check=1' : null].filter(Boolean)
+    return request<ComponentsListing>(`/api/v1/components${flags.length > 0 ? `?${flags.join('&')}` : ''}`)
+  },
+  /** Starts the install; the runtime refuses by name (400) a retired id, another platform's row,
+   *  an archive member. The download is then a resource like any model download. */
+  installComponent: (id: string) =>
+    request<DownloadProgress>(`/api/v1/components/${encodeURIComponent(id)}/install`, { method: 'POST' }),
 
   network: () => request<NetworkOverview>('/api/v1/network'),
   producedBlocks: () => request<{ blocks: ProducedBlock[] }>('/api/v1/network/blocks'),
@@ -162,13 +189,41 @@ export const api = {
   nodeLog: (limit = 200) => request<string[]>(`/api/v1/network/node/log?limit=${limit}`),
 
   records: (limit = 50) => request<InferenceRecord[]>(`/api/v1/records?limit=${limit}`),
+
+  // ADR-0096 Decision 12 — conversations are the runtime's: a JSON file per conversation under
+  // the data directory, in the UI's own shape. PUT sends the whole object; fields the runtime does
+  // not know are kept, not dropped.
+  conversations: () => request<ConversationSummary[]>('/api/v1/conversations'),
+  conversation: (id: string) => request<Conversation>(`/api/v1/conversations/${encodeURIComponent(id)}`),
+  putConversation: (conversation: Conversation) =>
+    request<ConversationSummary>(`/api/v1/conversations/${encodeURIComponent(conversation.id)}`, {
+      method: 'PUT',
+      body: JSON.stringify(conversation),
+    }),
+  deleteConversation: (id: string) => request<{ deleted: string }>(`/api/v1/conversations/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  exportConversations: () => request<ConversationExport>('/api/v1/conversations/export'),
+  /** `body` is the Studio's export, OpenAI's `conversations.json` array, or `[{title?, messages}]`;
+   *  the runtime tells the three apart and reports what it skipped by name. */
+  importConversations: (body: unknown) =>
+    request<ConversationImportReport>('/api/v1/conversations/import', { method: 'POST', body: JSON.stringify(body) }),
+
+  // ADR-0096 Decision 13 — the model-request form, prefilled with what this machine knows.
+  modelRequest: () => request<ModelRequestPrefill>('/api/v1/network/model-request'),
 }
 
-/** One event from a streamed completion. */
+/**
+ * One event from a streamed completion.
+ *
+ * `misaka` is the lane's account of the answer (ADR-0096 Decisions 3–5), carried by the last
+ * chunk; `tool_calls` is a delta's `tool_calls` list (Decision 2), passed through in OpenAI's own
+ * shape because the app that asked is the one that runs them.
+ */
 export type ChatStreamEvent =
   | { type: 'delta'; text: string }
   | { type: 'done'; finishReason: string; usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } }
   | { type: 'error'; message: string }
+  | { type: 'misaka'; misaka: MisakaExtension }
+  | { type: 'tool_calls'; toolCalls: unknown[] }
 
 export type ChatRequest = {
   model?: string
@@ -227,7 +282,12 @@ export async function* streamChat(request: ChatRequest, signal: AbortSignal): As
         yield { type: 'error', message: String(json.error.message ?? 'the runtime reported an error') }
         continue
       }
+      // The lane's own object rides the final chunk, beside `usage`. Yielded before `done` so
+      // the message holds it by the time the stream is declared over.
+      if (json.misaka && typeof json.misaka === 'object') yield { type: 'misaka', misaka: json.misaka as MisakaExtension }
       const choice = json.choices?.[0]
+      const toolCalls = choice?.delta?.tool_calls
+      if (Array.isArray(toolCalls) && toolCalls.length > 0) yield { type: 'tool_calls', toolCalls }
       const text = choice?.delta?.content
       if (typeof text === 'string' && text.length > 0) yield { type: 'delta', text }
       if (choice?.finish_reason) {

@@ -97,6 +97,34 @@ impl Catalog {
         }
     }
 
+    /// Fetch a small text document from an arbitrary `https://` URL, capped at `max_bytes`.
+    ///
+    /// Through this client — same timeouts, same user agent — and deliberately NOT through
+    /// [`Self::authorized`]: the hub token is for the hub, and a components manifest lives on a
+    /// release page. A bearer presented to every host a settings file names is a leaked token.
+    /// The cap is read from the body as it streams, so a wrong address that answers with a web
+    /// page (or a 40 GB file) stops at the cap instead of at the end.
+    pub async fn fetch_text(&self, url: &str, max_bytes: usize) -> Result<String> {
+        if !url.starts_with("https://") {
+            return Err(Error::Catalog { message: format!("{url}: only https:// documents are fetched") });
+        }
+        let response = self.http.get(url).send().await.map_err(|e| Error::Catalog { message: format!("{url}: {e}") })?;
+        let mut response = check(response, url).await?;
+        if response.content_length().is_some_and(|len| len > max_bytes as u64) {
+            return Err(Error::Catalog {
+                message: format!("{url}: {} bytes is larger than the {max_bytes}-byte cap", response.content_length().unwrap_or(0)),
+            });
+        }
+        let mut body: Vec<u8> = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|e| Error::Catalog { message: format!("{url}: {e}") })? {
+            if body.len() + chunk.len() > max_bytes {
+                return Err(Error::Catalog { message: format!("{url}: the body exceeds the {max_bytes}-byte cap") });
+            }
+            body.extend_from_slice(&chunk);
+        }
+        String::from_utf8(body).map_err(|e| Error::Catalog { message: format!("{url}: the body is not UTF-8: {e}") })
+    }
+
     /// Search for GGUF repositories.
     ///
     /// `filter=gguf` is what keeps the list to things this app can actually run: without it, a

@@ -12,7 +12,7 @@
 
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { duration } from '../lib/format'
-import type { ChatMessage, MessageMining } from '../lib/types'
+import type { ChatMessage, MessageMining, MisakaExtension, MisakaFormat, MisakaJob, MisakaSampling } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { CopyButton, EmptyState, Icon, Spinner } from './common'
 import { Markdown } from './Markdown'
@@ -81,6 +81,136 @@ function MiningBadge({ mining }: { mining: MessageMining }) {
         </div>
       )}
     </div>
+  )
+}
+
+/**
+ * **What the lane did with the request** (ADR-0096 Decisions 3–5) — under the answer, in the
+ * lane's own words, only when it said something.
+ *
+ * The doctrine these lines serve: nobody is told a false thing about what ran, because what ran
+ * is printed beside what was asked. A temperature the lane mapped to greedy, a JSON shape it only
+ * checked after the fact, the turns it trimmed to fit the row, the three claims one long thread
+ * became — each is a fact about the answer that the answer's text does not carry.
+ */
+function LaneNotes({ misaka }: { misaka: MisakaExtension }) {
+  const { sampling, format, context, jobs } = misaka
+  const trimmed = context !== undefined && context.dropped_turns > 0
+  const chained = jobs !== undefined && jobs.length > 1
+  if (!sampling && !format && !trimmed && !chained) return null
+  return (
+    <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[0.7rem] text-ink-500 dark:text-ink-400">
+      {sampling && <SamplingNotice sampling={sampling} />}
+      {format && <FormatBadge format={format} />}
+      {trimmed && (
+        <span
+          title={`about ${context.prompt_tokens_estimate} prompt tokens of ${context.n_ctx}${
+            context.summarized_turns ? ` · ${context.summarized_turns} of the dropped turns went to a summary job` : ''
+          }`}
+        >
+          trimmed {context.dropped_turns} earlier turn{context.dropped_turns === 1 ? '' : 's'} to fit {context.n_ctx} tokens
+          {context.summarized_turns ? ` · ${context.summarized_turns} summarized` : ''}
+        </span>
+      )}
+      {chained && <JobsLine jobs={jobs} />}
+    </div>
+  )
+}
+
+/** The knobs a request can carry, with the value at which each asks for nothing (Decision 1). */
+const SAMPLING_KNOBS: { key: string; identity: unknown }[] = [
+  { key: 'temperature', identity: 0 },
+  { key: 'top_p', identity: 1 },
+  { key: 'top_k', identity: 0 },
+  { key: 'min_p', identity: 0 },
+  { key: 'repeat_penalty', identity: 1 },
+  { key: 'seed', identity: 0 },
+]
+
+function SamplingNotice({ sampling }: { sampling: MisakaSampling }) {
+  // Only what was actually asked for is worth printing; a stock SDK sends every knob at its
+  // identity value, and "asked temperature 0" beside "greedy" would be noise dressed as notice.
+  const asked = SAMPLING_KNOBS.filter(({ key, identity }) => {
+    const value = sampling.requested[key]
+    return value !== undefined && value !== null && value !== identity
+  }).map(({ key }) => `${key} ${String(sampling.requested[key])}`)
+  const notARule = sampling.not_a_rule_on_this_lane ?? []
+  // What ran, from the lane's own numbers where it sent them; every shipped network decodes
+  // greedily (ADR-0082 Decision 11), and the gateway's one-word `enforced` says the same.
+  const temperature = sampling.applied?.temperature ?? (sampling.enforced === 'greedy' ? 0 : undefined)
+  const ran = temperature === undefined ? 'mapped on the lane' : temperature === 0 ? 'greedy on the lane' : `temperature ${temperature} on the lane`
+  const title = [
+    sampling.reason,
+    notARule.length > 0 ? `${notARule.join(', ')}: not a rule on this lane` : null,
+    sampling.applied ? `applied: temperature ${sampling.applied.temperature}, seed ${sampling.applied.seed}` : null,
+  ]
+    .filter((line) => line)
+    .join('\n')
+  return (
+    <span title={title}>
+      {ran}
+      {asked.length > 0 && ` · asked ${asked.join(' · ')}`}
+    </span>
+  )
+}
+
+/** `JSON ✓ advisory`, `JSON ✓ masked`, `JSON ✗ committed` — the shape, whether it held, and who enforced it. */
+function FormatBadge({ format }: { format: MisakaFormat }) {
+  const [open, setOpen] = useState(false)
+  const kind = format.requested.type === 'json_object' ? 'JSON' : format.requested.type === 'json_schema' ? 'JSON schema' : format.requested.type
+  const tone = format.valid
+    ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
+    : 'bg-red-50 text-red-700 dark:bg-red-950/40 dark:text-red-300'
+  const title = [
+    format.enforcement === 'committed'
+      ? 'Committed: the seat replays this constraint and the court can try it.'
+      : format.enforcement === 'masked'
+        ? 'Masked: the decode was constrained to this shape on this machine, so the model could not leave it; nothing was committed to a chain.'
+        : 'Advisory: the shape rode the prompt as text and was checked after the fact; nothing constrained the decode.',
+    format.canonical_sha256 ? `canonical sha256 ${format.canonical_sha256}` : null,
+    format.errors.length > 0 ? `${format.errors.length} error${format.errors.length === 1 ? '' : 's'} — click to show` : null,
+  ]
+    .filter((line) => line)
+    .join('\n')
+  return (
+    <>
+      <button type="button" className={`inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 ${tone}`} onClick={() => setOpen((v) => !v)} title={title}>
+        {kind} {format.valid ? '✓' : '✗'} {format.enforcement}
+      </button>
+      {open && format.errors.length > 0 && (
+        <ul className="basis-full list-disc space-y-0.5 rounded-lg border border-ink-200 bg-white p-2 pl-6 text-xs text-ink-700 dark:border-ink-800 dark:bg-ink-900 dark:text-ink-300">
+          {format.errors.map((error, i) => (
+            <li key={i} className="whitespace-pre-wrap">
+              {error}
+            </li>
+          ))}
+        </ul>
+      )}
+    </>
+  )
+}
+
+/** "3 lane jobs: summary 594abbb7… · answer 1a2b3c4d… · continue ✗" — every claim, in order. */
+function JobsLine({ jobs }: { jobs: MisakaJob[] }) {
+  return (
+    <span className="inline-flex flex-wrap items-center gap-x-1.5">
+      <span>{jobs.length} lane jobs:</span>
+      {jobs.map((job, i) => (
+        <span
+          key={`${job.fp_job_id ?? 'none'}-${i}`}
+          className="mono inline-flex items-center gap-1"
+          title={`${job.role} · ${job.fp_job_id ? `job ${job.fp_job_id}` : 'no job ran'} · ${job.prompt_tokens} prompt + ${job.decode_tokens} decode tokens${job.error ? `\n${job.error}` : ''}`}
+        >
+          {i > 0 && <span aria-hidden>·</span>}
+          {job.role} {job.fp_claim_id ? `${job.fp_claim_id.slice(0, 8)}…` : 'no claim'}
+          {job.error && (
+            <span className="font-bold text-red-600 dark:text-red-400" aria-label="failed">
+              ✗
+            </span>
+          )}
+        </span>
+      ))}
+    </span>
   )
 }
 
@@ -299,6 +429,20 @@ function Message({
               <Waiting />
             ) : null}
 
+            {/* A tool call is a turn of text the model produced (ADR-0096 Decision 2); the
+                round-trip is the app's. Shown as the JSON it is, and labelled so nobody waits
+                for this window to run it. */}
+            {message.toolCalls && message.toolCalls.length > 0 && (
+              <div className="mt-2">
+                <p className="mb-1 text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">
+                  Tool call{message.toolCalls.length === 1 ? '' : 's'} (the app is expected to run {message.toolCalls.length === 1 ? 'it' : 'them'})
+                </p>
+                <pre className="mono overflow-x-auto rounded-lg bg-ink-100 p-2 text-[0.7rem] leading-relaxed dark:bg-ink-800">
+                  {JSON.stringify(message.toolCalls, null, 2)}
+                </pre>
+              </div>
+            )}
+
             {message.error && (
               <p className="mt-2 flex items-start gap-2 rounded-lg bg-red-50 p-2 text-xs text-red-700 dark:bg-red-950/40 dark:text-red-300">
                 <Icon name="warning" className="mt-0.5 size-3.5 shrink-0" />
@@ -308,6 +452,7 @@ function Message({
           </div>
         )}
         {!editing && isUser && message.mining && <MiningBadge mining={message.mining} />}
+        {!editing && !isUser && message.misaka && <LaneNotes misaka={message.misaka} />}
 
         {!editing && (
           <div className={`mt-1.5 flex items-center gap-1 text-xs text-ink-500 opacity-0 transition-opacity group-hover:opacity-100 dark:text-ink-400 ${isUser ? 'justify-end' : ''}`}>

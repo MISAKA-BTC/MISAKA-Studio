@@ -236,10 +236,121 @@ export type Settings = {
     pool_slot_token: string | null
     palw_gateway_url: string | null
     mining_mode: MiningMode
+    /**
+     * ADR-0096 Decision 4 — what the app does with a sampling request the lane cannot commit.
+     * `greedy_with_notice` sends the request through and prints what ran beside what was asked;
+     * `refuse` answers as the gateway does: by name, before the inference.
+     */
+    sampling_policy: 'greedy_with_notice' | 'refuse'
+    /** ADR-0096 Decision 5 — a trim that would drop more turns than this becomes a summary job. */
+    summarize_after_turns: number
+    /** ADR-0096 Decision 5 — how many continuation legs may follow a `length` finish (0 to 4). */
+    continue_max_legs: number
   }
   huggingface: { endpoint: string; token: string | null; max_concurrent_downloads: number }
   ui: { theme: 'system' | 'light' | 'dark'; show_provenance: boolean; show_performance: boolean }
   provenance: { record_inferences: boolean; keep_transcripts: boolean; max_records: number }
+  /**
+   * ADR-0096 Decision 10 — where the components manifest is (a local path or an `https://` URL;
+   * null means the Studio only knows what is on disk) and whether `GET /api/v1/components` fetches
+   * it unasked. Optional because a settings file written before the manifest existed has no
+   * `components` key, and the runtime fills the default in; a window talking to an older runtime
+   * must not crash on its absence.
+   */
+  components?: { manifest: string | null; auto_check: boolean }
+}
+
+// --- ADR-0096 Decision 11: what the running objects were built from ---------
+
+/** JSON as the runtime hands it over untyped: `configured` and `effective` are `serde_json::Value`. */
+export type Json = string | number | boolean | null | Json[] | { [key: string]: Json }
+
+/**
+ * One subsystem of `GET /api/v1/settings/effective`. `configured` is what the settings the
+ * process holds would build; `effective` is read from the RUNNING object and is null when nothing
+ * runs (`source.effective` then says why); `source` names, per effective field, the file, flag,
+ * environment variable or discovery step that produced it; `since` is when the running object was
+ * built (unix seconds); `differs` is the runtime's own verdict — configured and effective disagree
+ * in a field the running object's fingerprint covers. The runtime says THAT they differ, not which
+ * fields: naming them is this window's job (`lib/effective.ts`).
+ */
+export type EffectiveSubsystem = {
+  configured: Json
+  effective: Json | null
+  source: Record<string, string>
+  since: number | null
+  differs: boolean
+}
+
+export type EffectiveSettings = {
+  backend: EffectiveSubsystem
+  node: EffectiveSubsystem
+  records: EffectiveSubsystem
+  catalog: EffectiveSubsystem
+  pool: EffectiveSubsystem
+  gateway: EffectiveSubsystem
+}
+
+export type EffectiveSubsystemName = keyof EffectiveSettings
+
+// --- ADR-0096 Decision 10: the components table -----------------------------
+
+export type ComponentKind = 'node' | 'cli' | 'worker' | 'gateway' | 'rail' | 'engine' | 'artifact' | 'tokenizer-table' | 'runtime' | 'shell'
+
+/** Which step of the one search order found a file — the runtime's own spellings, verbatim. */
+export type ComponentCandidate = 'configured' | 'beside the executable' | 'engines/' | 'models_dir' | 'PATH' | 'not found'
+
+/**
+ * Where a component stands against the manifest. `installed-unverified` is found with the right
+ * size and no digest computed (that is `?verify=1`); `mismatch` is found with the wrong size or
+ * digest — not this component, whatever its name; `not-in-manifest` is found with no row to hold
+ * it to; `retired` is an id the node tree stopped building.
+ */
+export type ComponentState = 'installed' | 'installed-unverified' | 'mismatch' | 'missing' | 'retired' | 'not-in-manifest'
+
+export type ComponentReport = {
+  id: string
+  kind: ComponentKind
+  installed: {
+    path: string
+    candidate: ComponentCandidate
+    found: boolean
+    size?: number
+    /** Only on `?verify=1` — a class artifact is 34 GiB. */
+    sha256?: string
+    /** The first line of `--version`, on `?verify=1`, when the binary answered. */
+    version?: string
+  }
+  manifest: { version: string; sha256: string; size: number; url: string; platform: string; member?: string } | null
+  state: ComponentState
+  /** Why the state is what it is, when a word is not enough (a retirement, a platform, a size). */
+  note?: string
+}
+
+/** The cross-repository check over the loaded manifest (ADR-0096 invariant 10), by name. */
+export type ComponentFinding =
+  | { finding: 'missing_spawnable'; id: string; kind: ComponentKind }
+  | { finding: 'retired_still_spawned'; id: string; note: string }
+  | { finding: 'retired_in_manifest'; id: string; note: string }
+
+export type ManifestStatus = {
+  /** `components.manifest`, as configured. */
+  source: string | null
+  release: string | null
+  network: string | null
+  loaded: boolean
+  /** Why it is not loaded: unset, switched off, unreachable, or refused by the validator. */
+  error?: string
+  findings: ComponentFinding[]
+}
+
+/** `GET /api/v1/components` — `ComponentsView` in the runtime; named for the table here so the
+ *  page component can keep the runtime's name. */
+export type ComponentsListing = {
+  components: ComponentReport[]
+  manifest: ManifestStatus
+  /** The triple this runtime was built for, so a row's `platform` can be read against it. */
+  host_platform: string
 }
 
 export type InferenceRecord = {
@@ -280,6 +391,72 @@ export type TurnStats = {
   finishReason: string
 }
 
+// --- ADR-0096: what the lane reports beside an answer ----------------------
+
+/** Decision 4: the sampling that ran, printed beside the sampling that was asked for. */
+export type MisakaSampling = {
+  requested: Record<string, unknown>
+  /** The contract says always; optional here because the runtime merges the app's own notice
+   *  (`requested`, `reason`) with the gateway's report key by key, and an object that arrived
+   *  with only the app's half must render a notice, not blank the window. */
+  applied?: { temperature: number; seed: string }
+  reason: string
+  /** The gateway's one-word account of what ran (`"greedy"`), where it sends one. */
+  enforced?: string
+  /** Knobs with no consensus rule on this lane (`top_p`, `top_k`, …): named, never dropped. */
+  not_a_rule_on_this_lane?: string[]
+}
+
+/** Decision 3: the shape that was asked for, and whether the chain enforced it or only checked it. */
+export type MisakaFormat = {
+  requested: { type: string; constraint_id: string | null }
+  /** `committed` — the seat replays the constraint and the court can try it; `masked` — the
+   *  decode was constrained on this machine and nothing reached a chain (the local engine);
+   *  `advisory` — the schema rode the prompt as text and the answer was validated after the fact. */
+  enforcement: 'advisory' | 'committed' | 'masked'
+  valid: boolean
+  errors: string[]
+  canonical_sha256: string | null
+}
+
+/** Decision 5: the row is 512 and the answer is what is left of it; this is what was trimmed. */
+export type MisakaContext = {
+  n_ctx: number
+  prompt_tokens_estimate: number
+  dropped_turns: number
+  /** How many of the dropped turns a summary job covered, when one ran. */
+  summarized_turns?: number
+}
+
+export type MisakaJobRole = 'summary' | 'answer' | 'continue' | 'tool_leg'
+
+/** Decision 5: one inference is one claim, so a long thread is a chain of jobs — every one listed. */
+export type MisakaJob = {
+  /** Null for a leg that did not run — such an entry carries `error` instead. */
+  fp_job_id: string | null
+  fp_claim_id: string | null
+  role: MisakaJobRole
+  prompt_tokens: number
+  decode_tokens: number
+  error?: string
+}
+
+/**
+ * The `misaka` object on the last chunk of a chat completion. Every field is optional on purpose:
+ * a GGUF engine sends none of it, and a gateway from before ADR-0096 sends only the job and claim
+ * ids. What is absent is simply not shown.
+ */
+export type MisakaExtension = {
+  fp_job_id?: string
+  fp_claim_id?: string
+  sampling?: MisakaSampling
+  format?: MisakaFormat
+  context?: MisakaContext
+  jobs?: MisakaJob[]
+  /** Fields OpenAI defines as having no effect on the answer — accepted and listed (Decision 1). */
+  ignored_fields?: string[]
+}
+
 export type ChatMessage = {
   id: string
   role: 'system' | 'user' | 'assistant'
@@ -290,6 +467,14 @@ export type ChatMessage = {
   stats?: TurnStats
   /** Set on a user message that was queued for mining behind the chat. */
   mining?: MessageMining
+  /**
+   * What the lane said about this answer (ADR-0096 Decisions 3–5). Kept on the message and
+   * persisted like `stats`: a notice that vanished with the window would be a notice nobody read.
+   */
+  misaka?: MisakaExtension
+  /** The tool calls the answer carried (ADR-0096 Decision 2), in OpenAI's shape. The app that
+   *  asked is expected to run them; this window only shows them. */
+  toolCalls?: unknown[]
 }
 
 export type Conversation = {
@@ -299,6 +484,33 @@ export type Conversation = {
   updatedAt: number
   modelId: string | null
   messages: ChatMessage[]
+}
+
+// --- ADR-0096 Decision 12: conversations are the runtime's -----------------
+
+/** One row of `GET /api/v1/conversations`: enough to draw the list, without the messages. */
+export type ConversationSummary = {
+  id: string
+  title: string
+  createdAt: number
+  updatedAt: number
+  modelId: string | null
+  messageCount: number
+}
+
+/** The Studio's own export — and the one shape the import takes back unchanged. */
+export type ConversationExport = {
+  schema: 'misaka-studio/conversations/v1'
+  /** Milliseconds since the epoch, like every timestamp in a conversation. */
+  exportedAt: number
+  conversations: Conversation[]
+}
+
+/** What an import did, by name: every skipped row says why (a non-text part, an unknown role). */
+export type ConversationImportReport = {
+  imported: number
+  skipped: { reason: string; count: number }[]
+  ids: string[]
 }
 
 // --- the Network tab -------------------------------------------------------
@@ -551,6 +763,15 @@ export type PromptMiningStatus = {
   health: GatewayHealth | null
   class: ClassMatch | null
 }
+
+/**
+ * ADR-0096 Decision 13: the door for a model that does not exist yet. `url` opens the issue form
+ * prefilled; `fields` is the form's every field by its own id — `title` and `machine` filled from
+ * this machine (RAM, accelerator, the classes it holds), the rest empty for the person to write —
+ * shown before the click, because it goes to a public tracker. `machine` is the same facts,
+ * structured.
+ */
+export type ModelRequestPrefill = { url: string; fields: Record<string, string>; machine?: Record<string, unknown> }
 
 /** How far a commitment got. Today there is one value, and its name is the whole truth. */
 export type ChainReach = 'committed_not_submitted'

@@ -12,7 +12,10 @@
 //! runtime class tag (`misaka-studio-mock/v1`) is distinct — so a record produced here can never
 //! be confused for one produced by a real engine.
 
-use super::{Availability, GenerationRequest, InferenceBackend, LoadRequest, LoadedModel, StreamEvent, Usage, approximate_tokens};
+use super::{
+    Availability, GenerationRequest, InferenceBackend, LoadRequest, LoadedModel, RuntimeFingerprint, StreamEvent, Usage,
+    approximate_tokens,
+};
 use crate::Result;
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
@@ -32,6 +35,9 @@ pub struct MockBackend {
 }
 
 impl MockBackend {
+    /// The name this backend answers to, everywhere.
+    pub const NAME: &'static str = "mock";
+
     pub fn new(token_delay: Duration) -> Self {
         MockBackend { loaded: Mutex::new(None), token_delay }
     }
@@ -60,7 +66,13 @@ impl Default for MockBackend {
 
 impl InferenceBackend for MockBackend {
     fn name(&self) -> &'static str {
-        "mock"
+        Self::NAME
+    }
+
+    fn fingerprint(&self) -> RuntimeFingerprint {
+        let mut fingerprint = RuntimeFingerprint::new(Self::NAME);
+        fingerprint.extra.insert("token_delay_ms".into(), self.token_delay.as_millis().to_string());
+        fingerprint
     }
 
     fn descriptor(&self) -> BoxFuture<'_, RuntimeDescriptor> {
@@ -124,6 +136,7 @@ impl InferenceBackend for MockBackend {
                             .send(Ok(StreamEvent::Done {
                                 usage: Usage { prompt_tokens, completion_tokens: limit, total_tokens: prompt_tokens + limit },
                                 finish_reason: "length".into(),
+                                misaka: None,
                             }))
                             .await;
                         return;
@@ -139,6 +152,7 @@ impl InferenceBackend for MockBackend {
                     .send(Ok(StreamEvent::Done {
                         usage: Usage { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens },
                         finish_reason: "stop".into(),
+                        misaka: None,
                     }))
                     .await;
             });
@@ -170,13 +184,7 @@ mod tests {
     use misaka_studio_core::provenance::SamplingCommitment;
 
     fn request(text: &str) -> GenerationRequest {
-        GenerationRequest {
-            model: "mock".into(),
-            messages: vec![ChatMessage::new("user", text)],
-            prompt: None,
-            params: SamplingCommitment::default(),
-            stop: Vec::new(),
-        }
+        GenerationRequest::plain("mock", vec![ChatMessage::new("user", text)], None, SamplingCommitment::default())
     }
 
     async fn collect(backend: &MockBackend, req: GenerationRequest) -> (String, Usage) {
@@ -187,6 +195,7 @@ mod tests {
             match event.expect("no error") {
                 StreamEvent::Delta(d) => text.push_str(&d),
                 StreamEvent::Done { usage: u, .. } => usage = u,
+                StreamEvent::ToolCallDelta(_) => panic!("the mock never calls a tool"),
             }
         }
         (text, usage)
@@ -224,6 +233,7 @@ mod tests {
             match event.expect("no error") {
                 StreamEvent::Delta(_) => deltas += 1,
                 StreamEvent::Done { finish_reason, .. } => reason = finish_reason,
+                StreamEvent::ToolCallDelta(_) => panic!("the mock never calls a tool"),
             }
         }
         assert_eq!(deltas, 3);
