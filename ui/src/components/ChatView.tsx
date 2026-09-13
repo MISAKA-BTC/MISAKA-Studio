@@ -270,7 +270,12 @@ function Message({
   onContinue?: () => void
 }) {
   const [draft, setDraft] = useState(message.content)
-  useEffect(() => setDraft(message.content), [message.content, editing])
+  // A streamed assistant reply changes on every token. This draft only exists for the edit UI,
+  // so synchronising it while the message is merely being displayed creates a needless nested
+  // state update for every token (and could hit React's maximum-update-depth guard).
+  useEffect(() => {
+    if (editing) setDraft(message.content)
+  }, [message.content, editing])
 
   const isUser = message.role === 'user'
 
@@ -308,7 +313,7 @@ function Message({
             {isUser ? (
               <p className="whitespace-pre-wrap text-[0.94rem] leading-relaxed">{message.content}</p>
             ) : message.content ? (
-              <Markdown>{message.content}</Markdown>
+              <Markdown streaming={message.streaming}>{message.content}</Markdown>
             ) : message.streaming ? (
               <Waiting />
             ) : null}

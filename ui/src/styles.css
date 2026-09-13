@@ -101,6 +101,13 @@
   }
   .prose-chat .katex-display {
     @apply my-4 overflow-x-auto overflow-y-hidden py-1;
+    max-width: 100%;
+  }
+  /* A malformed model answer must never make the message bubble itself wider than the window.
+     Valid display equations scroll above; ordinary text continues to wrap naturally here. */
+  .prose-chat p,
+  .prose-chat li {
+    overflow-wrap: anywhere;
   }
   .prose-chat table {
     @apply w-full text-sm border-collapse;

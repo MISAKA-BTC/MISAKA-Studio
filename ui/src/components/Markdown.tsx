@@ -37,25 +37,47 @@ function textOf(node: ReactNode): string {
  * the latter spell the former before parsing. Fenced code is left verbatim: a code sample that
  * happens to contain a LaTex string must remain copyable source, not become a formula.
  */
+function normalizeInlineMath(markdown: string): string {
+  const formulas: string[] = []
+  // A lone `$` is surprisingly common in partially streamed text (and in prose such as
+  // "$ (1)").  remark-math then treats everything up to the next dollar as one enormous
+  // formula.  Only keep a pair when its contents look like math; quote every other dollar so it
+  // stays readable source instead of swallowing the next paragraph.
+  const protectedMath = markdown.replace(/(?<!\\)\$(?!\$)([^\n$]*?)(?<!\\)\$(?!\$)/g, (whole, formula: string) => {
+    if (!/^[A-Za-z0-9\\^_{}()[\]<>+=*/|,:;.!?'"\- ]+$/.test(formula) || !/[A-Za-z0-9\\^_+=*/]/.test(formula)) {
+      return whole.replace(/\$/g, '\\$')
+    }
+    const token = formulas.push(`$${formula}$`) - 1
+    return `\uE000${token}\uE001`
+  })
+  return protectedMath
+    .replace(/(?<!\\)\$(?!\$)/g, '\\$')
+    .replace(/\uE000(\d+)\uE001/g, (_, token: string) => formulas[Number(token)] ?? '')
+}
+
 function normalizeMathDelimiters(markdown: string): string {
   return markdown
     .split(/(```[\s\S]*?```)/g)
     .map((part, index) => {
       if (index % 2 === 1) return part
-      return part
+      const normalized = part
         .replace(/\\\[([\s\S]*?)\\\]/g, (_, formula: string) => `$$\n${formula.trim()}\n$$`)
         .replace(/\\\(([^\n]*?)\\\)/g, (_, formula: string) => `$${formula.trim()}$`)
+      return normalizeInlineMath(normalized)
     })
     .join('')
 }
 
-export const Markdown = memo(function Markdown({ children }: { children: string }) {
-  const markdown = normalizeMathDelimiters(children)
+export const Markdown = memo(function Markdown({ children, streaming = false }: { children: string; streaming?: boolean }) {
+  // An incomplete reply has unmatched delimiters by definition.  Rendering it as ordinary
+  // Markdown until the stream commits avoids repeatedly rebuilding KaTeX's tree for every token
+  // and makes the in-progress source legible.
+  const markdown = streaming ? children : normalizeMathDelimiters(children)
   return (
     <div className="prose-chat">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }], rehypeKatex]}
+        remarkPlugins={streaming ? [remarkGfm] : [remarkGfm, remarkMath]}
+        rehypePlugins={streaming ? [[rehypeHighlight, { detect: true, ignoreMissing: true }]] : [[rehypeHighlight, { detect: true, ignoreMissing: true }], rehypeKatex]}
         components={{
           pre({ children }) {
             const code = textOf(children)
