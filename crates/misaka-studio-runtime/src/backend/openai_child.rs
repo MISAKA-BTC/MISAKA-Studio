@@ -57,6 +57,12 @@ pub struct ChildEngineConfig {
     pub args: ArgsBuilder,
     /// Path of the health endpoint, relative to the base URL.
     pub health_path: &'static str,
+    /// Read the engine's own context window out of the health document, when it publishes one.
+    ///
+    /// An engine whose window is a property of the model file — a `.palwart`'s rotary table is
+    /// inside the root a chain registered — knows a number the app only guessed at. `None` keeps
+    /// the requested value, which is right for engines the app sizes itself.
+    pub context_from_health: Option<fn(&serde_json::Value) -> Option<u32>>,
     /// Seconds to wait for the engine to report healthy.
     pub startup_timeout: Duration,
     /// Extra environment for the child.
@@ -174,6 +180,8 @@ impl ChildEngine {
         let base = format!("http://127.0.0.1:{port}");
         let health = format!("{base}{}", self.config.health_path);
         let deadline = Instant::now() + self.config.startup_timeout;
+        // Assigned on the one non-diverging way out of the poll below: the engine answered.
+        let health_body: Option<serde_json::Value>;
 
         loop {
             // A child that exited is a failure with an explanation waiting in the log — report
@@ -188,6 +196,7 @@ impl ChildEngine {
             if let Ok(resp) = self.http.get(&health).send().await
                 && resp.status().is_success()
             {
+                health_body = resp.json::<serde_json::Value>().await.ok();
                 break;
             }
             if Instant::now() >= deadline {
@@ -205,9 +214,26 @@ impl ChildEngine {
             tokio::time::sleep(HEALTH_POLL).await;
         }
 
+        // **The engine's own window wins over the one we asked for.**
+        //
+        // For an engine whose context is the model file's, the requested number is a guess and the
+        // engine is the authority: `qwen25-1.5b-a16` covers 512 positions whatever was asked for.
+        // Believing the guess is not harmless — the app trims a conversation to a budget the
+        // engine does not have, and the answer then stops mid-sentence at the real one with
+        // nothing anywhere saying which number ended it.
+        let context_size = self
+            .config
+            .context_from_health
+            .zip(health_body.as_ref())
+            .and_then(|(read, body)| read(body))
+            .filter(|window| *window > 0)
+            .unwrap_or(request.context_size);
+        if context_size != request.context_size {
+            tracing::info!(asked = request.context_size, engine = context_size, "the engine reports its own context window");
+        }
         let model = LoadedModel {
             model_id: request.model_id.clone(),
-            context_size: request.context_size,
+            context_size,
             gpu_layers: request.gpu_layers,
             load_ms: started.elapsed().as_millis() as u64,
         };

@@ -62,6 +62,8 @@ impl MisakaBackend {
                 program,
                 args: Box::new(move |request, port| build_args(request, port, tokenizer.as_deref())),
                 health_path: "/health",
+                // The artifact's rotary table, which is the class's and not the app's.
+                context_from_health: Some(|health| health.get("max_position").and_then(serde_json::Value::as_u64).map(|n| n as u32)),
                 startup_timeout,
                 env: Vec::new(),
             }),

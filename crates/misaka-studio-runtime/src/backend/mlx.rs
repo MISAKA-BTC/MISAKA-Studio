@@ -36,6 +36,7 @@ impl MlxBackend {
                 // MLX's server has no health endpoint; /v1/models is the cheapest thing it
                 // answers once it is up, and it answers nothing before that.
                 health_path: "/v1/models",
+                context_from_health: None,
                 startup_timeout,
                 env: Vec::new(),
             }),

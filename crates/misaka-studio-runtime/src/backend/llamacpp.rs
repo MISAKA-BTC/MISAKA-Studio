@@ -48,6 +48,7 @@ impl LlamaCppBackend {
                 // llama-server answers /health with 503 while the model loads and 200 once it is
                 // ready, which is exactly the signal a supervisor needs.
                 health_path: "/health",
+                context_from_health: None,
                 startup_timeout,
                 env: Vec::new(),
             }),

@@ -299,6 +299,20 @@ function Message({
               <Waiting />
             ) : null}
 
+            {/* A reply that ran out of ceiling used to end mid-sentence and say nothing about it —
+                the reason was in a hover title. The lane decodes to its ceiling and the class's
+                context is fixed on chain, so this is the one number a person can actually act on. */}
+            {!isUser && !message.streaming && message.stats?.finishReason === 'length' && (
+              <p className="mt-2 flex items-start gap-2 rounded-lg bg-amber-50 p-2 text-xs text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
+                <Icon name="stop" className="mt-0.5 size-3.5 shrink-0" />
+                <span>
+                  Cut at the {message.stats.completionTokens}-token ceiling — the model had not finished. This class's
+                  context is shared between the conversation and the reply, so a shorter chat leaves more of it for the
+                  answer.
+                </span>
+              </p>
+            )}
+
             {message.error && (
               <p className="mt-2 flex items-start gap-2 rounded-lg bg-red-50 p-2 text-xs text-red-700 dark:bg-red-950/40 dark:text-red-300">
                 <Icon name="warning" className="mt-0.5 size-3.5 shrink-0" />

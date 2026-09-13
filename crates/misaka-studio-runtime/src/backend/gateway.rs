@@ -218,30 +218,18 @@ impl InferenceBackend for GatewayBackend {
             let ceiling = match n_ctx {
                 Some(n_ctx) => {
                     let used = fallback_prompt_tokens.saturating_add(TEMPLATE_MARGIN_TOKENS);
-                    let room = n_ctx.saturating_sub(used);
-                    if room == 0 {
-                        return Err(Error::BadRequest {
-                            message: format!(
-                                "this class holds {n_ctx} tokens and the conversation is already about {used}. \
-                                 Start a new chat, or shorten it — the context is the class's, registered on chain, \
-                                 and not something this app can raise."
-                            ),
-                        });
+                    match decode_ceiling(request.params.max_tokens, used, n_ctx) {
+                        Some(ceiling) => ceiling,
+                        None => {
+                            return Err(Error::BadRequest {
+                                message: format!(
+                                    "this class holds {n_ctx} tokens and the conversation is already about {used}. \
+                                     Start a new chat, or shorten it — the context is the class's, registered on chain, \
+                                     and not something this app can raise."
+                                ),
+                            });
+                        }
                     }
-                    // **Room is not a target.** A decode ceiling is what the model is ALLOWED to
-                    // generate, and this one does not reliably stop early: given the whole
-                    // remaining context it produced 438 of 438 tokens and took 6.7 minutes for a
-                    // two-line question. So an ask that does not fit the class — the app's default
-                    // is 2048, meant for a 32K GGUF — is sized like an answer rather than like the
-                    // context. A smaller ask, or a larger one that fits, is honoured as given.
-                    //
-                    // This was 256 for a while, and for a different reason: a producer that
-                    // hardcoded one retained-trace chunk made every run past 256 tokens fail its
-                    // own binding check. That is fixed in the producer, and measured here at the
-                    // token that used to break — decode 257/257, committed — so the number is back
-                    // to being a default answer length and not a wall.
-                    const DEFAULT_ANSWER_TOKENS: u64 = 256;
-                    if request.params.max_tokens <= room { request.params.max_tokens } else { room.min(DEFAULT_ANSWER_TOKENS) }
                 }
                 None => request.params.max_tokens,
             };
@@ -342,6 +330,29 @@ impl InferenceBackend for GatewayBackend {
     }
 }
 
+/// **The decode ceiling for one request: what was asked for, or what the class has left.**
+///
+/// The lane decodes to its ceiling whatever the answer's length — an end-of-generation id is a
+/// DISPLAY stop and not an execution stop, because the worker's step leaves bind the executed
+/// count and cannot be hashed before it is fixed — so this number is the latency of a turn as
+/// much as its length.
+///
+/// It used to fall back to 256 whenever the ask did not fit, on the argument that room is not a
+/// target. Measured against the live slot, that argument cost more than it saved: `n_ctx` is 512,
+/// a one-line system prompt and a one-line question leave 446, and the app's own default ask is
+/// 2048 — so EVERY chat was decided by the fallback, every answer stopped at 256, mid-sentence,
+/// and nothing in the app said why. Leaving 43% of a class's context unused is not a smaller
+/// default; it is a shorter answer nobody chose.
+///
+/// So the ask is honoured up to the room, and the control for a turn that should be quicker is
+/// Max tokens — the person's, and obeyed here in both directions. `None` when the conversation has
+/// already filled the class: the caller says so and stops, because a ceiling of zero is not a
+/// request.
+fn decode_ceiling(requested: u64, used: u64, n_ctx: u64) -> Option<u64> {
+    let room = n_ctx.saturating_sub(used);
+    (room > 0).then(|| requested.min(room))
+}
+
 /// An UPPER bound on a conversation's tokens — a different job from `approximate_tokens`.
 ///
 /// That one is "about four characters per token" and its own doc says it is never for sizing a
@@ -417,6 +428,22 @@ mod tests {
         assert!(prompt_upper_bound(&jp) >= 6 + 8, "one token per kana or kanji, plus the template's markers");
         let en = [ChatMessage::new("user", "weather in Tokyo")];
         assert!(prompt_upper_bound(&en) >= 4, "ascii is cheaper, but never free");
+    }
+
+    /// The measured chat that started this: slot-06 reports `n_ctx` 512, the settings carry a
+    /// one-line Japanese system prompt, and the question was one line — about 66 tokens with the
+    /// margin. The app asks for its default 2048, which does not fit, and the answer people saw
+    /// stopped mid-sentence at 256 while 190 tokens of the class sat unused.
+    #[test]
+    fn an_ask_too_big_for_the_class_gets_the_room_and_not_a_fraction_of_it() {
+        assert_eq!(decode_ceiling(2048, 66, 512), Some(446), "the class's room, not a default answer length");
+        // An ask that fits is the ask: Max tokens is a ceiling the person set, in both directions.
+        assert_eq!(decode_ceiling(384, 66, 512), Some(384));
+        assert_eq!(decode_ceiling(64, 66, 512), Some(64));
+        // A conversation that has eaten the context has no ceiling to offer, and the caller has to
+        // say so rather than send a request for zero tokens.
+        assert_eq!(decode_ceiling(2048, 512, 512), None);
+        assert_eq!(decode_ceiling(2048, 900, 512), None);
     }
 
     #[test]

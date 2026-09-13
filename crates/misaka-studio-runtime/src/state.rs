@@ -481,6 +481,38 @@ impl AppState {
         let state = self.loaded().await.ok_or(Error::NoModelLoaded)?;
         let backend = self.backend().await;
 
+        // **The answer's share of the window, reserved before the question is sent.**
+        //
+        // The retry further down only fires when the engine REFUSES — the prompt alone over the
+        // window. Between "fits" and "refused" sits the case people actually meet: a prompt that
+        // fits with almost nothing behind it. Measured on `qwen25-1.5b-a16`, whose artifact holds
+        // 512 positions: prompt 432, answer 80 tokens, stopped mid-sentence, and every layer
+        // treated that as success. The window is shared between the conversation and the reply,
+        // and on a 512-position class the two cannot both be long — so the reply's half is taken
+        // first and the oldest turns go, which is the trade a person would make and the one they
+        // cannot make by hand.
+        //
+        // Half, not all of `max_tokens`: the app's default ask is 2048, meant for a 32K GGUF, and
+        // reserving it against a small window would leave nothing to remember with. An engine with
+        // room to spare trims nothing — `fit_messages_to_budget` returns a conversation that
+        // already fits untouched.
+        let messages = if prompt.is_some() || state.loaded.context_size == 0 {
+            messages
+        } else {
+            let window = state.loaded.context_size as u64;
+            let reserve = crate::backend::answer_room(params.max_tokens, window);
+            let (fitted, dropped) = crate::backend::fit_messages_to_budget(&messages, window.saturating_sub(reserve));
+            if dropped > 0 {
+                tracing::info!(
+                    window,
+                    reserve,
+                    dropped,
+                    "dropped older turns so the answer has room — this class's context is its artifact's"
+                );
+            }
+            fitted
+        };
+
         // The bytes the record commits to. Canonical and length-prefixed — see
         // `canonical_prompt_bytes`, which exists because the obvious `role: content` flattening
         // lets two different conversations produce the same commitment.

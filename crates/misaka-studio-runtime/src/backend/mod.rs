@@ -194,6 +194,22 @@ pub fn render_fallback_prompt(messages: &[ChatMessage]) -> String {
 ///
 /// Deliberately crude — ~4 characters per token — and never used to bill anything or to size a
 /// context window. Its one job is keeping a tokens/sec readout from being blank.
+/// **The share of a context window kept for the answer, before the question is sent.**
+///
+/// A window is shared between the conversation and the reply, and only one of the two is visible
+/// while it fills. On `qwen25-1.5b-a16` — 512 positions, fixed by the artifact's rotary table —
+/// the measured turn was prompt 432, answer 80, cut mid-sentence, with no refusal anywhere: the
+/// engine accepted a request that fit and then ran out of window while answering it.
+///
+/// Half the window, capped by what was actually asked for. Not all of `max_tokens`: the app's
+/// default ask is 2048, sized for a 32K GGUF, and reserving that against a small class would leave
+/// nothing to remember the conversation with. The floor is there so a very small window still
+/// yields a sentence rather than a word.
+pub fn answer_room(max_tokens: u64, window: u64) -> u64 {
+    const AT_LEAST: u64 = 96;
+    max_tokens.min(window / 2).max(AT_LEAST)
+}
+
 /// **A conversation trimmed to what the model can actually hold.**
 ///
 /// A class artifact's context is not a setting: `qwen25-1.5b-a16`'s rotary table covers 512
@@ -342,6 +358,36 @@ mod context_fit_tests {
         let (kept, dropped) = fit_messages_to_budget(&messages, 416);
         assert_eq!(dropped, 0);
         assert_eq!(kept.len(), 2);
+    }
+
+    /// The turn that started this: `qwen25-1.5b-a16` holds 512 positions, the app asks for its
+    /// 2048-token default, and the reserve has to come out of the window rather than the ask.
+    #[test]
+    fn the_answers_half_is_reserved_out_of_the_window_not_out_of_the_ask() {
+        assert_eq!(answer_room(2048, 512), 256, "half the class, not the app's 32K-sized default");
+        assert_eq!(answer_room(128, 512), 128, "a smaller ask is the ask — the reserve never invents length");
+        assert_eq!(answer_room(2048, 32_768), 2048, "a window with room to spare reserves only what was asked for");
+        assert_eq!(answer_room(2048, 64), 96, "and a tiny window still leaves enough for a sentence");
+    }
+
+    /// The measured chat: prompt 432 of 512, answer 80 tokens, cut mid-sentence, no refusal. With
+    /// the answer's half reserved first the same conversation loses a turn instead of a sentence.
+    #[test]
+    fn a_conversation_that_would_leave_no_room_to_answer_loses_a_turn_instead() {
+        let window = 512u64;
+        let reserve = answer_room(2048, window);
+        let budget = window - reserve;
+        let messages = vec![
+            msg("system", "日本語で答えてください。"),
+            msg("user", "マクスウェル方程式を導出して"),
+            msg("assistant", &"あ".repeat(217)),
+            msg("user", "F=maを証明して"),
+        ];
+        assert!(prompt_tokens_upper_bound(&messages) < window, "the engine would have ACCEPTED this — that is the whole trap");
+        let (kept, dropped) = fit_messages_to_budget(&messages, budget);
+        assert!(dropped > 0, "and it must still be trimmed, because accepting it leaves nothing to answer with");
+        assert!(prompt_tokens_upper_bound(&kept) + reserve <= window, "what is kept leaves the answer its half");
+        assert_eq!(kept.last().map(|m| m.content.as_str()), Some("F=maを証明して"));
     }
 
     /// One message too long for the class cannot be fixed by dropping history — there is none.
