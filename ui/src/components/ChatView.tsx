@@ -113,6 +113,7 @@ function Waiting() {
 export function ChatView() {
   const conversations = useStudio((s) => s.conversations)
   const activeId = useStudio((s) => s.activeConversationId)
+  const streaming = useStudio((s) => s.streaming)
   const send = useStudio((s) => s.send)
   const stop = useStudio((s) => s.stop)
   const regenerate = useStudio((s) => s.regenerate)
@@ -127,7 +128,15 @@ export function ChatView() {
 
   const conversation = conversations.find((c) => c.id === activeId) ?? null
   const messages = conversation?.messages ?? []
-  const generating = messages.some((m) => m.streaming)
+  const activeStream = streaming?.conversationId === conversation?.id ? streaming : null
+  // The pending reply is a render-only overlay. It joins the transcript exactly once, when the
+  // request ends, and therefore can never leak an incomplete answer into the next model request.
+  const visibleMessages = activeStream
+    ? messages.some((m) => m.id === activeStream.assistantId)
+      ? messages.map((m) => (m.id === activeStream.assistantId ? { ...m, content: activeStream.content, streaming: true } : m))
+      : [...messages, { id: activeStream.assistantId, role: 'assistant' as const, content: activeStream.content, streaming: true }]
+    : messages
+  const generating = activeStream !== null
 
   const [draft, setDraft] = useState('')
   const [editingId, setEditingId] = useState<string | null>(null)
@@ -139,7 +148,7 @@ export function ChatView() {
     const element = scrollRef.current
     if (!element || !followRef.current) return
     element.scrollTop = element.scrollHeight
-  }, [messages])
+  }, [messages, activeStream?.content])
 
   const onScroll = () => {
     const element = scrollRef.current
@@ -159,7 +168,7 @@ export function ChatView() {
       <ModelBar />
 
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
-        {messages.length === 0 ? (
+        {visibleMessages.length === 0 ? (
           <EmptyState icon="chat" title={runtime?.model_id ? `Chatting with ${runtime.model_id}` : 'No model loaded'}>
             {models.length === 0 ? (
               <>
@@ -186,7 +195,7 @@ export function ChatView() {
           </EmptyState>
         ) : (
           <div className="mx-auto w-full max-w-3xl px-4 py-6">
-            {messages.map((message, index) => (
+            {visibleMessages.map((message, index) => (
               <Message
                 key={message.id}
                 message={message}
@@ -199,7 +208,7 @@ export function ChatView() {
                   await editMessage(message.id, content)
                 }}
                 onRegenerate={
-                  message.role === 'assistant' && index === messages.length - 1 && !generating
+                  message.role === 'assistant' && index === visibleMessages.length - 1 && !generating
                     ? async () => {
                         followRef.current = true
                         await regenerate()
@@ -207,7 +216,7 @@ export function ChatView() {
                     : undefined
                 }
                 onContinue={
-                  message.role === 'assistant' && index === messages.length - 1 && !generating && message.stats?.finishReason === 'length'
+                  message.role === 'assistant' && index === visibleMessages.length - 1 && !generating && message.stats?.finishReason === 'length'
                     ? async () => {
                         followRef.current = true
                         await continueGeneration()

@@ -23,12 +23,20 @@ import type {
   RuntimeStatus,
   Settings,
   SystemInfo,
+  TurnStats,
 } from '../lib/types'
 
 export type View = 'chat' | 'models' | 'network' | 'monitor' | 'settings'
 
 /** A message shown to the user about something that just happened. */
 export type Toast = { id: string; kind: 'info' | 'error' | 'success'; text: string }
+
+/** A reply buffer is rendered live but never becomes history until the request finishes. */
+export type StreamingReply = {
+  conversationId: string
+  assistantId: string
+  content: string
+}
 
 type StudioState = {
   view: View
@@ -44,6 +52,7 @@ type StudioState = {
 
   conversations: Conversation[]
   activeConversationId: string | null
+  streaming: StreamingReply | null
 
   setView: (view: View) => void
   toast: (kind: Toast['kind'], text: string) => void
@@ -124,6 +133,7 @@ export const useStudio = create<StudioState>()(
       toasts: [],
       conversations: [],
       activeConversationId: null,
+      streaming: null,
       miningQueue: null,
 
       setView: (view) => set({ view }),
@@ -435,30 +445,45 @@ async function runGeneration(
 
   const assistantId = options.targetAssistantId ?? uid()
   const existing = conversation.messages.find((m) => m.id === assistantId)
-  const placeholder: ChatMessage = { id: assistantId, role: 'assistant', content: existing?.content ?? '', streaming: true }
-  set((s) => ({
-    conversations: s.conversations.map((c) => {
-      if (c.id !== conversationId) return c
-      const present = c.messages.some((m) => m.id === assistantId)
-      return { ...c, messages: present ? c.messages.map((m) => (m.id === assistantId ? placeholder : m)) : [...c.messages, placeholder], modelId, updatedAt: Date.now() }
-    }),
-  }))
+  const baseContent = existing?.content ?? ''
+  set({ streaming: { conversationId, assistantId, content: baseContent } })
 
-  const update = (patch: Partial<ChatMessage>) =>
-    set((s) => ({
-      conversations: s.conversations.map((c) =>
-        c.id === conversationId
-          ? { ...c, messages: c.messages.map((m) => (m.id === assistantId ? { ...m, ...patch } : m)), updatedAt: Date.now() }
-          : c,
-      ),
-    }))
+  const updateStream = (content: string) =>
+    set((s) =>
+      s.streaming?.conversationId === conversationId && s.streaming.assistantId === assistantId
+        ? { streaming: { ...s.streaming, content } }
+        : {},
+    )
+
+  const commit = (patch: { error?: string; stats?: TurnStats } = {}) =>
+    set((s) => {
+      const stream = s.streaming
+      // A stale SSE completion must not overwrite a reply started afterwards.
+      if (!stream || stream.conversationId !== conversationId || stream.assistantId !== assistantId) return {}
+      const answer: ChatMessage = { id: assistantId, role: 'assistant', content: stream.content, ...patch }
+      return {
+        streaming: null,
+        conversations: s.conversations.map((c) => {
+          if (c.id !== conversationId) return c
+          const present = c.messages.some((m) => m.id === assistantId)
+          return {
+            ...c,
+            messages: present ? c.messages.map((m) => (m.id === assistantId ? answer : m)) : [...c.messages, answer],
+            modelId,
+            updatedAt: Date.now(),
+          }
+        }),
+      }
+    })
 
   const controller = new AbortController()
   inFlight = controller
   const startedAt = performance.now()
   let firstTokenAt: number | null = null
-  let text = existing?.content ?? ''
+  let text = baseContent
   let stoppedForRepetition = false
+  let streamError: string | undefined
+  let stats: TurnStats | undefined
 
   try {
     const generator = streamChat(
@@ -480,50 +505,45 @@ async function runGeneration(
       if (event.type === 'delta') {
         if (firstTokenAt === null) firstTokenAt = performance.now()
         text += event.text
-        update({ content: text })
+        updateStream(text)
         if (hasRepeatedTail(text)) {
           stoppedForRepetition = true
           controller.abort()
           break
         }
       } else if (event.type === 'error') {
-        update({ error: event.message })
+        streamError = event.message
       } else {
         const elapsed = performance.now() - startedAt
-        update({
-          streaming: false,
-          stats: {
-            // The runtime's token counts, the window's clock. Neither knows both halves: the
-            // engine counts tokens, and only the client knows when the user's request started.
-            completionTokens: event.usage.completion_tokens,
-            promptTokens: event.usage.prompt_tokens,
-            tokensPerSecond: elapsed > 0 ? (event.usage.completion_tokens * 1000) / elapsed : 0,
-            timeToFirstTokenMs: firstTokenAt === null ? null : firstTokenAt - startedAt,
-            model: modelId,
-            finishReason: event.finishReason,
-          },
-        })
+        // The runtime's token counts, the window's clock. Neither knows both halves: the engine
+        // counts tokens, and only the client knows when the user's request started.
+        stats = {
+          completionTokens: event.usage.completion_tokens,
+          promptTokens: event.usage.prompt_tokens,
+          tokensPerSecond: elapsed > 0 ? (event.usage.completion_tokens * 1000) / elapsed : 0,
+          timeToFirstTokenMs: firstTokenAt === null ? null : firstTokenAt - startedAt,
+          model: modelId,
+          finishReason: event.finishReason,
+        }
       }
     }
     if (stoppedForRepetition) {
-      update({
-        streaming: false,
+      commit({
         error: '同じ文章の反復を検出したため、この表示を停止しました。再生成すると別の回答を試せます。',
       })
     } else {
-      update({ streaming: false })
+      commit({ error: streamError, stats })
     }
   } catch (error) {
     if (stoppedForRepetition) {
-      update({
-        streaming: false,
+      commit({
         error: '同じ文章の反復を検出したため、この表示を停止しました。再生成すると別の回答を試せます。',
       })
     } else if ((error as Error).name === 'AbortError') {
       // A stopped generation keeps what it produced: the user asked it to stop, not to undo.
-      update({ streaming: false, stats: undefined })
+      commit()
     } else {
-      update({ streaming: false, error: (error as Error).message })
+      commit({ error: (error as Error).message })
       get().toast('error', (error as Error).message)
     }
   } finally {
