@@ -115,6 +115,7 @@ export function ChatView() {
   const send = useStudio((s) => s.send)
   const stop = useStudio((s) => s.stop)
   const regenerate = useStudio((s) => s.regenerate)
+  const continueGeneration = useStudio((s) => s.continueGeneration)
   const editMessage = useStudio((s) => s.editMessage)
   const runtime = useStudio((s) => s.runtime)
   const models = useStudio((s) => s.models)
@@ -204,6 +205,14 @@ export function ChatView() {
                       }
                     : undefined
                 }
+                onContinue={
+                  message.role === 'assistant' && index === messages.length - 1 && !generating && message.stats?.finishReason === 'length'
+                    ? async () => {
+                        followRef.current = true
+                        await continueGeneration()
+                      }
+                    : undefined
+                }
               />
             ))}
           </div>
@@ -249,6 +258,7 @@ function Message({
   onCancelEdit,
   onSaveEdit,
   onRegenerate,
+  onContinue,
 }: {
   message: ChatMessage
   editing: boolean
@@ -256,6 +266,7 @@ function Message({
   onCancelEdit: () => void
   onSaveEdit: (content: string) => void
   onRegenerate?: () => void
+  onContinue?: () => void
 }) {
   const [draft, setDraft] = useState(message.content)
   useEffect(() => setDraft(message.content), [message.content, editing])
@@ -303,14 +314,21 @@ function Message({
                 the reason was in a hover title. The lane decodes to its ceiling and the class's
                 context is fixed on chain, so this is the one number a person can actually act on. */}
             {!isUser && !message.streaming && message.stats?.finishReason === 'length' && (
-              <p className="mt-2 flex items-start gap-2 rounded-lg bg-amber-50 p-2 text-xs text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
+              <div className="mt-2 rounded-lg bg-amber-50 p-2 text-xs text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
+                <p className="flex items-start gap-2">
                 <Icon name="stop" className="mt-0.5 size-3.5 shrink-0" />
                 <span>
                   Cut at the {message.stats.completionTokens}-token ceiling — the model had not finished. This class's
                   context is shared between the conversation and the reply, so a shorter chat leaves more of it for the
                   answer.
                 </span>
-              </p>
+                </p>
+                {onContinue && (
+                  <button type="button" className="btn-outline mt-2 px-2 py-1 text-xs" onClick={onContinue}>
+                    続きを生成
+                  </button>
+                )}
+              </div>
             )}
 
             {message.error && (

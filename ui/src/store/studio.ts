@@ -68,6 +68,7 @@ type StudioState = {
   renameConversation: (id: string, title: string) => void
   send: (text: string) => Promise<void>
   regenerate: () => Promise<void>
+  continueGeneration: () => Promise<void>
   editMessage: (messageId: string, content: string) => Promise<void>
   stop: () => void
   isGenerating: () => boolean
@@ -336,6 +337,18 @@ export const useStudio = create<StudioState>()(
         await runGeneration(set, get, conversationId)
       },
 
+      continueGeneration: async () => {
+        const conversationId = get().activeConversationId
+        if (!conversationId) return
+        const conversation = get().conversations.find((c) => c.id === conversationId)
+        const last = conversation?.messages.at(-1)
+        if (!conversation || !last || last.role !== 'assistant' || last.streaming || last.stats?.finishReason !== 'length') return
+        await runGeneration(set, get, conversationId, {
+          targetAssistantId: last.id,
+          prompt: '続きを生成してください。直前の回答を繰り返さず、途切れた箇所の続きから出力してください。',
+        })
+      },
+
       editMessage: async (messageId, content) => {
         const conversationId = get().activeConversationId
         if (!conversationId) return
@@ -384,7 +397,12 @@ type Getter = () => StudioState
  * Shared by send, regenerate and edit because all three are the same operation: take the
  * conversation as it now stands, ask for the next assistant turn, stream it in.
  */
-async function runGeneration(set: Setter, get: Getter, conversationId: string) {
+async function runGeneration(
+  set: Setter,
+  get: Getter,
+  conversationId: string,
+  options: { targetAssistantId?: string; prompt?: string } = {},
+) {
   const state = get()
   const conversation = state.conversations.find((c) => c.id === conversationId)
   if (!conversation) return
@@ -398,14 +416,18 @@ async function runGeneration(set: Setter, get: Getter, conversationId: string) {
 
   const systemPrompt = settings?.generation.system_prompt?.trim()
   const history = conversation.messages.map((m) => ({ role: m.role, content: m.content }))
-  const messages = systemPrompt ? [{ role: 'system', content: systemPrompt }, ...history] : history
+  const continuation = options.prompt ? [{ role: 'user' as const, content: options.prompt }] : []
+  const messages = systemPrompt ? [{ role: 'system' as const, content: systemPrompt }, ...history, ...continuation] : [...history, ...continuation]
 
-  const assistantId = uid()
-  const placeholder: ChatMessage = { id: assistantId, role: 'assistant', content: '', streaming: true }
+  const assistantId = options.targetAssistantId ?? uid()
+  const existing = conversation.messages.find((m) => m.id === assistantId)
+  const placeholder: ChatMessage = { id: assistantId, role: 'assistant', content: existing?.content ?? '', streaming: true }
   set((s) => ({
-    conversations: s.conversations.map((c) =>
-      c.id === conversationId ? { ...c, messages: [...c.messages, placeholder], modelId, updatedAt: Date.now() } : c,
-    ),
+    conversations: s.conversations.map((c) => {
+      if (c.id !== conversationId) return c
+      const present = c.messages.some((m) => m.id === assistantId)
+      return { ...c, messages: present ? c.messages.map((m) => (m.id === assistantId ? placeholder : m)) : [...c.messages, placeholder], modelId, updatedAt: Date.now() }
+    }),
   }))
 
   const update = (patch: Partial<ChatMessage>) =>
@@ -421,7 +443,7 @@ async function runGeneration(set: Setter, get: Getter, conversationId: string) {
   inFlight = controller
   const startedAt = performance.now()
   let firstTokenAt: number | null = null
-  let text = ''
+  let text = existing?.content ?? ''
 
   try {
     const generator = streamChat(
