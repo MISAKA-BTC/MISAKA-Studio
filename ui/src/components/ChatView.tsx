@@ -18,6 +18,7 @@ import { CopyButton, EmptyState, Icon, Spinner } from './common'
 import { Markdown } from './Markdown'
 import { useClassStatuses } from './MiningCatalog'
 import { ModelBar } from './ModelBar'
+import misakaPi from '../assets/misaka-pi.png'
 
 /**
  * What "no text yet" means, said out loud.
@@ -276,9 +277,11 @@ function Message({
   return (
     <div className={`group mb-6 flex gap-3 ${isUser ? 'justify-end' : ''}`}>
       {!isUser && (
-        <div className="mt-1 flex size-7 shrink-0 items-center justify-center rounded-lg bg-arc-600/15 text-[0.65rem] font-bold text-arc-700 dark:text-arc-300">
-          MS
-        </div>
+        <img
+          src={misakaPi}
+          alt="MISAKA"
+          className="mt-1 size-9 shrink-0 rounded-lg bg-white object-contain p-0.5 shadow-sm dark:bg-ink-100"
+        />
       )}
 
       <div className={`min-w-0 ${isUser ? 'max-w-[85%]' : 'flex-1'}`}>

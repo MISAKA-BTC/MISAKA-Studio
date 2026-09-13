@@ -17,7 +17,10 @@
 import { memo, type ReactNode } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import remarkMath from 'remark-math'
 import rehypeHighlight from 'rehype-highlight'
+import rehypeKatex from 'rehype-katex'
+import 'katex/dist/katex.min.css'
 import { CopyButton } from './common'
 
 function textOf(node: ReactNode): string {
@@ -28,12 +31,31 @@ function textOf(node: ReactNode): string {
   return ''
 }
 
+/**
+ * Models commonly use both Markdown math (`$x$`, `$$x$$`) and the delimiters ChatGPT emits
+ * (`\\(x\\)`, `\\[x\\]`). remark-math deliberately only owns the Markdown spellings, so make
+ * the latter spell the former before parsing. Fenced code is left verbatim: a code sample that
+ * happens to contain a LaTex string must remain copyable source, not become a formula.
+ */
+function normalizeMathDelimiters(markdown: string): string {
+  return markdown
+    .split(/(```[\s\S]*?```)/g)
+    .map((part, index) => {
+      if (index % 2 === 1) return part
+      return part
+        .replace(/\\\[([\s\S]*?)\\\]/g, (_, formula: string) => `$$\n${formula.trim()}\n$$`)
+        .replace(/\\\(([^\n]*?)\\\)/g, (_, formula: string) => `$${formula.trim()}$`)
+    })
+    .join('')
+}
+
 export const Markdown = memo(function Markdown({ children }: { children: string }) {
+  const markdown = normalizeMathDelimiters(children)
   return (
     <div className="prose-chat">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }], rehypeKatex]}
         components={{
           pre({ children }) {
             const code = textOf(children)
@@ -61,7 +83,7 @@ export const Markdown = memo(function Markdown({ children }: { children: string 
           },
         }}
       >
-        {children}
+        {markdown}
       </ReactMarkdown>
     </div>
   )

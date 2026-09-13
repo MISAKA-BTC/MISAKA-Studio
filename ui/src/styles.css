@@ -94,6 +94,14 @@
   .prose-chat pre code {
     @apply bg-transparent p-0 text-ink-100;
   }
+  /* KaTeX inherits the chat bubble's foreground colour. A displayed proof can be wider than the
+     narrow mobile/desktop-chat column, so scroll the formula itself rather than the whole answer. */
+  .prose-chat .katex {
+    font-size: 1.08em;
+  }
+  .prose-chat .katex-display {
+    @apply my-4 overflow-x-auto overflow-y-hidden py-1;
+  }
   .prose-chat table {
     @apply w-full text-sm border-collapse;
   }
