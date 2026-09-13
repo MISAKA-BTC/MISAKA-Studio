@@ -84,6 +84,20 @@ let inFlight: AbortController | null = null
 
 const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36)
 
+/**
+ * The PALW lane must finish its fixed decode for a reproducible proof, so it cannot use EOS as
+ * an execution stop.  Small models can consequently start a second copy of a paragraph after
+ * they have answered.  Do not make the reader wait for several screens of the same text: once a
+ * substantial, exact tail has already appeared, stop displaying the duplicate stream.
+ */
+function hasRepeatedTail(text: string): boolean {
+  const compact = text.replace(/\s+/g, ' ').trim()
+  const tailLength = 120
+  if (compact.length < tailLength * 2) return false
+  const tail = compact.slice(-tailLength)
+  return compact.slice(0, -tailLength).includes(tail)
+}
+
 function emptyConversation(): Conversation {
   const now = Date.now()
   return { id: uid(), title: 'New chat', createdAt: now, updatedAt: now, modelId: null, messages: [] }
@@ -444,6 +458,7 @@ async function runGeneration(
   const startedAt = performance.now()
   let firstTokenAt: number | null = null
   let text = existing?.content ?? ''
+  let stoppedForRepetition = false
 
   try {
     const generator = streamChat(
@@ -466,6 +481,11 @@ async function runGeneration(
         if (firstTokenAt === null) firstTokenAt = performance.now()
         text += event.text
         update({ content: text })
+        if (hasRepeatedTail(text)) {
+          stoppedForRepetition = true
+          controller.abort()
+          break
+        }
       } else if (event.type === 'error') {
         update({ error: event.message })
       } else {
@@ -485,9 +505,21 @@ async function runGeneration(
         })
       }
     }
-    update({ streaming: false })
+    if (stoppedForRepetition) {
+      update({
+        streaming: false,
+        error: '同じ文章の反復を検出したため、この表示を停止しました。再生成すると別の回答を試せます。',
+      })
+    } else {
+      update({ streaming: false })
+    }
   } catch (error) {
-    if ((error as Error).name === 'AbortError') {
+    if (stoppedForRepetition) {
+      update({
+        streaming: false,
+        error: '同じ文章の反復を検出したため、この表示を停止しました。再生成すると別の回答を試せます。',
+      })
+    } else if ((error as Error).name === 'AbortError') {
       // A stopped generation keeps what it produced: the user asked it to stop, not to undo.
       update({ streaming: false, stats: undefined })
     } else {
