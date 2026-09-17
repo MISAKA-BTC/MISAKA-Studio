@@ -299,6 +299,12 @@ impl InferenceBackend for LlamaCppBackend {
     fn devices(&self) -> BoxFuture<'_, Option<Vec<EngineDevice>>> {
         Box::pin(async move { self.engine.probe().await.devices })
     }
+
+    /// `llama-server` prefills a trailing assistant message by default (`--prefill-assistant`,
+    /// measured in build 10330's help): the answer's continuation, not a new answer.
+    fn continues_assistant_turn(&self) -> bool {
+        true
+    }
 }
 
 /// Which accelerator tag this machine should use, from what the hardware probe found.

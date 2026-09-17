@@ -164,6 +164,17 @@ pub trait InferenceBackend: Send + Sync {
     fn devices(&self) -> BoxFuture<'_, Option<Vec<devices::EngineDevice>>> {
         Box::pin(async { None })
     }
+
+    /// Whether a conversation that ENDS with an assistant turn is continued from inside that turn.
+    ///
+    /// `llama-server` does this by default (`--prefill-assistant`): the template leaves the last
+    /// assistant turn open and the model writes its next token. An engine whose template closes
+    /// every turn and opens a fresh `assistant` — the free-prompt gateway's, fixed by the class —
+    /// would instead answer the partial text as if it were finished, so it gets the continuation
+    /// spelled out as an instruction ([`continuation_as_instruction`]). `false` is the safe default.
+    fn continues_assistant_turn(&self) -> bool {
+        false
+    }
 }
 
 /// Whether a backend can be used here, and if not, what would fix it.
@@ -247,11 +258,14 @@ pub fn fit_messages_to_budget(messages: &[ChatMessage], budget: u64) -> (Vec<Cha
         return (messages.to_vec(), 0);
     }
     let (system, rest): (Vec<_>, Vec<_>) = messages.iter().cloned().partition(|m| m.role == "system");
-    // The newest turn is the question; it is never dropped. If it alone does not fit, the caller
-    // gets it back and the error it deserves — a message that says the prompt itself is too long,
-    // not one that says the history was.
-    let mut kept: Vec<ChatMessage> = Vec::new();
-    for m in rest.iter().rev() {
+    // The newest exchange is never dropped: the last user message, and any assistant text after
+    // it. The latter is a reply being CONTINUED, and dropping the question from under it is how
+    // "continue" reached a model as a bare "please continue" with nothing to continue — measured,
+    // on a 512-token class, as a reply that asked what it was supposed to continue. If the
+    // exchange alone does not fit, the caller gets it back and the error it deserves.
+    let last_user = rest.iter().rposition(|m| m.role == "user").unwrap_or(rest.len().saturating_sub(1));
+    let mut kept: Vec<ChatMessage> = rest[last_user..].iter().rev().cloned().collect();
+    for m in rest[..last_user].iter().rev() {
         let mut candidate = system.clone();
         candidate.extend(kept.iter().rev().cloned());
         candidate.push(m.clone());
@@ -276,6 +290,70 @@ pub fn fit_messages_to_budget(messages: &[ChatMessage], budget: u64) -> (Vec<Cha
 /// counts only the prompt: "the prompt is 524 tokens and this artifact's rotary table covers 512".
 /// The second shape had no reader, so a conversation that outgrew the class produced a raw engine
 /// string, no answer, and no way for the app to act. Both give the number that matters.
+/// **A continuation, spelled out for an engine that cannot continue a turn from inside it.**
+///
+/// The conversation ends with an assistant reply that was cut off. Rewritten as: the system
+/// prompt, then ONE user turn carrying the question, an instruction, and as much of the reply's
+/// end as fits `budget`. One turn rather than the whole history because on a 512-token class the
+/// history is exactly what does not fit — and a model that sees the question and where it stopped
+/// can continue; a model that sees only "continue" cannot.
+///
+/// `Err` is a sentence for the user when not even the question and a useful tail fit — a reply
+/// that already filled the class's window has no room left to be continued, and saying so beats a
+/// continuation of nothing.
+pub fn continuation_as_instruction(messages: &[ChatMessage], budget: u64) -> Result<Vec<ChatMessage>, String> {
+    /// Below this, the model is not continuing text, it is guessing at a fragment.
+    const MIN_TAIL_TOKENS: u64 = 16;
+    let Some(last_user) = messages.iter().rposition(|m| m.role == "user") else {
+        return Err("there is no question to continue the answer to".to_string());
+    };
+    let partial: String = messages[last_user + 1..].iter().filter(|m| m.role == "assistant").map(|m| m.content.as_str()).collect();
+    if partial.trim().is_empty() {
+        return Err("there is no answer to continue".to_string());
+    }
+    let system: Vec<ChatMessage> = messages.iter().filter(|m| m.role == "system").cloned().collect();
+    let question = messages[last_user].content.trim();
+    let japanese = question.chars().chain(partial.chars()).any(|c| !c.is_ascii());
+    let (header, marker) = if japanese {
+        (
+            "上の質問への回答が途中で切れています。すでに書いた部分を繰り返さず、前置きも付けずに、切れた箇所の直後の文字から続きだけを出力してください。",
+            "途中までの回答（末尾）:",
+        )
+    } else {
+        (
+            "The answer to the question above was cut off. Do not repeat what was already written and add no preamble: output only the continuation, starting from the character right after where it stopped.",
+            "The answer so far (its end):",
+        )
+    };
+    let compose = |tail: &str| {
+        let mut out = system.clone();
+        out.push(ChatMessage::new("user", format!("{question}\n\n---\n{header}\n\n{marker}\n{tail}")));
+        out
+    };
+
+    let chars: Vec<char> = partial.chars().collect();
+    let fits = |start: usize| prompt_tokens_upper_bound(&compose(&chars[start..].iter().collect::<String>())) <= budget;
+    if fits(0) {
+        return Ok(compose(&partial));
+    }
+    // The longest suffix that fits: binary search on where it starts.
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if fits(mid) { hi = mid } else { lo = mid + 1 }
+    }
+    let tail: String = chars[lo..].iter().collect();
+    let tail_tokens = prompt_tokens_upper_bound(&[ChatMessage::new("assistant", tail.clone())]).saturating_sub(8);
+    if lo >= chars.len() || !fits(lo) || tail_tokens < MIN_TAIL_TOKENS {
+        return Err(if japanese {
+            "この回答はモデルの文脈をほぼ使い切っていて、質問と途中の回答を渡すと続きを書く余地が残りません。新しいチャットで、残りの部分だけを質問してください（例:「(2)だけ解いてください」）。".to_string()
+        } else {
+            "This answer already fills the model's context: with the question and the answer so far there is no room left to continue. Ask for the remaining part on its own in a new chat.".to_string()
+        });
+    }
+    Ok(compose(&tail))
+}
+
 pub fn context_limit_from_refusal(message: &str) -> Option<u64> {
     let after = |needle: &str| -> Option<u64> {
         let rest = message.split(needle).nth(1)?;
@@ -404,6 +482,55 @@ mod context_fit_tests {
         assert!(dropped > 0, "and it must still be trimmed, because accepting it leaves nothing to answer with");
         assert!(prompt_tokens_upper_bound(&kept) + reserve <= window, "what is kept leaves the answer its half");
         assert_eq!(kept.last().map(|m| m.content.as_str()), Some("F=maを証明して"));
+    }
+
+    /// Continuing a reply: the question and the partial answer are one exchange and neither is
+    /// dropped to make room — the older history goes instead.
+    #[test]
+    fn a_reply_being_continued_keeps_its_question() {
+        let messages = vec![
+            msg("system", "日本語で答えてください。"),
+            msg("user", &"古い質問".repeat(60)),
+            msg("assistant", &"古い回答".repeat(60)),
+            msg("user", "円の接線の中点 Q を求めよ"),
+            msg("assistant", "(1) まず接点を A, B とします。これらを"),
+        ];
+        let (kept, dropped) = fit_messages_to_budget(&messages, 120);
+        assert_eq!(dropped, 2);
+        let roles: Vec<_> = kept.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user", "assistant"]);
+        assert_eq!(kept[1].content, "円の接線の中点 Q を求めよ");
+    }
+
+    /// The instruction form carries the question and the END of the partial answer, fits the
+    /// budget, and says what to do in the language of the chat.
+    #[test]
+    fn a_continuation_for_a_small_window_carries_the_question_and_the_tail() {
+        let question = "原点 O を中心とする半径 1 の円に円外の点 P から 2 本の接線を引く。中点 Q の座標を求めよ。";
+        let partial = format!("{}これらを x_1 と", "接線の方程式は l_1: y - y_0 = m(x - x_0) です。".repeat(30));
+        let messages = vec![msg("system", "日本語で答えてください。"), msg("user", question), msg("assistant", &partial)];
+        let rewritten = continuation_as_instruction(&messages, 256).expect("fits");
+        assert_eq!(rewritten.len(), 2, "system + one user turn");
+        assert_eq!(rewritten[1].role, "user", "never ends with an assistant turn the template would close");
+        let content = &rewritten[1].content;
+        assert!(content.starts_with(question), "the question is there, whole");
+        assert!(content.contains("繰り返さず"), "the instruction is in Japanese: {content}");
+        assert!(content.ends_with("これらを x_1 と"), "the tail is the END of the answer: {content}");
+        assert!(prompt_tokens_upper_bound(&rewritten) <= 256);
+
+        let short = vec![msg("user", "Explain RSA."), msg("assistant", "RSA relies on the difficulty of factoring")];
+        let whole = continuation_as_instruction(&short, 10_000).expect("fits");
+        assert!(whole[0].content.contains("Do not repeat"), "English chat, English instruction");
+        assert!(whole[0].content.ends_with("difficulty of factoring"));
+    }
+
+    /// No room is a sentence, not a continuation of nothing.
+    #[test]
+    fn a_continuation_with_no_room_says_so() {
+        let messages = vec![msg("user", &"長い質問".repeat(80)), msg("assistant", "答えの途中")];
+        let refused = continuation_as_instruction(&messages, 256).unwrap_err();
+        assert!(refused.contains("新しいチャット"), "{refused}");
+        assert!(continuation_as_instruction(&[msg("assistant", "x")], 256).is_err(), "nothing to continue to");
     }
 
     /// One message too long for the class cannot be fixed by dropping history — there is none.

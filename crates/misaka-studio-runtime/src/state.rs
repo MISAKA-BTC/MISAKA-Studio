@@ -544,6 +544,20 @@ impl AppState {
         // reserving it against a small window would leave nothing to remember with. An engine with
         // room to spare trims nothing — `fit_messages_to_budget` returns a conversation that
         // already fits untouched.
+        // **Continuing a cut-off reply.** The conversation ends with the partial assistant text.
+        // An engine that continues a turn from inside it gets exactly that; any other engine
+        // would close the partial turn and start a new answer, so it gets the continuation as an
+        // instruction that fits its window — see `continuation_as_instruction`.
+        let continuing = prompt.is_none() && messages.last().is_some_and(|m| m.role == "assistant");
+        let messages = if continuing && !backend.continues_assistant_turn() {
+            let budget = match state.loaded.context_size as u64 {
+                0 => u64::MAX,
+                window => window.saturating_sub(crate::backend::answer_room(params.max_tokens, window)),
+            };
+            crate::backend::continuation_as_instruction(&messages, budget).map_err(|message| Error::BadRequest { message })?
+        } else {
+            messages
+        };
         let messages = if prompt.is_some() || state.loaded.context_size == 0 {
             messages
         } else {

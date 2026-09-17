@@ -12,6 +12,7 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { api, streamChat } from '../lib/api'
+import { joinContinuation } from '../lib/continuation'
 import type {
   ChatMessage,
   Conversation,
@@ -370,10 +371,13 @@ export const useStudio = create<StudioState>()(
         const conversation = get().conversations.find((c) => c.id === conversationId)
         const last = conversation?.messages.at(-1)
         if (!conversation || !last || last.role !== 'assistant' || last.streaming || last.stats?.finishReason !== 'length') return
-        await runGeneration(set, get, conversationId, {
-          targetAssistantId: last.id,
-          prompt: '続きを生成してください。直前の回答を繰り返さず、途切れた箇所の続きから出力してください。',
-        })
+        // No instruction is added here. The conversation already ends with the cut-off reply, and
+        // the runtime decides how that reaches the engine: as an open assistant turn the engine
+        // continues (llama.cpp), or as the question plus the reply's end in one instruction that
+        // fits a small class's window. Adding "please continue" as a user turn was the bug: on a
+        // 512-token class the trim kept that line and dropped the question, and the model asked
+        // what it was meant to continue — glued onto the answer.
+        await runGeneration(set, get, conversationId, { targetAssistantId: last.id })
       },
 
       editMessage: async (messageId, content) => {
@@ -492,6 +496,7 @@ async function runGeneration(
   inFlight = controller
   const startedAt = performance.now()
   let firstTokenAt: number | null = null
+  let added = ''
   let text = baseContent
   let stoppedForRepetition = false
   let streamError: string | undefined
@@ -516,7 +521,8 @@ async function runGeneration(
     for await (const event of generator) {
       if (event.type === 'delta') {
         if (firstTokenAt === null) firstTokenAt = performance.now()
-        text += event.text
+        added += event.text
+        text = baseContent ? joinContinuation(baseContent, added) : added
         updateStream(text)
         if (hasRepeatedTail(text)) {
           stoppedForRepetition = true
