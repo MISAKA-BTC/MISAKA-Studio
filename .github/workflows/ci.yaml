@@ -80,6 +80,10 @@ jobs:
       # a bundle that throws at runtime.
       - name: Typecheck and bundle
         run: npm run build
+      # The Markdown math normaliser has a test file of what models actually write; Node runs it
+      # without a framework. See ui/test/.
+      - name: Test
+        run: npm test
 
   desktop:
     name: Desktop shell

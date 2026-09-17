@@ -448,10 +448,26 @@ impl AppState {
     }
 
     pub async fn status(&self) -> RuntimeStatus {
-        let loaded = self.loaded().await;
+        let loaded = self.reconciled_loaded().await;
         let backend = self.backend().await;
         let available = backend.availability().await.is_available();
         self.status_from(loaded.as_ref(), available).await
+    }
+
+    /// What is loaded, after asking the engine whether it is still there.
+    ///
+    /// The Studio's own record says "loaded" from the load until the unload. The engine's process
+    /// can leave in between — a driver fault, the OS taking its memory back, a signal — and says
+    /// nothing. This is the one place both are compared, so a dead engine turns into "nothing is
+    /// loaded" the next time anyone asks, instead of a model that refuses every connection.
+    async fn reconciled_loaded(&self) -> Option<LoadedState> {
+        let state = self.loaded().await?;
+        if self.backend().await.loaded().await.is_none() {
+            tracing::warn!(model = %state.model.id, "the engine holding this model is gone; marking it unloaded");
+            *self.loaded.write().await = None;
+            return None;
+        }
+        Some(state)
     }
 
     async fn status_from(&self, state: Option<&LoadedState>, available: bool) -> RuntimeStatus {
@@ -503,6 +519,15 @@ impl AppState {
     ) -> Result<BoxStream<'static, Result<StreamEvent>>> {
         let state = self.loaded().await.ok_or(Error::NoModelLoaded)?;
         let backend = self.backend().await;
+        // An engine that died between two messages is found out here, not by the connection
+        // refused that would otherwise be this message's answer.
+        if backend.loaded().await.is_none() {
+            *self.loaded.write().await = None;
+            return Err(Error::Engine {
+                backend: backend.name(),
+                message: format!("the engine that held {} is no longer running — load the model again", state.model.id),
+            });
+        }
 
         // **The answer's share of the window, reserved before the question is sent.**
         //

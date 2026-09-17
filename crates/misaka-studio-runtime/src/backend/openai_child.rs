@@ -88,7 +88,9 @@ struct Running {
 /// A supervised OpenAI-compatible engine.
 pub struct ChildEngine {
     config: ChildEngineConfig,
-    running: RwLock<Option<Running>>,
+    /// Shared with in-flight generations, so a stream that breaks can ask whether the process is
+    /// still there — the one fact that separates "the engine crashed" from "the network hiccuped".
+    running: Arc<RwLock<Option<Running>>>,
     log: Arc<Mutex<VecDeque<String>>>,
     http: reqwest::Client,
 }
@@ -97,7 +99,7 @@ impl ChildEngine {
     pub fn new(config: ChildEngineConfig) -> Self {
         ChildEngine {
             config,
-            running: RwLock::new(None),
+            running: Arc::new(RwLock::new(None)),
             log: Arc::new(Mutex::new(VecDeque::with_capacity(LOG_LINES))),
             // No overall timeout: a generation legitimately runs for minutes. Connect timeouts
             // still apply, so a dead engine is detected quickly.
@@ -282,8 +284,27 @@ impl ChildEngine {
         Ok(())
     }
 
+    /// The model this engine holds — and `None` the moment the process is found to have exited.
+    ///
+    /// A child that died on its own (a driver fault, the OS reclaiming memory, someone's `kill`)
+    /// does not announce it; it is only ever discovered by looking. So every reader of "what is
+    /// loaded" looks, and a dead engine becomes "nothing is loaded, and here is why" in the log
+    /// rather than a model that answers every message with a refused connection.
     pub async fn loaded(&self) -> Option<LoadedModel> {
-        self.running.read().await.as_ref().map(|r| r.model.clone())
+        let mut guard = self.running.write().await;
+        if let Some(running) = guard.as_mut()
+            && let Ok(Some(status)) = running.child.try_wait()
+        {
+            tracing::warn!(
+                model = %running.model.model_id,
+                %status,
+                "the engine exited on its own; its last lines:\n{}",
+                log_tail(&self.log, 12)
+            );
+            *guard = None;
+            return None;
+        }
+        guard.as_ref().map(|r| r.model.clone())
     }
 
     async fn base_url(&self) -> Result<String> {
@@ -300,6 +321,8 @@ impl ChildEngine {
         let body = request_body(&request, chat);
         let http = self.http.clone();
         let backend = self.config.name;
+        let running = self.running.clone();
+        let log = self.log.clone();
         let fallback_prompt_tokens = approximate_tokens(
             &request
                 .prompt
@@ -329,7 +352,8 @@ impl ChildEngine {
                 let chunk = match chunk {
                     Ok(c) => c,
                     Err(e) => {
-                        let _ = tx.send(Err(Error::Engine { backend, message: format!("stream broke: {e}") })).await;
+                        let message = stream_break_message(&e, &running, &log).await;
+                        let _ = tx.send(Err(Error::Engine { backend, message })).await;
                         return;
                     }
                 };
@@ -375,6 +399,63 @@ impl ChildEngine {
             ),
         }
     }
+}
+
+/// **Why a stream broke, with the facts that decide what to do next.**
+///
+/// reqwest's own text for a body that stops arriving is `error decoding response body` — the
+/// same seven words for an engine that crashed, an engine that closed the connection on purpose,
+/// and a socket reset — with the actual reason two links down the error's source chain and never
+/// printed. A tester saw exactly those words, mid-answer, and had nothing to act on. So: the whole
+/// chain, whether the process is still alive (and its exit status when it is not), and the last
+/// lines it printed, which is where a crash says what it was.
+async fn stream_break_message(
+    error: &reqwest::Error,
+    running: &Arc<RwLock<Option<Running>>>,
+    log: &Arc<Mutex<VecDeque<String>>>,
+) -> String {
+    let cause = error_chain(error);
+    // A dying process closes its sockets a moment before it becomes reapable: the EOF arrives
+    // first and `try_wait` still says "running". Measured with `kill -9` on a streaming engine —
+    // the first attempt reported it alive. So look a few times over half a second before
+    // concluding that it is; a crash is worth that much of a wait to be named as one.
+    let mut exited = None;
+    for _ in 0..10 {
+        exited = running.write().await.as_mut().and_then(|r| r.child.try_wait().ok().flatten());
+        if exited.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let tail = log_tail(log, 6);
+    match exited {
+        Some(status) => format!(
+            "stream broke: the engine exited with {status} while generating ({cause}). Its last lines:\n{tail}\nLoad the model again."
+        ),
+        None => format!("stream broke: {cause}. The engine is still running; its last lines:\n{tail}"),
+    }
+}
+
+/// An error and everything under it, on one line, without repeating a link that only restates
+/// the one above it.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut parts: Vec<String> = vec![error.to_string()];
+    let mut current = error.source();
+    while let Some(source) = current {
+        let text = source.to_string();
+        if parts.last().is_none_or(|last| !last.contains(&text)) {
+            parts.push(text);
+        }
+        current = source.source();
+    }
+    parts.join(": ")
+}
+
+/// The newest `lines` of the engine's output, oldest first.
+fn log_tail(log: &Arc<Mutex<VecDeque<String>>>, lines: usize) -> String {
+    let guard = log.lock().expect("log lock");
+    let skip = guard.len().saturating_sub(lines);
+    guard.iter().skip(skip).cloned().collect::<Vec<_>>().join("\n")
 }
 
 enum Pipe {
@@ -678,6 +759,59 @@ mod tests {
         assert_eq!(body["stop"][0], "</s>");
         assert!(body["messages"].is_array());
         assert!(body.get("prompt").is_none(), "a chat request must not also send a raw prompt");
+    }
+
+    /// An error's reason lives in its source chain, and a chain that repeats itself is noise.
+    #[test]
+    fn the_error_chain_carries_the_reason_once() {
+        let inner = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset by peer");
+        let outer = Wrapped { message: "error decoding response body".into(), source: Some(inner) };
+        assert_eq!(error_chain(&outer), "error decoding response body: connection reset by peer");
+
+        let restating = Wrapped {
+            message: "failed: connection reset by peer".into(),
+            source: Some(std::io::Error::other("connection reset by peer")),
+        };
+        assert_eq!(error_chain(&restating), "failed: connection reset by peer", "a link that only restates its parent is dropped");
+    }
+
+    #[derive(Debug)]
+    struct Wrapped {
+        message: String,
+        source: Option<std::io::Error>,
+    }
+    impl std::fmt::Display for Wrapped {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source.as_ref().map(|e| e as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    /// An engine whose process has exited is not a loaded model, whatever it was a moment ago.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_engine_that_exited_is_no_longer_loaded() {
+        let engine = ChildEngine::new(ChildEngineConfig {
+            name: "test",
+            program: PathBuf::from("true"),
+            args: Box::new(|_, _| Vec::new()),
+            health_path: "/health",
+            context_from_health: None,
+            startup_timeout: Duration::from_secs(1),
+            env: Vec::new(),
+            offload_from_log: None,
+        });
+        let child = tokio::process::Command::new("true").spawn().expect("`true` runs");
+        let model = LoadedModel { model_id: "m".into(), context_size: 1, gpu_layers: None, load_ms: 0, offload: None };
+        *engine.running.write().await = Some(Running { child, port: 1, model });
+        // `true` exits at once; give it the moment it needs.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(engine.loaded().await.is_none());
+        assert!(engine.running.read().await.is_none(), "and the dead process is not kept around");
     }
 
     #[test]

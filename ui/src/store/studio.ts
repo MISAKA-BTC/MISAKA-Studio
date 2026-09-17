@@ -479,6 +479,15 @@ async function runGeneration(
       }
     })
 
+  // "Regenerate" only helps where sampling can differ. The mining lane and the integer runtime
+  // decode greedily by construction — the same prompt gives the same answer, and telling someone
+  // to try again there sends them round in a circle they can see for themselves.
+  const lane = get().runtime?.backend
+  const repetitionNote =
+    lane === 'gateway' || lane === 'misaka'
+      ? '同じ文章の反復を検出したため、この表示を停止しました。この経路（マイニング用の整数ランタイム）は決定論的で、同じ質問には同じ答えが返ります。質問を言い換えるか、Settings → Backend で別のエンジンを選んでください。'
+      : '同じ文章の反復を検出したため、この表示を停止しました。再生成すると別の回答を試せます。'
+
   const controller = new AbortController()
   inFlight = controller
   const startedAt = performance.now()
@@ -531,17 +540,13 @@ async function runGeneration(
       }
     }
     if (stoppedForRepetition) {
-      commit({
-        error: '同じ文章の反復を検出したため、この表示を停止しました。再生成すると別の回答を試せます。',
-      })
+      commit({ error: repetitionNote })
     } else {
       commit({ error: streamError, stats })
     }
   } catch (error) {
     if (stoppedForRepetition) {
-      commit({
-        error: '同じ文章の反復を検出したため、この表示を停止しました。再生成すると別の回答を試せます。',
-      })
+      commit({ error: repetitionNote })
     } else if ((error as Error).name === 'AbortError') {
       // A stopped generation keeps what it produced: the user asked it to stop, not to undo.
       commit()
