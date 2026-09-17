@@ -394,6 +394,8 @@ export type MemoryReport = {
 export type ContextReport = {
   /** False when the conversation fitted as it was. */
   managed: boolean
+  /** The engine that was sent the request: `llamacpp`, `misaka`, `gateway`… */
+  backend: string
   window: number
   answer_reserve: number
   prompt_budget: number

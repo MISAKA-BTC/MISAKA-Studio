@@ -79,6 +79,9 @@ pub struct AppState {
     pub records: RwLock<Arc<RecordStore>>,
     /// Prompts waiting to be — or already — mined behind the chat. See `crate::mining_queue`.
     pub mining: Arc<crate::mining_queue::MiningQueue>,
+    /// One load at a time. A startup load and a chat that asked for a model before it finished
+    /// used to start two engines side by side, and the one that finished last was the one loaded.
+    load_lock: tokio::sync::Mutex<()>,
     /// Installs a `llama-server` built for this machine's GPU. See `crate::engines`.
     pub engines: Arc<crate::engines::EngineInstaller>,
     /// Summarises older turns on a local model, when `context.summarizer_model` names one.
@@ -125,6 +128,7 @@ impl AppState {
             node,
             records: RwLock::new(records),
             mining,
+            load_lock: tokio::sync::Mutex::new(()),
             engines,
             summarizer: Arc::new(crate::context::summarizer::Summarizer::new()),
             counters: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -371,6 +375,16 @@ impl AppState {
 
     /// Load a model into the engine that can run it.
     pub async fn load(&self, model_id: &str, context_override: Option<u32>) -> Result<RuntimeStatus> {
+        let _one_at_a_time = self.load_lock.lock().await;
+        // Asked for what is already loaded — typically a chat that waited here for the startup load
+        // of the same model: that load is the answer, not a reason to start the engine again.
+        if let Some(current) = self.loaded().await
+            && current.model.id == model_id
+            && context_override.is_none_or(|n| n == current.loaded.context_size)
+            && self.backend().await.loaded().await.is_some()
+        {
+            return Ok(self.status_from(Some(&current), true).await);
+        }
         let model = self.store.require(model_id).await?;
         let settings = self.settings.read().await.clone();
         let backend = self.backend_for(&model, &settings).await;
@@ -403,8 +417,16 @@ impl AppState {
         // The engine's own device list, when it has one: a CPU-only build on a machine with a
         // card must plan for the CPU, and a Vulkan build on a card the probe cannot see must plan
         // for the card.
-        let devices = backend.devices().await;
-        let gpu_layers = plan_gpu_layers(&model, &self.hardware, devices.as_deref(), context_size as u64, settings.backend.gpu_layers);
+        // Only an engine that offloads is given a layer count. The integer runtime computes on the CPU by
+        // construction and the gateway runs somewhere else; a planned count for either was echoed back
+        // as "28/28 on GPU" on the model bar, once the artifact's header said how many layers it has.
+        let offloads = ![MisakaBackend::NAME, crate::backend::gateway::NAME].contains(&backend.name());
+        let devices = if offloads { backend.devices().await } else { None };
+        let gpu_layers = if offloads {
+            plan_gpu_layers(&model, &self.hardware, devices.as_deref(), context_size as u64, settings.backend.gpu_layers)
+        } else {
+            None
+        };
 
         let loaded = backend
             .load(LoadRequest {
@@ -771,6 +793,7 @@ impl AppState {
             (None, None)
         };
         let mut plan = draft.finish(supplied, counter, note);
+        plan.report.backend = backend.name().to_string();
 
         // A cut-off reply for an engine that closes every turn: the question and the reply's end,
         // spelled as one instruction (see `continuation_as_instruction`).

@@ -13,6 +13,7 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { api, streamChat } from '../lib/api'
 import { joinContinuation } from '../lib/continuation'
+import { hasRepeatedTail, historyForModel, trimRepeatedTail } from '../lib/history'
 import type {
   ChatMessage,
   Conversation,
@@ -98,20 +99,6 @@ type StudioState = {
 let inFlight: AbortController | null = null
 
 const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36)
-
-/**
- * The PALW lane must finish its fixed decode for a reproducible proof, so it cannot use EOS as
- * an execution stop.  Small models can consequently start a second copy of a paragraph after
- * they have answered.  Do not make the reader wait for several screens of the same text: once a
- * substantial, exact tail has already appeared, stop displaying the duplicate stream.
- */
-function hasRepeatedTail(text: string): boolean {
-  const compact = text.replace(/\s+/g, ' ').trim()
-  const tailLength = 120
-  if (compact.length < tailLength * 2) return false
-  const tail = compact.slice(-tailLength)
-  return compact.slice(0, -tailLength).includes(tail)
-}
 
 function emptyConversation(): Conversation {
   const now = Date.now()
@@ -471,14 +458,20 @@ async function runGeneration(
   if (!conversation) return
 
   const settings = state.settings
-  const modelId = state.runtime?.model_id ?? state.models[0]?.id
+  // The loaded model; else the one the runtime loads at startup, which may still be loading — asking
+  // for the first model in the list instead started a second engine in a race with it, and a chat
+  // meant for the 512-token class was answered by a 32K GGUF with the whole history behind it.
+  const startupModel = settings?.load_on_start && state.models.some((m) => m.id === settings.load_on_start) ? settings.load_on_start : null
+  const modelId = state.runtime?.model_id ?? startupModel ?? state.models[0]?.id
   if (!modelId) {
     state.toast('error', 'No model is available. Download one from the Models tab.')
     return
   }
 
   const systemPrompt = settings?.generation.system_prompt?.trim()
-  const history = conversation.messages.map((m) => ({ role: m.role, content: m.content }))
+  // Not every turn in the window is context: failed, looping and superseded replies stay visible
+  // but are not sent back — see `lib/history`.
+  const history = historyForModel(conversation.messages)
   const continuation = options.prompt ? [{ role: 'user' as const, content: options.prompt }] : []
   const messages = systemPrompt ? [{ role: 'system' as const, content: systemPrompt }, ...history, ...continuation] : [...history, ...continuation]
 
@@ -518,8 +511,9 @@ async function runGeneration(
   // "Regenerate" only helps where sampling can differ. The mining lane and the integer runtime
   // decode greedily by construction — the same prompt gives the same answer, and telling someone
   // to try again there sends them round in a circle they can see for themselves.
-  const lane = get().runtime?.backend
-  const repetitionNote =
+  // Which engine answered is the context report's to say: the window's idea of the runtime can be a
+  // load behind.
+  const repetitionNoteFor = (lane: string | undefined) =>
     lane === 'gateway' || lane === 'misaka'
       ? '同じ文章の反復を検出したため、この表示を停止しました。この経路（マイニング用の整数ランタイム）は決定論的で、同じ質問には同じ答えが返ります。質問を言い換えるか、Settings → Backend で別のエンジンを選んでください。'
       : '同じ文章の反復を検出したため、この表示を停止しました。再生成すると別の回答を試せます。'
@@ -582,13 +576,16 @@ async function runGeneration(
       }
     }
     if (stoppedForRepetition) {
-      commit({ error: repetitionNote, context })
+      // The reply is kept as far as it got, without the copy of itself it was stopped in.
+      updateStream(trimRepeatedTail(text) ?? text)
+      commit({ error: repetitionNoteFor(context?.backend ?? get().runtime?.backend), context })
     } else {
       commit({ error: streamError, stats, context })
     }
   } catch (error) {
     if (stoppedForRepetition) {
-      commit({ error: repetitionNote })
+      updateStream(trimRepeatedTail(text) ?? text)
+      commit({ error: repetitionNoteFor(context?.backend ?? get().runtime?.backend), context })
     } else if ((error as Error).name === 'AbortError') {
       // A stopped generation keeps what it produced: the user asked it to stop, not to undo.
       commit({ context })

@@ -85,6 +85,9 @@ pub struct MemoryReport {
 pub struct ContextReport {
     /// `false` when the conversation fitted as it was: nothing was left out or rewritten.
     pub managed: bool,
+    /// The engine the request went to (`llamacpp`, `misaka`, `gateway`), filled in by the caller —
+    /// the window's own idea of the runtime can be a load behind.
+    pub backend: String,
     pub window: u64,
     /// Tokens held back for the answer.
     pub answer_reserve: u64,
@@ -374,6 +377,7 @@ impl Draft {
             let prompt_tokens = counter.messages(&messages);
             let report = ContextReport {
                 managed: false,
+                backend: String::new(),
                 window,
                 answer_reserve: reserve,
                 prompt_budget: budget,
@@ -416,6 +420,7 @@ impl Draft {
         let prompt_tokens = counter.messages(&messages);
         let report = ContextReport {
             managed: true,
+            backend: String::new(),
             window,
             answer_reserve: reserve,
             prompt_budget: budget,
