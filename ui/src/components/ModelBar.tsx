@@ -6,9 +6,32 @@
 
 import { useState } from 'react'
 import { bytes, tokens } from '../lib/format'
+import type { Offload } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { Icon, QuantBadge, Spinner } from './common'
 import { ParametersPanel } from './ParametersPanel'
+
+/** `29/29 on MTL0`, `CPU`, or `GPU (engine decides)` — with a `?` when nothing verified it. */
+function offloadLabel(offload: Offload, blockCount: number | null): string {
+  const unverified = offload.evidence === 'unverified' ? '?' : ''
+  if (offload.layers === null) return 'GPU: engine decides'
+  if (offload.layers === 0) return 'CPU'
+  const total = offload.total_layers ?? (blockCount ? blockCount + 1 : null)
+  const device = offload.device?.split(' (')[0] ?? 'GPU'
+  return total ? `${Math.min(offload.layers, total)}/${total} on ${device}${unverified}` : `${offload.layers} layers on ${device}${unverified}`
+}
+
+function offloadTitle(offload: Offload): string {
+  const where = offload.device ? `Weights on ${offload.device}` : 'Weights in system memory'
+  const evidence = { engine_log: "from the engine's own load log", device_list: "from the engine's device list", unverified: 'unverified — the engine is too old to say' }[
+    offload.evidence
+  ]
+  const sizes =
+    offload.accelerator_bytes !== null && offload.cpu_bytes !== null
+      ? ` · ${bytes(offload.accelerator_bytes)} on the accelerator, ${bytes(offload.cpu_bytes)} on the CPU`
+      : ''
+  return `${where} (${evidence})${sizes}`
+}
 
 export function ModelBar() {
   const models = useStudio((s) => s.models)
@@ -53,10 +76,24 @@ export function ModelBar() {
             <QuantBadge quantization={loaded.quantization} architecture={loaded.architecture} />
             <span>{bytes(loaded.size_bytes)}</span>
             {runtime?.context_size && <span>· {tokens(runtime.context_size)} ctx</span>}
-            {runtime?.gpu_layers !== null && runtime?.gpu_layers !== undefined && loaded.block_count && (
-              <span title="Layers on the accelerator">
-                · {Math.min(runtime.gpu_layers, loaded.block_count)}/{loaded.block_count} on GPU
+            {runtime?.offload ? (
+              // What the engine did, not what it was asked: a CPU run says "CPU" whatever the
+              // setting, and a number that is only the request is marked as such.
+              <span
+                title={runtime.offload_note ?? offloadTitle(runtime.offload)}
+                className={runtime.offload_note ? 'text-amber-700 dark:text-amber-400' : undefined}
+              >
+                · {offloadLabel(runtime.offload, loaded.block_count)}
+                {runtime.offload_note && <Icon name="warning" className="ml-1 inline size-3.5 align-text-bottom" />}
               </span>
+            ) : (
+              runtime?.gpu_layers !== null &&
+              runtime?.gpu_layers !== undefined &&
+              loaded.block_count && (
+                <span title="Layers on the accelerator">
+                  · {Math.min(runtime.gpu_layers, loaded.block_count)}/{loaded.block_count} on GPU
+                </span>
+              )
             )}
           </div>
         )}

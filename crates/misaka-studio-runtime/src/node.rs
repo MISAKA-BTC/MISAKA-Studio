@@ -192,13 +192,13 @@ pub async fn query_status(url: &str) -> NodeStatus {
     }
     // The sink's own header, for its timestamp and lane. A second call because getBlockDagInfo
     // names the sink and says nothing else about it.
-    if let Some(sink) = status.sink.clone() {
-        if let Ok(answer) = wrpc_call(url, "getBlock", json!({ "hash": sink, "includeTransactions": false }), timeout).await {
-            let header = answer.get("block").unwrap_or(&answer).get("header").cloned().unwrap_or(Value::Null);
-            status.sink_timestamp_ms = header.get("timestamp").and_then(Value::as_u64);
-            status.sink_algo_id = header.get("powAlgoId").and_then(Value::as_u64).map(|id| id as u8);
-            status.sink_stand_down_secs = status.sink_algo_id.and_then(heartbeat_stand_down_secs);
-        }
+    if let Some(sink) = status.sink.clone()
+        && let Ok(answer) = wrpc_call(url, "getBlock", json!({ "hash": sink, "includeTransactions": false }), timeout).await
+    {
+        let header = answer.get("block").unwrap_or(&answer).get("header").cloned().unwrap_or(Value::Null);
+        status.sink_timestamp_ms = header.get("timestamp").and_then(Value::as_u64);
+        status.sink_algo_id = header.get("powAlgoId").and_then(Value::as_u64).map(|id| id as u8);
+        status.sink_stand_down_secs = status.sink_algo_id.and_then(heartbeat_stand_down_secs);
     }
     if let Ok(peers) = wrpc_call(url, "getConnectedPeerInfo", json!({}), timeout).await {
         status.peer_count = peers.get("peerInfo").and_then(Value::as_array).map(Vec::len);

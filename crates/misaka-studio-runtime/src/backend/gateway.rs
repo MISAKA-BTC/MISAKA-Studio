@@ -170,6 +170,7 @@ impl InferenceBackend for GatewayBackend {
                 context_size: if facts.n_ctx > 0 { facts.n_ctx } else { request.context_size },
                 gpu_layers: None,
                 load_ms: started.elapsed().as_millis() as u64,
+                offload: None,
             };
             *self.loaded.write().await = Some(loaded.clone());
             Ok(loaded)

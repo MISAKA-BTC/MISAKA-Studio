@@ -34,10 +34,12 @@ spawns its runtime and takes it down again. The Network tab joins the MISAKA net
 *Joining the MISAKA network*). **On the public testnet (testnet-11, Relaunch 5f) the hosted-slot
 path runs end to end from the app**: join, take the faucet's grant, and the slot registers its own
 bond and produces — measured 2026-09-04, bond `56b6bfbd…` from a 12 tMSK grant the app requested,
-with no node on this machine. Not yet done: MLX is wired but has never run on a Mac, no CUDA or
-Metal machine has executed a model here, and a Studio-supervised node has produced on a local
-chain rather than on the public one (that path needs a `kaspad` built for the current release
-beside the app).
+with no node on this machine. **Metal has run a model here** (2026-09-17, M4 Pro: 29/29 layers
+on `MTL0`, 1.06 GB of weights on the device, read from the engine's own log). Not yet done: MLX
+is wired but has never run on a Mac, no CUDA, Vulkan or ROCm machine has executed a model here
+(the installer's builds for them are chosen and unpacked by the same code, unit-tested against
+upstream's asset names), and a Studio-supervised node has produced on a local chain rather than
+on the public one (that path needs a `kaspad` built for the current release beside the app).
 
 ## Quick start
 
@@ -47,8 +49,10 @@ beside the app).
 npm --prefix ui install && npm --prefix ui run build
 cargo build --release                    # misaka-studiod
 
-# 2. An engine. The Studio drives llama.cpp; it does not bundle it.
-#    Install llama.cpp so `llama-server` is on PATH, or point the setting at your own build.
+# 2. An engine. The Studio drives llama.cpp; it does not bundle it — it installs it.
+#    Settings → Backend → "Install a llama.cpp build" downloads upstream's build for this
+#    machine's GPU (Metal / CUDA / Vulkan / ROCm), verifies it, and points the setting at it.
+#    Or install llama.cpp yourself so `llama-server` is on PATH, or name your own build.
 
 # 3. Run — from any directory; the UI travels inside the binary
 ./target/release/misaka-studiod
@@ -135,8 +139,13 @@ never appears as a model until it is one.
 takes the engine with it, not the app — and the engine can be updated without rebuilding the
 Studio.
 
-**GPU offload is planned, not guessed.** "Auto" computes how many layers fit after the KV cache and
-scratch buffers are accounted for, and says so in the UI: `23/33 on GPU`.
+**GPU offload is planned, not guessed — and then checked.** "Auto" asks the engine which devices it
+can drive (`llama-server --list-devices`), computes how many layers fit on that device after the KV
+cache and scratch buffers are accounted for, and reads the engine's own load log for where the
+weights actually went. The model bar shows the result — `29/29 on MTL0` — or `CPU`, with the reason
+beside it. A `llama-server` from a package repository is usually a CPU-only build that takes
+`--n-gpu-layers 99` in silence; the Studio now says so, and Settings → Backend installs the build
+that would use the card.
 
 ## Joining the MISAKA network
 

@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub mod devices;
 pub mod gateway;
 pub mod llamacpp;
 pub mod misaka;
@@ -114,11 +115,16 @@ pub struct LoadRequest {
 pub struct LoadedModel {
     pub model_id: String,
     pub context_size: u32,
-    /// Layers actually on the accelerator, when the engine reports it.
+    /// Layers on the accelerator: what the engine's own account says when it gave one
+    /// (`offload`), otherwise what was asked for. `Some(0)` is a CPU run.
     pub gpu_layers: Option<u32>,
     /// How long the load took. The number people want when deciding whether to keep a model
     /// resident.
     pub load_ms: u64,
+    /// What became of the offload request, with the evidence for it. `None` for engines that have
+    /// no accelerator to speak of (the integer runtime, a remote gateway, the mock).
+    #[serde(default)]
+    pub offload: Option<devices::Offload>,
 }
 
 /// An engine, behind one interface.
@@ -148,6 +154,16 @@ pub trait InferenceBackend: Send + Sync {
     /// The stream is `'static` so the HTTP layer can hand it straight to a response body without
     /// borrowing the backend for the life of the request.
     fn generate(&self, request: GenerationRequest) -> BoxFuture<'_, crate::Result<BoxStream<'static, crate::Result<StreamEvent>>>>;
+
+    /// The devices this engine can put layers on, from the engine itself.
+    ///
+    /// `None` means the engine cannot say — it is the answer for engines with no offload at all
+    /// and for a `llama-server` too old to list its devices — and the caller then plans from the
+    /// hardware probe as it always did. `Some(empty)` is a definite "none": a CPU-only build on a
+    /// machine that may well have a GPU, which is the case the planner must not offload into.
+    fn devices(&self) -> BoxFuture<'_, Option<Vec<devices::EngineDevice>>> {
+        Box::pin(async { None })
+    }
 }
 
 /// Whether a backend can be used here, and if not, what would fix it.

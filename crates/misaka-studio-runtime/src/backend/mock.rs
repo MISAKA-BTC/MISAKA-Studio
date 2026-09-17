@@ -82,8 +82,13 @@ impl InferenceBackend for MockBackend {
 
     fn load(&self, request: LoadRequest) -> BoxFuture<'_, Result<LoadedModel>> {
         Box::pin(async move {
-            let model =
-                LoadedModel { model_id: request.model_id, context_size: request.context_size, gpu_layers: Some(0), load_ms: 0 };
+            let model = LoadedModel {
+                model_id: request.model_id,
+                context_size: request.context_size,
+                gpu_layers: Some(0),
+                load_ms: 0,
+                offload: None,
+            };
             *self.loaded.lock().expect("mock lock") = Some(model.clone());
             Ok(model)
         })

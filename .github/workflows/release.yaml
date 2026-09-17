@@ -199,5 +199,8 @@ jobs:
             binaries in a folder. Unzip it anywhere and run `misaka-studio.exe`; keep `resources/`
             beside it, which is where the app looks for its runtime. No admin, no installer.
 
-            Chat needs an inference engine the Studio does not bundle: install llama.cpp so
-            `llama-server` is on PATH. Mining does not need it.
+            Chat needs an inference engine the Studio does not bundle. Open Settings → Backend
+            and press *Download and install*: the Studio fetches upstream llama.cpp's build for
+            this machine's GPU (Metal on Apple Silicon; CUDA, Vulkan or ROCm on Windows and
+            Linux), verifies it and uses it. Or install llama.cpp yourself so `llama-server` is
+            on PATH. Mining does not need it.

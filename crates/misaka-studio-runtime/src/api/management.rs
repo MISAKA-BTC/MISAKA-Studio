@@ -42,6 +42,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/models/{id}/hash", post(hash_model))
         .route("/runtime", get(runtime_status))
         .route("/runtime/backends", get(backends))
+        .nest("/engines", crate::api::engines::router())
         .route("/catalog/search", get(search))
         .route("/catalog/repo/{*repo}", get(repo))
         .route("/downloads", get(list_downloads).post(start_download))

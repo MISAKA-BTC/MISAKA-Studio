@@ -20,6 +20,7 @@
 //! Studio-built engine would fill those in — that is the upgrade path, not a thing to pretend
 //! about now.
 
+use super::devices::{EngineProbe, Offload, probe_program};
 use super::mock::async_stream;
 use super::{Availability, GenerationRequest, LoadRequest, LoadedModel, StreamEvent, Usage, approximate_tokens};
 use crate::{Error, Result};
@@ -47,6 +48,9 @@ const HEALTH_POLL: Duration = Duration::from_millis(250);
 /// backends has a name where the reader meets it.
 pub type ArgsBuilder = Box<dyn Fn(&LoadRequest, u16) -> Vec<String> + Send + Sync>;
 
+/// Reads what an engine did with an offload request out of its log, given the request.
+pub type OffloadReader = fn(&[String], Option<u32>) -> Option<Offload>;
+
 /// What a concrete backend must supply.
 pub struct ChildEngineConfig {
     /// Backend name, as it appears in records: `llamacpp`, `mlx`.
@@ -67,6 +71,12 @@ pub struct ChildEngineConfig {
     pub startup_timeout: Duration,
     /// Extra environment for the child.
     pub env: Vec<(String, String)>,
+    /// Read what the engine did with the offload request out of its load log, given the request.
+    ///
+    /// `None` for engines whose log says nothing about devices. The reader runs once, right after
+    /// the health wait, while the load lines are still in the buffer — a request or two later
+    /// they have scrolled out.
+    pub offload_from_log: Option<OffloadReader>,
 }
 
 struct Running {
@@ -102,6 +112,17 @@ impl ChildEngine {
     /// The engine's recent output, newest last.
     pub fn recent_log(&self) -> Vec<String> {
         self.log.lock().expect("log lock").iter().cloned().collect()
+    }
+
+    /// The program itself.
+    pub fn program(&self) -> &std::path::Path {
+        &self.config.program
+    }
+
+    /// What this binary is and what it can drive — `--version` and `--list-devices`, cached per
+    /// file. See [`super::devices`].
+    pub async fn probe(&self) -> EngineProbe {
+        probe_program(&self.config.program).await
     }
 
     fn push_log(log: &Arc<Mutex<VecDeque<String>>>, line: String) {
@@ -156,10 +177,17 @@ impl ChildEngine {
         command
             .args(&args)
             .envs(self.config.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // If the Studio dies, the engine must not survive holding 20 GB of VRAM.
             .kill_on_drop(true);
+        // Its own directory, not the Studio's: every path on the command line is absolute, and a
+        // working directory the child cannot read (a TCC-protected folder on macOS) is a hang at
+        // startup — see `devices::run`.
+        if let Some(dir) = self.config.program.parent().filter(|d| d.is_dir()) {
+            command.current_dir(dir);
+        }
 
         tracing::info!(program = %self.config.program.display(), ?args, "starting engine");
         let mut child = command.spawn().map_err(|e| Error::Engine {
@@ -231,11 +259,14 @@ impl ChildEngine {
         if context_size != request.context_size {
             tracing::info!(asked = request.context_size, engine = context_size, "the engine reports its own context window");
         }
+        // The engine's account of the offload, while its load lines are still in the buffer.
+        let offload = self.config.offload_from_log.and_then(|read| read(&self.recent_log(), request.gpu_layers));
         let model = LoadedModel {
             model_id: request.model_id.clone(),
             context_size,
-            gpu_layers: request.gpu_layers,
+            gpu_layers: offload.as_ref().and_then(|o| o.layers).or(request.gpu_layers),
             load_ms: started.elapsed().as_millis() as u64,
+            offload,
         };
         *self.running.write().await = Some(Running { child, port, model: model.clone() });
         tracing::info!(model = %model.model_id, ms = model.load_ms, "engine ready");

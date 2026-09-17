@@ -14,6 +14,7 @@ import { bytes } from '../lib/format'
 import type { BackendInfo, Settings } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { Field, Icon, Section, Toggle } from './common'
+import { EnginePanel } from './EnginePanel'
 
 export function SettingsView() {
   const settings = useStudio((s) => s.settings)
@@ -86,7 +87,12 @@ export function SettingsView() {
             </ul>
           )}
 
-          <Field label="llama-server path" hint="Leave empty to use the one on PATH, or the one packaged beside the app.">
+          {/* Whether the GPU is in play is the engine's to answer, and the install that changes the
+              answer lives here rather than in a README: the person whose model is slow is on this
+              page already. */}
+          <EnginePanel onUsePath={(path) => set('backend', { ...draft.backend, llama_server_path: path })} />
+
+          <Field label="llama-server path" hint="Leave empty to use the one on PATH, or the one packaged beside the app. Installing a build above fills this in.">
             <input
               className="input mt-1"
               placeholder="/usr/local/bin/llama-server"
@@ -137,7 +143,10 @@ export function SettingsView() {
             </select>
           </Field>
 
-          <Field label="GPU offload">
+          <Field
+            label="GPU offload"
+            hint="Auto asks the engine which devices it has and fits as many layers as its free memory allows. A CPU-only engine gets none whatever this says — the model bar shows what actually happened."
+          >
             <select
               className="input mt-1"
               value={draft.backend.gpu_layers.mode}

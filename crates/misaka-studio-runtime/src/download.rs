@@ -277,6 +277,105 @@ impl DownloadManager {
         Ok(progress)
     }
 
+    /// Download one file that is not a model: an engine archive, today.
+    ///
+    /// The same transfer as [`Self::start`] — resumable, verified against `expected_sha256`,
+    /// cancellable from the Downloads panel — without the model bookkeeping (no sidecar, no
+    /// rescan). `repo`, `file` and `label` are what the panel shows; `label` stands where a model
+    /// id would. A destination that already exists and matches the digest is reused as is; one
+    /// that does not match is replaced.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch(
+        self: &Arc<Self>,
+        id: String,
+        repo: String,
+        file: String,
+        label: String,
+        url: String,
+        destination: PathBuf,
+        expected_sha256: Option<String>,
+        expected_size: Option<u64>,
+    ) -> Result<DownloadProgress> {
+        {
+            let jobs = self.jobs.read().await;
+            if let Some(job) = jobs.get(&id)
+                && matches!(job.progress.status, DownloadStatus::Downloading | DownloadStatus::Verifying)
+            {
+                return Ok(job.progress.clone());
+            }
+        }
+        if let Some(parent) = destination.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| Error::io(parent.display(), e))?;
+        }
+
+        let mut progress = DownloadProgress {
+            id: id.clone(),
+            repo,
+            file,
+            model_id: label,
+            destination: destination.clone(),
+            downloaded: 0,
+            total: expected_size,
+            bytes_per_second: 0.0,
+            status: DownloadStatus::Downloading,
+            error: None,
+        };
+
+        // Already here from an earlier run? Only if the bytes say so.
+        if tokio::fs::metadata(&destination).await.is_ok() {
+            let reusable = match &expected_sha256 {
+                Some(expected) => {
+                    let path = destination.clone();
+                    let actual = tokio::task::spawn_blocking(move || sha256_file_sync(&path)).await.ok().and_then(|r| r.ok());
+                    actual.is_some_and(|a| a.eq_ignore_ascii_case(expected))
+                }
+                None => false,
+            };
+            if reusable {
+                progress.status = DownloadStatus::Completed;
+                if let Some(total) = progress.total {
+                    progress.downloaded = total;
+                }
+                self.jobs
+                    .write()
+                    .await
+                    .insert(id.clone(), Job { progress: progress.clone(), cancel: Arc::new(AtomicBool::new(false)) });
+                let _ = self.events.send(progress.clone());
+                return Ok(progress);
+            }
+            let _ = tokio::fs::remove_file(&destination).await;
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.jobs.write().await.insert(id.clone(), Job { progress: progress.clone(), cancel: cancel.clone() });
+        let _ = self.events.send(progress.clone());
+
+        let manager = self.clone();
+        tokio::spawn(async move {
+            match manager.run(&id, url, None, destination, expected_sha256, cancel).await {
+                Ok(_) => manager.finish(&id, DownloadStatus::Completed, None).await,
+                Err(Error::Cancelled) => manager.finish(&id, DownloadStatus::Cancelled, None).await,
+                Err(e) => manager.finish(&id, DownloadStatus::Failed, Some(e.to_string())).await,
+            }
+        });
+        Ok(progress)
+    }
+
+    /// Wait for a download to reach a terminal status. `None` when there is no such download.
+    pub async fn wait(&self, id: &str) -> Option<DownloadProgress> {
+        let mut events = self.subscribe();
+        loop {
+            let current = self.get(id).await?;
+            if !matches!(current.status, DownloadStatus::Downloading | DownloadStatus::Verifying) {
+                return Some(current);
+            }
+            match events.recv().await {
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return self.get(id).await,
+            }
+        }
+    }
+
     /// The transfer itself. Returns the verified digest when one could be established.
     async fn run(
         &self,

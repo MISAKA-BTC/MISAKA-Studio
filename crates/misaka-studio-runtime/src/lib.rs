@@ -26,6 +26,7 @@ pub mod api;
 pub mod backend;
 pub mod catalog;
 pub mod download;
+pub mod engines;
 pub mod error;
 pub mod metrics;
 pub mod mining_queue;

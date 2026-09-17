@@ -1,15 +1,16 @@
 //! The llama.cpp backend — `llama-server`, supervised.
 //!
-//! This is the default engine on every platform the Studio targets: CUDA on Windows and Linux,
-//! Metal on Apple Silicon, plain CPU everywhere else. It is also the one the MISAKA network's PALW
-//! work already uses, which matters for the long path — the artifacts a validator pins are
-//! llama.cpp GGUFs under a pinned llama.cpp build.
+//! This is the default engine on every platform the Studio targets: CUDA or Vulkan on Windows and
+//! Linux, Metal on Apple Silicon, plain CPU everywhere else. It is also the one the MISAKA
+//! network's PALW work already uses, which matters for the long path — the artifacts a validator
+//! pins are llama.cpp GGUFs under a pinned llama.cpp build.
 //!
 //! # Finding the binary
 //!
 //! Three places, in order, because each is right for a different kind of user:
 //!
-//! 1. **The configured path** — someone who built llama.cpp with flags they care about.
+//! 1. **The configured path** — someone who built llama.cpp with flags they care about, or the
+//!    build the Studio installed for them (`crate::engines` writes this setting).
 //! 2. **Next to the Studio executable** — the packaged desktop app ships an engine beside itself.
 //! 3. **`PATH`** — a developer with `llama-server` installed system-wide.
 //!
@@ -17,7 +18,16 @@
 //! keeps running on the mock backend rather than failing to start. A local-LLM app that refuses
 //! to open because an engine is missing has made the user's first problem unsolvable from inside
 //! the app.
+//!
+//! # What the engine can drive
+//!
+//! `--n-gpu-layers` is a request. Whether anything honours it depends on the **build** — a
+//! `llama-server` from a package repository is usually CPU-only and accepts the flag in silence.
+//! So this backend asks the binary first (`--list-devices`, see [`super::devices`]) and, for an
+//! engine new enough to answer, loads at `-lv 4` so the engine's own buffer report says where the
+//! weights went. Both answers travel with the loaded model, evidence attached.
 
+use super::devices::{EngineDevice, accelerator_tag_for, offload_from_devices, offload_from_log};
 use super::openai_child::{ChildEngine, ChildEngineConfig};
 use super::{Availability, GenerationRequest, InferenceBackend, LoadRequest, LoadedModel, StreamEvent};
 use crate::Result;
@@ -25,32 +35,36 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use misaka_studio_core::provenance::RuntimeDescriptor;
 use misaka_studio_core::settings::FlashAttention;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub struct LlamaCppBackend {
     engine: ChildEngine,
-    accelerator_tag: String,
+    /// The tag the hardware probe suggests. Used only when the engine cannot say for itself.
+    probed_accelerator_tag: String,
 }
 
 impl LlamaCppBackend {
     /// `configured` is `backend.llama_server_path`; `accelerator_tag` is `cuda`, `metal`, `rocm`
-    /// or `cpu` and becomes part of the determinism class, because the same source built for a
-    /// different accelerator is different arithmetic.
+    /// or `cpu` from the hardware probe. The engine's own device list overrides it when known,
+    /// because the same source built for a different accelerator is different arithmetic — and a
+    /// CPU-only build on a CUDA machine is the CPU's arithmetic, whatever the card.
     pub fn new(configured: Option<PathBuf>, accelerator_tag: impl Into<String>, startup_timeout: Duration) -> Self {
         let program = resolve_program(configured);
         LlamaCppBackend {
-            accelerator_tag: accelerator_tag.into(),
+            probed_accelerator_tag: accelerator_tag.into(),
             engine: ChildEngine::new(ChildEngineConfig {
                 name: "llamacpp",
-                program,
+                program: program.clone(),
                 args: Box::new(build_args),
                 // llama-server answers /health with 503 while the model loads and 200 once it is
                 // ready, which is exactly the signal a supervisor needs.
                 health_path: "/health",
                 context_from_health: None,
                 startup_timeout,
-                env: Vec::new(),
+                env: library_path_env(&program),
+                offload_from_log: Some(offload_from_log),
             }),
         }
     }
@@ -58,14 +72,39 @@ impl LlamaCppBackend {
     pub fn recent_log(&self) -> Vec<String> {
         self.engine.recent_log()
     }
+
+    /// The binary this backend will run.
+    pub fn program(&self) -> &Path {
+        self.engine.program()
+    }
+}
+
+/// Where a resolved engine came from — shown beside the path, because "which llama-server is
+/// this" is the first question when offload does not happen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramSource {
+    /// `backend.llama_server_path`.
+    Configured,
+    /// Beside the Studio's own executable, or in `engines/` beside it.
+    BesideApp,
+    /// Found on `PATH`.
+    Path,
+    /// Nowhere: the bare name, so the error names what is missing.
+    Missing,
 }
 
 /// Where the engine binary is.
 pub fn resolve_program(configured: Option<PathBuf>) -> PathBuf {
-    let exe_name = if cfg!(windows) { "llama-server.exe" } else { "llama-server" };
+    resolve_program_with_source(configured).0
+}
+
+/// Where the engine binary is, and how it was found.
+pub fn resolve_program_with_source(configured: Option<PathBuf>) -> (PathBuf, ProgramSource) {
+    let exe_name = engine_file_name();
 
     if let Some(path) = configured {
-        return path;
+        return (path, ProgramSource::Configured);
     }
     // Beside the Studio's own executable: how the packaged app ships an engine.
     if let Ok(exe) = std::env::current_exe()
@@ -73,16 +112,21 @@ pub fn resolve_program(configured: Option<PathBuf>) -> PathBuf {
     {
         for candidate in [dir.join(exe_name), dir.join("engines").join(exe_name)] {
             if candidate.is_file() {
-                return candidate;
+                return (candidate, ProgramSource::BesideApp);
             }
         }
     }
     if let Some(found) = which(exe_name) {
-        return found;
+        return (found, ProgramSource::Path);
     }
     // Not found: return the bare name so the error names the thing that is missing rather than
     // an absolute path that never existed.
-    PathBuf::from(exe_name)
+    (PathBuf::from(exe_name), ProgramSource::Missing)
+}
+
+/// `llama-server`, or `llama-server.exe`.
+pub fn engine_file_name() -> &'static str {
+    if cfg!(windows) { "llama-server.exe" } else { "llama-server" }
 }
 
 /// A minimal `which`, to avoid a dependency for eleven lines.
@@ -91,11 +135,35 @@ fn which(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&path).map(|dir| dir.join(name)).find(|c| c.is_file())
 }
 
+/// The environment an engine needs to find the libraries beside it.
+///
+/// A release tarball is `llama-server` plus `libllama.so`, `libggml-vulkan.so` and the rest in
+/// one directory, and on Linux a binary finds a library beside itself only if it was linked with
+/// `$ORIGIN` in its rpath — which upstream's has not always been. Putting the binary's own
+/// directory first on `LD_LIBRARY_PATH` costs nothing when the rpath is right and is the
+/// difference between "GPU" and "cannot open shared object file" when it is not. macOS uses
+/// `@rpath`/`@loader_path` and strips `DYLD_*` for hardened binaries; Windows searches the
+/// executable's directory by default. Neither needs help.
+fn library_path_env(program: &Path) -> Vec<(String, String)> {
+    if !cfg!(target_os = "linux") {
+        return Vec::new();
+    }
+    let Some(dir) = program.parent().filter(|d| d.is_dir()) else { return Vec::new() };
+    let mut value = dir.display().to_string();
+    if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH").filter(|v| !v.is_empty()) {
+        value.push(':');
+        value.push_str(&existing.to_string_lossy());
+    }
+    vec![("LD_LIBRARY_PATH".to_string(), value)]
+}
+
 /// The command line.
 ///
 /// Conservative on purpose: only flags `llama-server` has accepted for years, because a user's
 /// engine build may be any age and an unknown flag makes it exit with a usage message instead of
-/// loading. Anything newer goes through `backend.extra_args`, where the user owns the risk.
+/// loading. Anything newer goes through `backend.extra_args`, where the user owns the risk — and
+/// through [`LlamaCppBackend::load`], which adds `-lv 4` only to an engine it has already seen
+/// answer `--list-devices`, a flag of the same vintage.
 fn build_args(request: &LoadRequest, port: u16) -> Vec<String> {
     let mut args = vec![
         "--model".into(),
@@ -148,28 +216,72 @@ fn build_args(request: &LoadRequest, port: u16) -> Vec<String> {
     args
 }
 
+/// The verbosity at which `llama-server` narrates the load: `device_info`, `using device …`,
+/// `offloaded N/M layers` and the per-device buffer sizes. Its default (3) prints none of them.
+const LOAD_LOG_VERBOSITY: &str = "4";
+
 impl InferenceBackend for LlamaCppBackend {
     fn name(&self) -> &'static str {
         "llamacpp"
     }
 
     fn descriptor(&self) -> BoxFuture<'_, RuntimeDescriptor> {
-        Box::pin(async move { self.engine.descriptor(&self.accelerator_tag).await })
+        Box::pin(async move {
+            let probe = self.engine.probe().await;
+            let tag = accelerator_tag_for(probe.devices.as_deref()).unwrap_or(self.probed_accelerator_tag.as_str());
+            self.engine.descriptor(tag).await
+        })
     }
 
     fn availability(&self) -> BoxFuture<'_, Availability> {
         Box::pin(async {
-            self.engine
+            let availability = self
+                .engine
                 .availability(
-                    "Install llama.cpp (its `llama-server` binary), or set backend.llama_server_path in Settings \
-                     to a build you already have.",
+                    "Install llama.cpp (its `llama-server` binary) — Settings → Backend can download a build for this \
+                     machine's GPU — or set backend.llama_server_path to a build you already have.",
                 )
-                .await
+                .await;
+            // Say what the build can drive, beside its version: the line people read when a model
+            // is slow, and the difference between a Metal build and a CPU one is not in the banner.
+            match availability {
+                Availability::Available { detail } => {
+                    let probe = self.engine.probe().await;
+                    let devices = match probe.devices.as_deref() {
+                        Some([]) => " · CPU-only build (no GPU device)".to_string(),
+                        Some(list) => match super::devices::first_gpu(list) {
+                            Some(gpu) => format!(" · GPU: {}", gpu.label()),
+                            None => " · CPU-only build (no GPU device)".to_string(),
+                        },
+                        None => " · too old to list its devices".to_string(),
+                    };
+                    Availability::Available { detail: format!("{detail}{devices}") }
+                }
+                unavailable => unavailable,
+            }
         })
     }
 
     fn load(&self, request: LoadRequest) -> BoxFuture<'_, Result<LoadedModel>> {
-        Box::pin(async move { self.engine.load(request).await })
+        Box::pin(async move {
+            let probe = self.engine.probe().await;
+            let mut request = request;
+            if probe.devices.is_some() {
+                // An engine that answers `--list-devices` also takes `-lv`; both arrived with the
+                // same argument parser. First, so the user's own `extra_args` can still override.
+                request.extra_args.splice(0..0, ["-lv".to_string(), LOAD_LOG_VERBOSITY.to_string()]);
+            }
+            let asked = request.gpu_layers;
+            let mut loaded = self.engine.load(request).await?;
+            if loaded.offload.is_none() {
+                // The log did not say (an old engine, or the lines are gone): the device list is
+                // the next best witness, and it says which kind of witness it is.
+                let offload = offload_from_devices(probe.devices.as_deref(), asked);
+                loaded.gpu_layers = offload.layers;
+                loaded.offload = Some(offload);
+            }
+            Ok(loaded)
+        })
     }
 
     fn unload(&self) -> BoxFuture<'_, Result<()>> {
@@ -182,6 +294,10 @@ impl InferenceBackend for LlamaCppBackend {
 
     fn generate(&self, request: GenerationRequest) -> BoxFuture<'_, Result<BoxStream<'static, Result<StreamEvent>>>> {
         Box::pin(async move { self.engine.generate(request).await })
+    }
+
+    fn devices(&self) -> BoxFuture<'_, Option<Vec<EngineDevice>>> {
+        Box::pin(async move { self.engine.probe().await.devices })
     }
 }
 
@@ -255,6 +371,9 @@ mod tests {
         assert!(!joined.contains("--n-gpu-layers"));
         assert!(!joined.contains("--threads"));
         assert!(!joined.contains("--flash-attn"), "auto says nothing at all: {joined}");
+        // The verbosity that reads the placement is not part of the base command line: it is
+        // added at load, and only for an engine known to accept it.
+        assert!(!joined.contains("-lv"), "{joined}");
     }
 
     /// The 400-with-a-C++-message bug: a model with no template of its own must have one supplied,
@@ -283,5 +402,28 @@ mod tests {
     fn a_configured_path_wins() {
         let configured = PathBuf::from("/opt/llama/llama-server");
         assert_eq!(resolve_program(Some(configured.clone())), configured);
+        assert_eq!(resolve_program_with_source(Some(configured.clone())).1, ProgramSource::Configured);
+    }
+
+    /// An engine nobody installed resolves to its bare name and says so, so that the message a
+    /// user sees names `llama-server` and not a path that never existed.
+    #[test]
+    fn a_missing_engine_is_named_not_pathed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let empty_path = dir.path().display().to_string();
+        // A PATH with nothing on it, restored afterwards; `which` reads the real one otherwise.
+        let saved = std::env::var_os("PATH");
+        unsafe { std::env::set_var("PATH", &empty_path) };
+        let (program, source) = resolve_program_with_source(None);
+        match saved {
+            Some(v) => unsafe { std::env::set_var("PATH", v) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        if source == ProgramSource::Missing {
+            assert_eq!(program, PathBuf::from(engine_file_name()));
+        } else {
+            // A packaged layout with an engine beside the test binary is a legitimate find.
+            assert_eq!(source, ProgramSource::BesideApp);
+        }
     }
 }

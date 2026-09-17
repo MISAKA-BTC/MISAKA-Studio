@@ -5,6 +5,7 @@
 //! the app reports what it chose and why, because a person whose model is unexpectedly slow
 //! needs to see "23 of 33 layers offloaded, VRAM was the limit" rather than a spinner.
 
+use crate::backend::devices::{EngineDevice, Offload, OffloadEvidence, first_gpu};
 use crate::backend::llamacpp::{LlamaCppBackend, accelerator_tag};
 use crate::backend::misaka::MisakaBackend;
 use crate::backend::mlx::MlxBackend;
@@ -41,6 +42,8 @@ pub struct LoadedState {
     /// `None` until the file has been hashed.
     pub identity: Option<ModelIdentity>,
     pub backend: String,
+    /// A sentence for the user when the offload that happened is not the one that was asked for.
+    pub offload_note: Option<String>,
 }
 
 /// What the UI shows about the current runtime.
@@ -51,6 +54,10 @@ pub struct RuntimeStatus {
     pub model_id: Option<String>,
     pub context_size: Option<u32>,
     pub gpu_layers: Option<u32>,
+    /// What became of the offload request, with its evidence. See [`crate::backend::devices`].
+    pub offload: Option<Offload>,
+    /// Why `gpu_layers` is not what the settings asked for, when it is not.
+    pub offload_note: Option<String>,
     pub load_ms: Option<u64>,
     pub runtime_hash: Option<String>,
     pub runtime_class_id: Option<String>,
@@ -70,6 +77,8 @@ pub struct AppState {
     pub records: RwLock<Arc<RecordStore>>,
     /// Prompts waiting to be — or already — mined behind the chat. See `crate::mining_queue`.
     pub mining: Arc<crate::mining_queue::MiningQueue>,
+    /// Installs a `llama-server` built for this machine's GPU. See `crate::engines`.
+    pub engines: Arc<crate::engines::EngineInstaller>,
     catalog: RwLock<Arc<Catalog>>,
     backend: RwLock<SharedBackend>,
     loaded: RwLock<Option<LoadedState>>,
@@ -97,6 +106,7 @@ impl AppState {
 
         let node = Arc::new(crate::node::NodeManager::with_journal(Some(data_dir.join("produced-blocks.jsonl"))));
         let mining = crate::mining_queue::MiningQueue::open(data_dir.join("mining-queue.json")).await;
+        let engines = Arc::new(crate::engines::EngineInstaller::new(data_dir.join("engines").join("llama.cpp")));
         let app = Arc::new(AppState {
             settings: RwLock::new(settings),
             settings_path,
@@ -108,6 +118,7 @@ impl AppState {
             node,
             records: RwLock::new(records),
             mining,
+            engines,
             catalog: RwLock::new(catalog),
             backend: RwLock::new(backend),
             loaded: RwLock::new(None),
@@ -375,7 +386,11 @@ impl AppState {
 
         let context_size =
             context_override.or(settings.generation.context_size).unwrap_or_else(|| model.recommended_context(&self.hardware) as u32);
-        let gpu_layers = plan_gpu_layers(&model, &self.hardware, context_size as u64, settings.backend.gpu_layers);
+        // The engine's own device list, when it has one: a CPU-only build on a machine with a
+        // card must plan for the CPU, and a Vulkan build on a card the probe cannot see must plan
+        // for the card.
+        let devices = backend.devices().await;
+        let gpu_layers = plan_gpu_layers(&model, &self.hardware, devices.as_deref(), context_size as u64, settings.backend.gpu_layers);
 
         let loaded = backend
             .load(LoadRequest {
@@ -401,7 +416,11 @@ impl AppState {
         // recorded rather than recomputed. Unloading does not put the configured one back: what
         // matters is which engine holds the model, and after an unload none does.
         *self.backend.write().await = backend.clone();
-        let state = LoadedState { model, loaded, runtime, identity, backend: backend.name().to_string() };
+        let offload_note = offload_note(settings.backend.gpu_layers, loaded.offload.as_ref(), &self.hardware);
+        if let Some(note) = &offload_note {
+            tracing::warn!(model = %model.id, "{note}");
+        }
+        let state = LoadedState { model, loaded, runtime, identity, backend: backend.name().to_string(), offload_note };
         *self.loaded.write().await = Some(state.clone());
         Ok(self.status_from(Some(&state), true).await)
     }
@@ -444,6 +463,8 @@ impl AppState {
                 model_id: Some(s.model.id.clone()),
                 context_size: Some(s.loaded.context_size),
                 gpu_layers: s.loaded.gpu_layers,
+                offload: s.loaded.offload.clone(),
+                offload_note: s.offload_note.clone(),
                 load_ms: Some(s.loaded.load_ms),
                 runtime_hash: Some(s.runtime.h_r.to_hex()),
                 runtime_class_id: Some(s.runtime.class_id.to_hex()),
@@ -456,6 +477,8 @@ impl AppState {
                 model_id: None,
                 context_size: None,
                 gpu_layers: None,
+                offload: None,
+                offload_note: None,
                 load_ms: None,
                 runtime_hash: None,
                 runtime_class_id: None,
@@ -732,7 +755,18 @@ pub fn build_backend_kind(kind: BackendKind, settings: &Settings, hardware: &Har
 /// the compute overhead, divided by the per-layer weight size. What is left is what can be
 /// offloaded, and offloading one layer more is an out-of-memory error at load time — the failure
 /// this function exists to avoid.
-pub fn plan_gpu_layers(model: &LocalModel, hardware: &HardwareSnapshot, context: u64, setting: GpuLayers) -> Option<u32> {
+///
+/// `engine_devices` is what the engine itself can drive, when it could be asked. It outranks the
+/// hardware probe in both directions: a CPU-only build gets no layers however good the card, and a
+/// Vulkan build that sees a card `nvidia-smi` and `rocm-smi` do not gets the card's memory as its
+/// budget. `None` — an engine too old to say — leaves the probe's answer as it was.
+pub fn plan_gpu_layers(
+    model: &LocalModel,
+    hardware: &HardwareSnapshot,
+    engine_devices: Option<&[EngineDevice]>,
+    context: u64,
+    setting: GpuLayers,
+) -> Option<u32> {
     let total_layers = model.block_count.unwrap_or(0) as u32;
     match setting {
         GpuLayers::None => return Some(0),
@@ -743,15 +777,18 @@ pub fn plan_gpu_layers(model: &LocalModel, hardware: &HardwareSnapshot, context:
         GpuLayers::Auto => {}
     }
 
-    if !hardware.has_gpu() {
+    let budget = match engine_devices {
+        // The engine has a device: its own free-memory figure is the budget, or the probe's for
+        // the same device when the engine did not report one.
+        Some(devices) => match first_gpu(devices) {
+            Some(gpu) => gpu.usable_bytes().or_else(|| probed_budget(hardware)),
+            None => return Some(0),
+        },
+        None => probed_budget(hardware),
+    };
+    let Some(budget) = budget else {
         return Some(0);
-    }
-    let budget = hardware
-        .accelerators
-        .iter()
-        .filter(|a| a.kind != misaka_studio_core::hardware::AcceleratorKind::Cpu)
-        .filter_map(|a| a.usable_memory)
-        .max()?;
+    };
 
     let requirements = model.requirements(context);
     if requirements.total_bytes <= budget {
@@ -765,6 +802,57 @@ pub fn plan_gpu_layers(model: &LocalModel, hardware: &HardwareSnapshot, context:
     let per_layer = (requirements.weights_bytes / total_layers as u64).max(1);
     let for_weights = budget.saturating_sub(requirements.kv_cache_bytes).saturating_sub(requirements.overhead_bytes);
     Some(((for_weights / per_layer) as u32).min(total_layers))
+}
+
+/// The largest accelerator pool the hardware probe found, if it found one.
+fn probed_budget(hardware: &HardwareSnapshot) -> Option<u64> {
+    hardware
+        .accelerators
+        .iter()
+        .filter(|a| a.kind != misaka_studio_core::hardware::AcceleratorKind::Cpu)
+        .filter_map(|a| a.usable_memory)
+        .max()
+}
+
+/// **Why the model is on the CPU, when it was not meant to be.**
+///
+/// One sentence, or none. Written for the person who set "Auto" or "All layers", watched a model
+/// answer at CPU speed, and has a right to know whether that was the engine, the card, or the
+/// setting — and what to do about it. Silent when what happened is what was asked for.
+pub fn offload_note(setting: GpuLayers, offload: Option<&Offload>, hardware: &HardwareSnapshot) -> Option<String> {
+    let offload = offload?;
+    let probed_gpu =
+        hardware.accelerators.iter().find(|a| a.kind != misaka_studio_core::hardware::AcceleratorKind::Cpu).map(|a| a.name.clone());
+    let idle_card = probed_gpu.as_deref().map(|name| format!(" This machine's {name} is idle.")).unwrap_or_default();
+    let install = " Settings → Backend can install a llama.cpp build that uses the GPU.";
+
+    match (setting, offload.evidence) {
+        // Nothing asked for, nothing to explain.
+        (GpuLayers::None, _) => None,
+        // Asked for layers, got none, and the engine's own device list says why.
+        (_, OffloadEvidence::DeviceList) if offload.asked_but_none_landed() => {
+            Some(format!("No layers were offloaded: this llama-server is a CPU-only build.{idle_card}{install}"))
+        }
+        // Auto found nothing to offload to, from the engine's list.
+        (GpuLayers::Auto, OffloadEvidence::DeviceList) if offload.asked == Some(0) => {
+            Some(format!("Running on the CPU: this llama-server lists no GPU device.{idle_card}{install}"))
+        }
+        // The log itself shows the weights on the CPU after a request to offload them.
+        (_, OffloadEvidence::EngineLog) if offload.asked_but_none_landed() => Some(format!(
+            "No layers were offloaded: the engine put every model buffer in system memory (asked for {}).{idle_card}{install}",
+            offload.asked.unwrap_or(0)
+        )),
+        // Auto, planned from the probe, and the probe had nothing.
+        (GpuLayers::Auto, OffloadEvidence::EngineLog) if offload.asked == Some(0) && offload.layers == Some(0) => {
+            probed_gpu.is_none().then(|| "Running on the CPU: no GPU was detected on this machine.".to_string())
+        }
+        // The engine could not be asked and did not say: the number shown is the request.
+        (_, OffloadEvidence::Unverified) if offload.asked.is_some_and(|n| n > 0) => Some(format!(
+            "This llama-server is too old to say whether it used the GPU; the {} layers shown are the request, not a measurement.{install}",
+            offload.asked.unwrap_or(0)
+        )),
+        _ => None,
+    }
 }
 
 /// **The file and the engine, checked against each other.**
@@ -873,30 +961,108 @@ mod tests {
 
     #[test]
     fn a_model_that_fits_is_fully_offloaded() {
-        let layers = plan_gpu_layers(&model(8, 32), &machine(64, Some(24)), 4096, GpuLayers::Auto);
+        let layers = plan_gpu_layers(&model(8, 32), &machine(64, Some(24)), None, 4096, GpuLayers::Auto);
         assert_eq!(layers, Some(33), "every layer plus the output tensor");
+    }
+
+    fn engine_gpu(free_mib: u64) -> Vec<EngineDevice> {
+        vec![EngineDevice {
+            id: "Vulkan0".into(),
+            description: "Test GPU".into(),
+            backend: "vulkan".into(),
+            kind: crate::backend::devices::EngineDeviceKind::Gpu,
+            total_mib: Some(free_mib + 512),
+            free_mib: Some(free_mib),
+        }]
+    }
+
+    /// The tester's machine: a card the probe cannot see (no `nvidia-smi`, no `rocm-smi`), and a
+    /// Vulkan engine that can. The engine's word is enough to offload.
+    #[test]
+    fn an_engine_that_sees_a_gpu_the_probe_missed_offloads_to_it() {
+        let devices = engine_gpu(24 * 1024);
+        let layers = plan_gpu_layers(&model(8, 32), &machine(32, None), Some(&devices), 4096, GpuLayers::Auto);
+        assert_eq!(layers, Some(33));
+    }
+
+    /// The other direction, and the one the field reported: a card the probe DOES see, and an
+    /// engine built without any GPU backend. Offloading into it would be a request the engine
+    /// silently ignores — and a `28/28 on GPU` in the UI.
+    #[test]
+    fn a_cpu_only_engine_gets_no_layers_however_good_the_card() {
+        let layers = plan_gpu_layers(&model(8, 32), &machine(64, Some(24)), Some(&[]), 4096, GpuLayers::Auto);
+        assert_eq!(layers, Some(0));
+        // An explicit setting is still passed through: the engine ignores it, and the note says so.
+        assert_eq!(plan_gpu_layers(&model(8, 32), &machine(64, Some(24)), Some(&[]), 4096, GpuLayers::All), Some(33));
+    }
+
+    /// The engine's free-memory figure is the budget when it gives one: it is measured on the
+    /// device the layers will actually go to.
+    #[test]
+    fn the_engines_own_memory_figure_sets_the_budget() {
+        let small = engine_gpu(4 * 1024);
+        let layers = plan_gpu_layers(&model(40, 60), &machine(128, Some(24)), Some(&small), 4096, GpuLayers::Auto).expect("a plan");
+        assert!(layers < 10, "a 4 GiB card cannot take much of a 40 GiB model: {layers}");
+    }
+
+    fn offload(asked: Option<u32>, layers: Option<u32>, evidence: OffloadEvidence) -> Offload {
+        Offload { asked, layers, total_layers: None, device: None, accelerator_bytes: None, cpu_bytes: None, evidence }
+    }
+
+    /// The sentences a person gets, and — as important — the silences.
+    #[test]
+    fn the_note_names_the_cause_and_stays_quiet_when_nothing_is_wrong() {
+        let with_card = machine(64, Some(24));
+        let no_card = machine(32, None);
+
+        // A CPU-only build on a machine with a card: the exact field report.
+        let note =
+            offload_note(GpuLayers::Auto, Some(&offload(Some(33), Some(0), OffloadEvidence::DeviceList)), &with_card).expect("a note");
+        assert!(note.contains("CPU-only build"), "{note}");
+        assert!(note.contains("GPU is idle"), "the card is named as idle: {note}");
+        assert!(note.contains("Settings"), "and the remedy is where to click: {note}");
+
+        // Auto planned zero because the engine lists no device.
+        let note =
+            offload_note(GpuLayers::Auto, Some(&offload(Some(0), Some(0), OffloadEvidence::DeviceList)), &no_card).expect("a note");
+        assert!(note.contains("lists no GPU device"), "{note}");
+
+        // The log shows the weights in system memory after a request.
+        let note =
+            offload_note(GpuLayers::All, Some(&offload(Some(29), Some(0), OffloadEvidence::EngineLog)), &no_card).expect("a note");
+        assert!(note.contains("system memory"), "{note}");
+
+        // Too old to say.
+        let note =
+            offload_note(GpuLayers::Auto, Some(&offload(Some(9), Some(9), OffloadEvidence::Unverified)), &no_card).expect("a note");
+        assert!(note.contains("too old"), "{note}");
+
+        // Silences: the user chose the CPU; the offload happened; nothing is loaded.
+        assert_eq!(offload_note(GpuLayers::None, Some(&offload(Some(0), Some(0), OffloadEvidence::DeviceList)), &with_card), None);
+        assert_eq!(offload_note(GpuLayers::Auto, Some(&offload(Some(29), Some(29), OffloadEvidence::EngineLog)), &with_card), None);
+        assert_eq!(offload_note(GpuLayers::Auto, None, &with_card), None);
     }
 
     /// The case the whole function exists for: too big for the card, so some layers stay on the
     /// CPU. Offloading them all would be an out-of-memory error at load.
     #[test]
     fn a_model_that_does_not_fit_is_split() {
-        let layers = plan_gpu_layers(&model(40, 60), &machine(128, Some(24)), 4096, GpuLayers::Auto).expect("a plan");
+        let layers = plan_gpu_layers(&model(40, 60), &machine(128, Some(24)), None, 4096, GpuLayers::Auto).expect("a plan");
         assert!(layers > 0 && layers < 60, "expected a partial offload, got {layers}");
     }
 
     #[test]
     fn without_a_gpu_nothing_is_offloaded() {
-        assert_eq!(plan_gpu_layers(&model(8, 32), &machine(32, None), 4096, GpuLayers::Auto), Some(0));
+        assert_eq!(plan_gpu_layers(&model(8, 32), &machine(32, None), None, 4096, GpuLayers::Auto), Some(0));
     }
 
     #[test]
     fn explicit_settings_win_over_the_estimate() {
         let m = model(40, 60);
         let h = machine(128, Some(24));
-        assert_eq!(plan_gpu_layers(&m, &h, 4096, GpuLayers::All), Some(61));
-        assert_eq!(plan_gpu_layers(&m, &h, 4096, GpuLayers::None), Some(0));
-        assert_eq!(plan_gpu_layers(&m, &h, 4096, GpuLayers::Fixed { layers: 7 }), Some(7));
+        assert_eq!(plan_gpu_layers(&m, &h, None, 4096, GpuLayers::All), Some(61));
+        assert_eq!(plan_gpu_layers(&m, &h, None, 4096, GpuLayers::None), Some(0));
+        assert_eq!(plan_gpu_layers(&m, &h, None, 4096, GpuLayers::Fixed { layers: 7 }), Some(7));
     }
 
     /// A long context eats the offload budget: the same model and card must offload fewer layers
@@ -905,8 +1071,8 @@ mod tests {
     fn context_length_takes_layers_off_the_gpu() {
         let m = model(20, 48);
         let h = machine(128, Some(24));
-        let short = plan_gpu_layers(&m, &h, 4096, GpuLayers::Auto).expect("a plan");
-        let long = plan_gpu_layers(&m, &h, 131_072, GpuLayers::Auto).expect("a plan");
+        let short = plan_gpu_layers(&m, &h, None, 4096, GpuLayers::Auto).expect("a plan");
+        let long = plan_gpu_layers(&m, &h, None, 131_072, GpuLayers::Auto).expect("a plan");
         assert!(long < short, "short={short} long={long}");
     }
 }

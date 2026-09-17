@@ -152,7 +152,7 @@ impl MiningQueue {
 
     pub async fn list(&self) -> Vec<MiningJob> {
         let mut jobs = self.jobs.read().await.clone();
-        jobs.sort_by(|a, b| b.created_ms.cmp(&a.created_ms));
+        jobs.sort_by_key(|job| std::cmp::Reverse(job.created_ms));
         jobs
     }
 
@@ -449,7 +449,7 @@ async fn run_job(job: &MiningJob, url: &str, token: Option<&str>) -> std::result
             if pass == 0
                 && let Some(room) = crate::backend::gateway::ceiling_from_refusal(&message)
             {
-                ceiling = room.min(ANSWER_TOKENS).max(1);
+                ceiling = room.clamp(1, ANSWER_TOKENS);
                 continue;
             }
             let transient = status.is_server_error()

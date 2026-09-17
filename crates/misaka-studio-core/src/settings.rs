@@ -259,10 +259,12 @@ pub enum NetworkRole {
 
 /// The MISAKA node this Studio watches or supervises.
 ///
-/// `Default` is written out rather than derived because one field has to default to *on*, and a
-/// derived `Default` would silently make it `false` — which is the difference between a fresh
-/// install that can mine and one that cannot, decided by a missing line.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Every field's default is the type's own — `None`, empty, off. `install_default_class_artifact`
+/// used to be the exception (on, so a fresh install could mine a model class) and its `Default`
+/// was written out to say so; since testnet-11 Relaunch 5f it is off as well (see the field), and
+/// a derived `Default` states the same thing without a second copy of the field list to keep in
+/// step.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NodeSettings {
     /// Path to the `kaspad` binary (the misakas node keeps upstream's binary name). `None` means
@@ -325,9 +327,12 @@ pub struct NodeSettings {
     /// Fetch the default class's artifact (`palw::DEFAULT_CLASS`) on first run, so a machine that
     /// just downloaded the Studio can mine a model class without hunting for a file.
     ///
-    /// On by default. It is a 1.7 GiB verified download that appears in the download list like
-    /// any other and can be cancelled there; turn it off for a metered connection, or for a
-    /// machine that is only ever going to chat.
+    /// It is a 1.7 GiB verified download that appears in the download list like any other and
+    /// can be cancelled there. **Off by default since testnet-11 Relaunch 5f (2026-09-03)**: the
+    /// dense class's material (~750 MB per job) is above the gossip cap, so its blocks do not
+    /// cross the public links and a node that holds the artifact only pays bandwidth for it.
+    /// Rewards today come from the floor; the artifact is a click away in Models → Discover when
+    /// the transport fix lands.
     pub install_default_class_artifact: bool,
     /// Base URL of a miner pool (`…/pool`), for mining without running a node here. The pool
     /// hosts the producer; joining it needs nothing but funding the slot it hands back.
@@ -361,38 +366,6 @@ pub enum MiningMode {
     Inline,
     /// The chat answers locally; prompts are mined from a queue behind it.
     Background,
-}
-
-impl Default for NodeSettings {
-    fn default() -> Self {
-        NodeSettings {
-            kaspad_path: None,
-            misaka_cli_path: None,
-            misaka_rpc: None,
-            rpc_url: None,
-            network: NodeNetwork::default(),
-            role: NetworkRole::default(),
-            mining_address: None,
-            producer_key_path: None,
-            producer_bond: None,
-            fee_outpoint: None,
-            producer_class: None,
-            class_artifact: None,
-            register_class: None,
-            appdir: None,
-            extra_args: Vec::new(),
-            // Off since testnet-11 Relaunch 5f (2026-09-03): the dense class's material (~750 MB per
-            // job) is above the gossip cap, so its blocks do not cross the public links and a node that
-            // holds the artifact only pays bandwidth for it. Rewards today come from the floor; the
-            // artifact is a click away in Models → Discover when the transport fix lands.
-            install_default_class_artifact: false,
-            pool_url: None,
-            pool_slot_id: None,
-            pool_slot_token: None,
-            palw_gateway_url: None,
-            mining_mode: MiningMode::default(),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

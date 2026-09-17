@@ -39,6 +39,8 @@ impl MlxBackend {
                 context_from_health: None,
                 startup_timeout,
                 env: Vec::new(),
+                // MLX is Metal or nothing; its server does not narrate a placement.
+                offload_from_log: None,
             }),
         }
     }

@@ -29,6 +29,8 @@ import type {
   SeedReadiness,
   SeedOutcome,
   RegistrationReadiness,
+  EnginesView,
+  InstallStatus,
 } from './types'
 
 /**
@@ -95,6 +97,13 @@ export const api = {
 
   runtime: () => request<RuntimeStatus>('/api/v1/runtime'),
   backends: () => request<BackendInfo[]>('/api/v1/runtime/backends'),
+
+  // The engine and its GPU: what the resolved llama-server can drive, and the builds that could
+  // replace it. Installing one is a background job; its status is polled.
+  engines: () => request<EnginesView>('/api/v1/engines'),
+  engineInstallStatus: () => request<InstallStatus>('/api/v1/engines/install'),
+  installEngine: (flavor: string, tag?: string | null) =>
+    request<InstallStatus>('/api/v1/engines/install', { method: 'POST', body: JSON.stringify({ flavor, tag: tag ?? null }) }),
 
   search: (q: string, limit = 24) => request<CatalogEntry[]>(`/api/v1/catalog/search?q=${encodeURIComponent(q)}&limit=${limit}`),
   repo: (id: string) => request<CatalogRepo>(`/api/v1/catalog/repo/${id}`),

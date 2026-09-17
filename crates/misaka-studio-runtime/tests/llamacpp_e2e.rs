@@ -56,6 +56,8 @@ async fn studio(engine: PathBuf, models: PathBuf) -> (std::sync::Arc<AppState>, 
         backend: BackendSettings {
             kind: BackendKind::LlamaCpp,
             llama_server_path: Some(engine),
+            // Everything: the fixture is one layer, and the point is to see where it lands.
+            gpu_layers: misaka_studio_core::settings::GpuLayers::All,
             // The fixture is tiny; a long wait would only hide a hang.
             startup_timeout_secs: 90,
             // Left at Auto — the default, which passes no flag at all. An earlier version of this
@@ -94,6 +96,36 @@ async fn a_real_engine_loads_streams_and_identifies_itself() {
     assert_ne!(descriptor.engine_commit, "unknown", "the engine's version banner should have parsed");
     assert!(descriptor.engine_build_number > 0, "a real build number");
     assert!(status.runtime_hash.is_some() && status.runtime_class_id.is_some());
+
+    // 2b. It says where the model went — from the engine, not from the request. A current engine
+    //     answers `--list-devices`, is loaded at `-lv 4`, and its buffer report is the evidence;
+    //     the number has to agree with the device list either way. On a GPU build (Metal on a Mac,
+    //     CUDA/Vulkan elsewhere) layers land on a named device; on CI's CPU build none do, and the
+    //     status says so instead of echoing the request.
+    let offload = status.offload.clone().expect("the llama.cpp backend reports its offload");
+    let devices = state.backend().await.devices().await;
+    eprintln!("devices: {devices:?}\noffload: {offload:?}\nnote: {:?}", status.offload_note);
+    match devices.as_deref().and_then(misaka_studio_runtime::backend::devices::first_gpu) {
+        Some(gpu) => {
+            assert_eq!(
+                offload.evidence,
+                misaka_studio_runtime::backend::devices::OffloadEvidence::EngineLog,
+                "a current engine narrates its load"
+            );
+            assert!(offload.layers.is_some_and(|n| n > 0), "layers went to {}: {offload:?}", gpu.id);
+            assert!(offload.device.as_deref().is_some_and(|d| d.starts_with(&gpu.id)), "the device is the listed one: {offload:?}");
+            assert!(offload.accelerator_bytes.is_some_and(|b| b > 0));
+            assert_eq!(status.offload_note, None, "nothing to explain when the offload happened");
+        }
+        None => {
+            assert_eq!(offload.layers, Some(0), "a CPU-only build puts nothing on a GPU: {offload:?}");
+            assert_eq!(status.gpu_layers, Some(0), "and the status does not echo the request");
+            if devices.is_some() {
+                assert!(status.offload_note.as_deref().is_some_and(|n| n.contains("CPU-only")), "{:?}", status.offload_note);
+            }
+        }
+    }
+    assert_eq!(status.gpu_layers, offload.layers, "one number, not two");
 
     // 3. It streams. Deltas arrive, then exactly one Done carrying usage from the engine.
     let params = SamplingCommitment { temperature: 0.0, max_tokens: 16, ..Default::default() };

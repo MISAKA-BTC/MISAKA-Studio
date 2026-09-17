@@ -66,6 +66,8 @@ impl MisakaBackend {
                 context_from_health: Some(|health| health.get("max_position").and_then(serde_json::Value::as_u64).map(|n| n as u32)),
                 startup_timeout,
                 env: Vec::new(),
+                // Integer arithmetic on the CPU, by construction: there is no placement to read.
+                offload_from_log: None,
             }),
         }
     }

@@ -76,12 +76,31 @@ export type RuntimeDescriptor = {
   class_tag: string
 }
 
+/** Where an offload report's numbers came from — the engine's log, its device list, or nowhere. */
+export type OffloadEvidence = 'engine_log' | 'device_list' | 'unverified'
+
+/** What became of the layers the Studio asked the engine to put on the GPU. */
+export type Offload = {
+  asked: number | null
+  /** Layers on the accelerator; 0 is a CPU run, null is "not known". */
+  layers: number | null
+  total_layers: number | null
+  /** The device holding the weights, as the engine names it: `MTL0 (Apple M4 Pro)`. */
+  device: string | null
+  accelerator_bytes: number | null
+  cpu_bytes: number | null
+  evidence: OffloadEvidence
+}
+
 export type RuntimeStatus = {
   backend: string
   backend_available: boolean
   model_id: string | null
   context_size: number | null
   gpu_layers: number | null
+  offload: Offload | null
+  /** Why the model is on the CPU when it was not meant to be, or null. */
+  offload_note: string | null
   load_ms: number | null
   runtime_hash: string | null
   runtime_class_id: string | null
@@ -92,6 +111,67 @@ export type RuntimeStatus = {
 export type Availability = { state: 'available'; detail: string } | { state: 'unavailable'; reason: string; remedy: string }
 
 export type BackendInfo = { name: string; selected: boolean; availability: Availability }
+
+// --- the engine and its devices -------------------------------------------
+
+/** One device as `llama-server --list-devices` reports it. */
+export type EngineDevice = {
+  id: string
+  description: string
+  backend: string
+  kind: 'gpu' | 'accel' | 'remote' | 'cpu'
+  total_mib: number | null
+  free_mib: number | null
+}
+
+export type EngineFlavorView = {
+  id: string
+  label: string
+  accelerator: string
+  requires: string
+  download_bytes: number | null
+  recommended: boolean
+}
+
+export type InstallState = 'idle' | 'resolving' | 'downloading' | 'extracting' | 'verifying' | 'done' | 'failed'
+
+export type InstalledEngine = {
+  path: string
+  tag: string
+  flavor: string
+  accelerator: string
+  version: string | null
+  installed_at_unix: number
+  devices: EngineDevice[] | null
+}
+
+export type InstallStatus = {
+  state: InstallState
+  flavor: string | null
+  tag: string | null
+  detail: string
+  download_ids: string[]
+  installed: InstalledEngine | null
+  error: string | null
+  started_ms: number | null
+}
+
+/** `/api/v1/engines`: the engine a load would run, what it can drive, and what could replace it. */
+export type EnginesView = {
+  program: string
+  source: 'configured' | 'beside_app' | 'path' | 'missing'
+  version: string | null
+  error: string | null
+  devices: EngineDevice[] | null
+  verdict: 'gpu' | 'cpu_only' | 'unknown' | 'missing'
+  summary: string
+  hardware_gpu: string | null
+  flavors: EngineFlavorView[]
+  recommendation: string | null
+  release: { tag: string | null; error: string | null }
+  install: InstallStatus
+  installed: InstalledEngine[]
+}
 
 export type Accelerator = {
   kind: 'apple_unified' | 'cuda' | 'rocm' | 'vulkan' | 'cpu'

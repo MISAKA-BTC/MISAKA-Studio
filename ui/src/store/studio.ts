@@ -193,6 +193,9 @@ export const useStudio = create<StudioState>()(
           const runtime = await api.loadModel(id, contextSize)
           set({ runtime })
           get().toast('success', `${id} loaded in ${((runtime.load_ms ?? 0) / 1000).toFixed(1)}s`)
+          // The one thing a person cannot see from the chat: that the model is on the CPU when
+          // the setting says otherwise. The note names the cause and where to fix it.
+          if (runtime.offload_note) get().toast('info', runtime.offload_note)
         } catch (error) {
           get().toast('error', (error as Error).message)
         } finally {

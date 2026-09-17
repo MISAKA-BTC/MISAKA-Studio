@@ -274,14 +274,28 @@ template.
 
 | Platform | Engine | Status |
 |---|---|---|
-| macOS, Apple Silicon | llama.cpp (Metal), or MLX | Unified memory is modelled properly; MLX is implemented and untested on hardware |
-| Windows / Linux, NVIDIA | llama.cpp (CUDA) | `nvidia-smi` supplies device memory and utilisation |
-| Windows / Linux, AMD | llama.cpp (ROCm) | `rocm-smi` parsed by header name |
+| macOS, Apple Silicon | llama.cpp (Metal), or MLX | Unified memory is modelled properly; **Metal verified on an M4 Pro** (29/29 layers on `MTL0`); MLX is implemented and untested on hardware |
+| Windows / Linux, NVIDIA | llama.cpp (CUDA, or Vulkan) | `nvidia-smi` supplies device memory and utilisation; the installer picks CUDA 12 or 13 by driver version |
+| Windows / Linux, AMD | llama.cpp (ROCm, or Vulkan) | `rocm-smi` parsed by header name; Vulkan when ROCm is absent |
+| Windows / Linux, anything else | llama.cpp (Vulkan) | Finds GPUs the vendor tools cannot see; runs on the CPU when there is none, and says so |
 | Anywhere | llama.cpp (CPU) | Always available; the fit verdict says what it will cost |
 
-The Studio does not bundle an engine. A packaged build may ship `llama-server` beside the
-executable (the resolver looks there first); otherwise the user's own build is used, which is what
-someone who compiled with specific flags wants.
+The Studio does not bundle an engine; it **installs** one (`crate::engines`). Upstream publishes a
+build per accelerator with each release, with a SHA-256 per asset in the release API. Settings →
+Backend lists the builds for this platform, recommends one from the hardware probe, downloads it
+through the model pipeline (resumable, verified), unpacks it under the data directory, runs it
+(`--version`, `--list-devices`) and only then writes `backend.llama_server_path`. A packaged build
+may also ship `llama-server` beside the executable (the resolver looks there first), and the
+user's own build is used when named, which is what someone who compiled with specific flags wants.
+
+**Whether the GPU is used is the engine's word, not the setting's** (`backend::devices`). Before
+a load the backend asks `llama-server --list-devices`; the planner's "Auto" budget is the device's
+own free memory, and a CPU-only build gets zero layers however good the card. The load runs at
+`-lv 4` on any engine that answered, and the engine's buffer report (`MTL0_Mapped model buffer
+size = 1059.89 MiB`) is what `RuntimeStatus.offload` carries — with its evidence, because the
+engine's `offloaded 29/29 layers to GPU` line is printed even under `--device none` (measured),
+so a layer count is believed only when a device holds bytes. The accelerator in `h_R`'s class tag
+comes from the same list: a CPU-only engine on a CUDA machine is tagged `cpu`.
 
 ## 7. Adding a backend
 
@@ -307,8 +321,11 @@ processes, not bundled. No closed-source application was used, copied, or revers
 
 * **MLX is untested on hardware.** The code path exists and reports itself unavailable off Apple
   Silicon; nobody has run it on a Mac yet. llama.cpp, by contrast, is verified end to end (§5a).
-* **No CUDA or Metal machine has run this.** The detection, the offload planning and the class
-  tags are written and unit-tested; what has actually executed a model here is a CPU build.
+* **No CUDA, Vulkan or ROCm machine has run this.** Metal has (2026-09-17, M4 Pro: the Studio
+  loaded a GGUF at 29/29 layers on `MTL0` and read 1.06 GB of weights on the device from the
+  engine's log). The other builds are chosen, downloaded, unpacked and probed by the same code,
+  unit-tested against upstream's published asset names; what is unverified is that a CUDA or
+  Vulkan `llama-server` from upstream's archive runs on a tester's machine as unpacked.
 * **`BackendKind::Misaka` refuses to run**, which is the intended state until the in-tree runtime
   is wired: it reports unavailable with a remedy and errors on load, rather than handing the work
   to llama.cpp under a record that names MISAKA. It is listed in `/api/v1/runtime/backends` so it
