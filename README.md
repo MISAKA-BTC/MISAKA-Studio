@@ -135,6 +135,15 @@ say).
 file is checked against *that*, not against itself. A partial download lives in a `.part` file and
 never appears as a model until it is one.
 
+**A conversation fits the model's window, and you can see how.** A class registered at 512
+tokens holds a question and an answer, not a conversation. Each request carries, in order: the
+system prompt and the question; the conversation's **pinned notes** (standing facts you pin from
+the chat, kept ahead of all history); recent turns whole; and a memory of the older ones — an
+extract of each earlier result, or a summary from a local GGUF model if one is chosen under
+Settings → Context. Prompts are counted with the class's own tokenizer (fetched beside its
+artifact and verified against a pinned digest) rather than estimated. Under every reply that was
+fitted, one line says what the model was given, and a click shows the messages exactly as sent.
+
 **The engine is a child process, not a library.** A model that crashes llama.cpp on a driver fault
 takes the engine with it, not the app — and the engine can be updated without rebuilding the
 Studio.

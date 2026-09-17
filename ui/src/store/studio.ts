@@ -25,6 +25,7 @@ import type {
   Settings,
   SystemInfo,
   TurnStats,
+  ContextReport,
 } from '../lib/types'
 
 export type View = 'chat' | 'models' | 'network' | 'monitor' | 'settings'
@@ -80,6 +81,10 @@ type StudioState = {
   regenerate: () => Promise<void>
   continueGeneration: () => Promise<void>
   editMessage: (messageId: string, content: string) => Promise<void>
+  /** Pinned notes on the active conversation: standing facts the context manager keeps. */
+  addPin: (text: string) => void
+  updatePin: (index: number, text: string) => void
+  removePin: (index: number) => void
   stop: () => void
   isGenerating: () => boolean
 
@@ -269,6 +274,33 @@ export const useStudio = create<StudioState>()(
       },
 
       selectConversation: (id) => set({ activeConversationId: id }),
+
+      addPin: (text) => {
+        const pin = text.trim()
+        const id = get().activeConversationId
+        if (!pin || !id) return
+        set((s) => ({
+          conversations: s.conversations.map((c) =>
+            c.id === id && !(c.pinned ?? []).includes(pin) ? { ...c, pinned: [...(c.pinned ?? []), pin], updatedAt: Date.now() } : c,
+          ),
+        }))
+      },
+
+      updatePin: (index, text) => {
+        const id = get().activeConversationId
+        if (!id) return
+        set((s) => ({
+          conversations: s.conversations.map((c) =>
+            c.id === id ? { ...c, pinned: (c.pinned ?? []).map((p, i) => (i === index ? text : p)).filter((p) => p.trim()) } : c,
+          ),
+        }))
+      },
+
+      removePin: (index) => {
+        const id = get().activeConversationId
+        if (!id) return
+        set((s) => ({ conversations: s.conversations.map((c) => (c.id === id ? { ...c, pinned: (c.pinned ?? []).filter((_, i) => i !== index) } : c)) }))
+      },
 
       deleteConversation: (id) =>
         set((s) => {
@@ -462,7 +494,7 @@ async function runGeneration(
         : {},
     )
 
-  const commit = (patch: { error?: string; stats?: TurnStats } = {}) =>
+  const commit = (patch: { error?: string; stats?: TurnStats; context?: ContextReport } = {}) =>
     set((s) => {
       const stream = s.streaming
       // A stale SSE completion must not overwrite a reply started afterwards.
@@ -499,6 +531,7 @@ async function runGeneration(
   let added = ''
   let text = baseContent
   let stoppedForRepetition = false
+  let context: ContextReport | undefined
   let streamError: string | undefined
   let stats: TurnStats | undefined
 
@@ -514,12 +547,15 @@ async function runGeneration(
         repeat_penalty: settings?.generation.repeat_penalty,
         max_tokens: settings?.generation.max_tokens,
         seed: settings?.generation.seed ?? null,
+        misaka: { pinned: conversation.pinned ?? [] },
       },
       controller.signal,
     )
 
     for await (const event of generator) {
-      if (event.type === 'delta') {
+      if (event.type === 'context') {
+        context = event.report
+      } else if (event.type === 'delta') {
         if (firstTokenAt === null) firstTokenAt = performance.now()
         added += event.text
         text = baseContent ? joinContinuation(baseContent, added) : added
@@ -546,16 +582,16 @@ async function runGeneration(
       }
     }
     if (stoppedForRepetition) {
-      commit({ error: repetitionNote })
+      commit({ error: repetitionNote, context })
     } else {
-      commit({ error: streamError, stats })
+      commit({ error: streamError, stats, context })
     }
   } catch (error) {
     if (stoppedForRepetition) {
       commit({ error: repetitionNote })
     } else if ((error as Error).name === 'AbortError') {
       // A stopped generation keeps what it produced: the user asked it to stop, not to undo.
-      commit()
+      commit({ context })
     } else {
       commit({ error: (error as Error).message })
       get().toast('error', (error as Error).message)

@@ -131,15 +131,19 @@ impl LocalModel {
     /// Models now ship 256 k trained context. Defaulting to it on a 16 GB laptop reserves more
     /// KV cache than the machine has and the load fails — with an out-of-memory message that
     /// blames the model rather than the setting. So the default is the largest power-of-two
-    /// context whose total still fits, floor 2048.
+    /// context whose total still fits, floor 2048 — or the model's own window, when that is
+    /// smaller. A class artifact whose rotary table holds 512 positions was being offered, and
+    /// memory-billed, at 2048: a context it cannot run at, on the card that is supposed to say
+    /// what the model holds.
     pub fn recommended_context(&self, hardware: &HardwareSnapshot) -> u64 {
+        const FLOOR: u64 = 2048;
         let trained = self.context_length.unwrap_or(4096).min(131_072);
         let budget = hardware.best_usable_memory();
         let mut ctx = trained;
-        while ctx > 2048 && self.requirements(ctx).total_bytes > budget {
+        while ctx > FLOOR && self.requirements(ctx).total_bytes > budget {
             ctx /= 2;
         }
-        ctx.max(2048)
+        ctx.max(FLOOR.min(trained))
     }
 
     /// Can this machine run it, and how comfortably.
@@ -351,5 +355,11 @@ mod tests {
         // A workstation should not be punished for the laptop's limits.
         let workstation = machine(256, Some(("H100", 80)));
         assert!(model.recommended_context(&workstation) >= ctx);
+
+        // A window smaller than the floor is the window: never offered wider than the model holds.
+        let small = LocalModel { context_length: Some(512), ..model.clone() };
+        assert_eq!(small.recommended_context(&laptop), 512);
+        let floor_class = LocalModel { context_length: Some(12), ..model };
+        assert_eq!(floor_class.recommended_context(&workstation), 12);
     }
 }

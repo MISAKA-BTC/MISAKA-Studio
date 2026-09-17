@@ -13,7 +13,9 @@ use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use misaka_studio_core::palw;
-use misaka_studio_core::palw::{PalwArtifactSource, PalwClassStatus, TESTNET11_CLASSES, assess_classes};
+use misaka_studio_core::palw::{
+    PalwArtifactSource, PalwClassReadiness, PalwClassStatus, TESTNET11_CLASSES, assess_classes, read_artifact_header,
+};
 use misaka_studio_core::settings::{NetworkRole, NodeNetwork};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -76,7 +78,7 @@ async fn overview(State(state): State<Arc<AppState>>) -> Result<Json<NetworkOver
     let settings = state.settings.read().await.clone();
     let node = state.node.view(&settings.node).await?;
     let artifacts = artifact_scan(&state).await;
-    let classes = assess_classes(&artifacts, state.hardware.total_memory);
+    let classes = with_artifact_headers(assess_classes(&artifacts, state.hardware.total_memory));
     let kaspad = crate::node::NodeManager::resolve_kaspad(settings.node.kaspad_path.as_ref());
     Ok(Json(NetworkOverview {
         role: settings.node.role,
@@ -88,9 +90,22 @@ async fn overview(State(state): State<Arc<AppState>>) -> Result<Json<NetworkOver
     }))
 }
 
+/// Read each present artifact's header (64 bytes apiece), so a class card can say what the file on
+/// disk can hold beside what the class was registered at.
+fn with_artifact_headers(mut statuses: Vec<PalwClassStatus>) -> Vec<PalwClassStatus> {
+    for status in &mut statuses {
+        let path = match &status.readiness {
+            PalwClassReadiness::ArtifactPresent { path, .. } | PalwClassReadiness::ArtifactMismatch { path, .. } => path,
+            _ => continue,
+        };
+        status.artifact_header = read_artifact_header(std::path::Path::new(path));
+    }
+    statuses
+}
+
 async fn classes(State(state): State<Arc<AppState>>) -> Json<Vec<PalwClassStatus>> {
     let artifacts = artifact_scan(&state).await;
-    Json(assess_classes(&artifacts, state.hardware.total_memory))
+    Json(with_artifact_headers(assess_classes(&artifacts, state.hardware.total_memory)))
 }
 
 /// Download a class artifact into the models directory, verified against the chain-pinned digest.

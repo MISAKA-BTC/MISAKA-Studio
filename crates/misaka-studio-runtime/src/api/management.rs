@@ -42,6 +42,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/models/{id}/hash", post(hash_model))
         .route("/runtime", get(runtime_status))
         .route("/runtime/backends", get(backends))
+        .route("/context/plan", post(context_plan))
         .nest("/engines", crate::api::engines::router())
         .route("/catalog/search", get(search))
         .route("/catalog/repo/{*repo}", get(repo))
@@ -191,6 +192,41 @@ async fn hash_model(State(state): State<Arc<AppState>>, Path(id): Path<String>) 
         state.resolve_identity().await?;
     }
     Ok(Json(view(&model, &state.hardware)))
+}
+
+#[derive(Deserialize)]
+struct ContextPlanRequest {
+    messages: Vec<crate::backend::ChatMessage>,
+    #[serde(default)]
+    pinned: Vec<String>,
+    #[serde(default)]
+    max_tokens: Option<u64>,
+}
+
+/// **What the loaded model would be sent**, without sending it: the context manager's plan for a
+/// conversation, with the extract in place of any summary (a preview must not start a model).
+async fn context_plan(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ContextPlanRequest>,
+) -> Result<Json<crate::context::ContextReport>> {
+    let loaded = state.loaded().await.ok_or(Error::NoModelLoaded)?;
+    let counter = state.token_counter_for(&loaded.model).await;
+    let max_tokens = match body.max_tokens {
+        Some(n) => n,
+        None => state.settings.read().await.generation.max_tokens,
+    };
+    let continues = state.backend().await.continues_assistant_turn();
+    let draft = crate::context::plan(&crate::context::PlanInputs {
+        messages: &body.messages,
+        pinned: &body.pinned,
+        window: loaded.loaded.context_size as u64,
+        max_tokens,
+        counter: &counter,
+        engine_continues_turns: continues,
+        count_scale_permille: 1000,
+    })
+    .map_err(Error::bad_request)?;
+    Ok(Json(draft.finish(None, &counter, None).report))
 }
 
 async fn runtime_status(State(state): State<Arc<AppState>>) -> Json<RuntimeStatus> {

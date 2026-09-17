@@ -17,8 +17,16 @@
 //! `top_k`, `min_p` and `repeat_penalty` are not OpenAI fields; they are what local engines
 //! actually expose, and leaving them out would make the Studio's own UI unable to use its own
 //! API. They are additive — a client that never sends them gets the configured defaults.
+//!
+//! # The `misaka` extension
+//!
+//! A chat request may carry `"misaka": {"pinned": ["…"]}` — the conversation's pinned notes, which
+//! the context manager keeps ahead of history (`crate::context`). What the manager decided comes
+//! back as `misaka.context`: on the role-only opening chunk of a stream, and on the response of a
+//! non-streaming call. Both are fields OpenAI clients ignore.
 
 use crate::backend::{ChatMessage, StreamEvent, Usage};
+use crate::context::ContextReport;
 use crate::state::AppState;
 use crate::{Error, Result};
 use axum::extract::State;
@@ -96,6 +104,16 @@ pub struct ChatCompletionRequest {
     pub stream: bool,
     #[serde(flatten)]
     pub sampling: SamplingFields,
+    #[serde(default)]
+    pub misaka: Option<MisakaChatExtension>,
+}
+
+/// The Studio's additions to a chat request.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct MisakaChatExtension {
+    /// The conversation's pinned notes.
+    #[serde(default)]
+    pub pinned: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,8 +174,9 @@ async fn chat_completions(State(state): State<Arc<AppState>>, Json(request): Jso
     let defaults = state.settings.read().await.generation.sampling();
     let (params, stop) = request.sampling.resolve(defaults);
 
-    let stream = state.generate(request.messages, None, params, stop).await?;
-    Ok(if request.stream { sse_response(stream, model, true) } else { aggregate(stream, model, true).await? })
+    let pinned = request.misaka.map(|m| m.pinned).unwrap_or_default();
+    let (context, stream) = state.generate_managed(request.messages, None, params, stop, pinned).await?;
+    Ok(if request.stream { sse_response(stream, model, true, context) } else { aggregate(stream, model, true, context).await? })
 }
 
 async fn completions(State(state): State<Arc<AppState>>, Json(request): Json<CompletionRequest>) -> Result<Response> {
@@ -166,7 +185,7 @@ async fn completions(State(state): State<Arc<AppState>>, Json(request): Json<Com
     let (params, stop) = request.sampling.resolve(defaults);
 
     let stream = state.generate(Vec::new(), Some(request.prompt), params, stop).await?;
-    Ok(if request.stream { sse_response(stream, model, false) } else { aggregate(stream, model, false).await? })
+    Ok(if request.stream { sse_response(stream, model, false, None) } else { aggregate(stream, model, false, None).await? })
 }
 
 fn now() -> u64 {
@@ -183,6 +202,7 @@ async fn aggregate(
     mut stream: futures_util::stream::BoxStream<'static, Result<StreamEvent>>,
     model: String,
     chat: bool,
+    context: Option<ContextReport>,
 ) -> Result<Response> {
     let mut text = String::new();
     let mut usage = Usage::default();
@@ -203,19 +223,27 @@ async fn aggregate(
     } else {
         serde_json::json!({ "index": 0, "text": text, "finish_reason": finish_reason })
     };
-    Ok(Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "id": id,
         "object": if chat { "chat.completion" } else { "text_completion" },
         "created": now(),
         "model": model,
         "choices": [choice],
         "usage": usage,
-    }))
-    .into_response())
+    });
+    if let Some(context) = context {
+        body["misaka"] = serde_json::json!({ "context": context });
+    }
+    Ok(Json(body).into_response())
 }
 
 /// Stream the generation as server-sent events, in OpenAI's chunk shape.
-fn sse_response(stream: futures_util::stream::BoxStream<'static, Result<StreamEvent>>, model: String, chat: bool) -> Response {
+fn sse_response(
+    stream: futures_util::stream::BoxStream<'static, Result<StreamEvent>>,
+    model: String,
+    chat: bool,
+    context: Option<ContextReport>,
+) -> Response {
     let id = completion_id(chat);
     let created = now();
     let object = if chat { "chat.completion.chunk" } else { "text_completion" };
@@ -223,10 +251,16 @@ fn sse_response(stream: futures_util::stream::BoxStream<'static, Result<StreamEv
     // The role-only opening chunk. OpenAI sends one and some clients rely on it to open the
     // assistant message before any text arrives.
     let opener = if chat {
-        Some(serde_json::json!({
+        let mut opener = serde_json::json!({
             "id": id, "object": object, "created": created, "model": model,
             "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }]
-        }))
+        });
+        // What the model was sent, before the first token: the client can show it while the
+        // answer streams, and a stream cut short still carried it.
+        if let Some(context) = &context {
+            opener["misaka"] = serde_json::json!({ "context": context });
+        }
+        Some(opener)
     } else {
         None
     };
@@ -278,6 +312,17 @@ mod tests {
         assert_eq!(params.top_k, 40, "an absent field keeps the default");
         assert_eq!(params.max_tokens, 2048);
         assert_eq!(stop, vec!["</s>".to_string()]);
+    }
+
+    /// The extension is optional, and a client that sends it gets its pins read.
+    #[test]
+    fn the_misaka_extension_is_optional_and_read_when_sent() {
+        let plain: ChatCompletionRequest = serde_json::from_str(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+        assert!(plain.misaka.is_none());
+        let pinned: ChatCompletionRequest =
+            serde_json::from_str(r#"{"messages":[{"role":"user","content":"hi"}],"misaka":{"pinned":["P is outside the circle"]}}"#)
+                .unwrap();
+        assert_eq!(pinned.misaka.unwrap().pinned, vec!["P is outside the circle".to_string()]);
     }
 
     #[test]

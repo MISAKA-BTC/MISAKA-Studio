@@ -31,6 +31,7 @@ import type {
   RegistrationReadiness,
   EnginesView,
   InstallStatus,
+  ContextReport,
 } from './types'
 
 /**
@@ -96,6 +97,9 @@ export const api = {
   hashModel: (id: string) => request<ModelView>(`/api/v1/models/${encodeURIComponent(id)}/hash`, { method: 'POST' }),
 
   runtime: () => request<RuntimeStatus>('/api/v1/runtime'),
+  /** What the loaded model would be sent for this conversation, without sending it. */
+  contextPlan: (messages: { role: string; content: string }[], pinned: string[], maxTokens?: number) =>
+    request<ContextReport>('/api/v1/context/plan', { method: 'POST', body: JSON.stringify({ messages, pinned, max_tokens: maxTokens ?? null }) }),
   backends: () => request<BackendInfo[]>('/api/v1/runtime/backends'),
 
   // The engine and its GPU: what the resolved llama-server can drive, and the builds that could
@@ -178,6 +182,7 @@ export type ChatStreamEvent =
   | { type: 'delta'; text: string }
   | { type: 'done'; finishReason: string; usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } }
   | { type: 'error'; message: string }
+  | { type: 'context'; report: ContextReport }
 
 export type ChatRequest = {
   model?: string
@@ -189,6 +194,8 @@ export type ChatRequest = {
   repeat_penalty?: number
   max_tokens?: number
   seed?: number | null
+  /** The Studio's extension: the conversation's pinned notes. */
+  misaka?: { pinned: string[] }
 }
 
 /**
@@ -236,6 +243,8 @@ export async function* streamChat(request: ChatRequest, signal: AbortSignal): As
         yield { type: 'error', message: String(json.error.message ?? 'the runtime reported an error') }
         continue
       }
+      // The opening chunk carries what the context manager sent the model.
+      if (json.misaka?.context) yield { type: 'context', report: json.misaka.context as ContextReport }
       const choice = json.choices?.[0]
       const text = choice?.delta?.content
       if (typeof text === 'string' && text.length > 0) yield { type: 'delta', text }

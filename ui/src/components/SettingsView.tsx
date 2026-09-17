@@ -223,6 +223,48 @@ export function SettingsView() {
           </div>
         </Section>
 
+        <Section
+          title="Context"
+          description="How a conversation is fitted into the model's window. A class registered at 512 tokens holds a question and an answer: each request carries the system prompt and the question, the conversation's pinned notes, recent turns whole, and a memory of the older ones."
+        >
+          <Field
+            label="Memory of older turns"
+            hint="Extract takes each earlier question's first line and the sentence of its answer that states a result: instant, no model, no memory. A local model writes a summary instead — better, and it starts a second llama.cpp engine beside the chat (about the model's size in memory)."
+          >
+            <select
+              className="input mt-1"
+              value={draft.context.summarizer_model ?? ''}
+              onChange={(e) => set('context', { ...draft.context, summarizer_model: e.target.value || null })}
+            >
+              <option value="">Extract — no model</option>
+              {models
+                .filter((model) => model.architecture !== 'palw')
+                .map((model) => (
+                  <option key={model.id} value={model.id}>
+                    Summarise with {model.id}
+                  </option>
+                ))}
+            </select>
+          </Field>
+          <Field
+            label="Tokenizer"
+            hint="What prompts are counted in. Empty uses the class's own tokenizer beside its artifact, then the integer runtime's tokenizer setting, then an estimate that over-counts prose to stay safe on formulas."
+          >
+            <input
+              className="input mt-1"
+              placeholder="/path/to/tokenizer.json"
+              value={draft.context.tokenizer_path ?? ''}
+              onChange={(e) => set('context', { ...draft.context, tokenizer_path: e.target.value || null })}
+            />
+          </Field>
+          <Toggle
+            label="Fetch a class's tokenizer when it is missing"
+            checked={draft.context.fetch_class_tokenizer}
+            onChange={(fetch_class_tokenizer) => set('context', { ...draft.context, fetch_class_tokenizer })}
+            hint="7 MB, from the class's repository, verified against the pinned digest, placed beside the artifact."
+          />
+        </Section>
+
         <Section title="API" description="The OpenAI-compatible endpoint other applications can point at.">
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Host">

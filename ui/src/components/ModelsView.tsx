@@ -11,6 +11,7 @@ import { bytes, count, eta, params, rate, relativeTime, tokens } from '../lib/fo
 import type { CatalogEntry, CatalogRepo, DownloadProgress, HardwareSnapshot } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { EmptyState, FitBadge, Icon, QuantBadge, Spinner } from './common'
+import { ContextBadge } from './ContextBadge'
 import { InstalledMiningArtifacts, MiningCatalog } from './MiningCatalog'
 
 export function ModelsView() {
@@ -162,13 +163,31 @@ function InstalledList() {
                     </span>
                   )}
                   {model.expert_count && <span className="badge bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300">MoE · {model.expert_count} experts</span>}
+                  {model.context_length ? (
+                    <ContextBadge
+                      value={model.context_length}
+                      title={
+                        model.architecture === 'palw'
+                          ? `The artifact's rotary table covers ${model.context_length.toLocaleString()} positions — the widest window this file can run at. The class it mines was registered at its own context; see Mining class artifacts.`
+                          : `Trained context: ${model.context_length.toLocaleString()} tokens, from the GGUF header. It loads at the context shown below, which is sized to this machine's memory.`
+                      }
+                    />
+                  ) : (
+                    model.architecture === 'palw' && (
+                      <span className="badge bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300" title="This artifact format's header is not one the Studio reads, so its context is not shown rather than guessed.">
+                        ctx not read
+                      </span>
+                    )
+                  )}
                 </div>
 
                 <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-xs text-ink-500 dark:text-ink-400">
                   <span>{bytes(model.size_bytes)}</span>
                   {model.parameter_count && <span>{params(model.parameter_count)} params</span>}
                   {model.architecture && <span className="mono">{model.architecture}</span>}
-                  {model.context_length && <span>{tokens(model.context_length)} trained ctx</span>}
+                  {model.context_length && (
+                    <span>{model.architecture === 'palw' ? `${tokens(model.context_length)}-position window` : `${tokens(model.context_length)} trained ctx`}</span>
+                  )}
                   {model.block_count && <span>{model.block_count} layers</span>}
                   {model.modified_at && <span>added {relativeTime(model.modified_at)}</span>}
                 </div>

@@ -24,9 +24,12 @@ export function params(value: number | null | undefined): string {
   return String(value)
 }
 
-/** Context lengths: 128K, 32K, 4096. */
+/** Context lengths: 2M, 128K, 32K, 512, 12 — binary units, which is how windows are sized. */
 export function tokens(value: number | null | undefined): string {
   if (!value) return '—'
+  const MIB = 1 << 20
+  if (value >= MIB && value % MIB === 0) return `${value / MIB}M`
+  if (value >= MIB) return `${(value / MIB).toFixed(1)}M`
   if (value >= 1024 && value % 1024 === 0) return `${value / 1024}K`
   return value.toLocaleString()
 }

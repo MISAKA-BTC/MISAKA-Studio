@@ -62,6 +62,15 @@ pub struct GenerationRequest {
     pub prompt: Option<String>,
     pub params: SamplingCommitment,
     pub stop: Vec<String>,
+    /// The templated prompt's length, counted with the model's own tokenizer, when the context
+    /// manager had one. An engine that sizes its decode ceiling against a fixed window uses it in
+    /// place of its own estimate; `None` means nobody counted exactly.
+    pub prompt_tokens: Option<u64>,
+    /// Ask a reasoning model to answer without thinking first (`chat_template_kwargs.enable_thinking
+    /// = false`). Measured on Qwen3.5-2B: asked for a 120-token summary, it spent all 120 on a
+    /// "Thinking Process" that arrives as `reasoning_content`, and the content was empty. Ignored
+    /// by templates that do not read the flag.
+    pub disable_thinking: bool,
 }
 
 /// Token accounting, in OpenAI's shape.
@@ -237,52 +246,6 @@ pub fn answer_room(max_tokens: u64, window: u64) -> u64 {
     max_tokens.min(window / 2).max(AT_LEAST)
 }
 
-/// **A conversation trimmed to what the model can actually hold.**
-///
-/// A class artifact's context is not a setting: `qwen25-1.5b-a16`'s rotary table covers 512
-/// positions, that number is part of the root the chain registered, and no app can raise it. What
-/// an app CAN do is stop spending it on history the answer does not need — which is what was
-/// happening: every turn re-sent the whole conversation, so a two-character question arrived as
-/// 524 tokens and was refused outright, with nothing generated and nothing to act on.
-///
-/// Keeps the system prompt (it is an instruction, not history — dropping it changes the answer's
-/// language) and the newest turns, and drops from the oldest until the estimate fits. Returns the
-/// kept messages and how many were dropped, so the caller can say so rather than quietly forgetting
-/// what the user typed.
-///
-/// `budget` is the whole context minus whatever room the answer needs; the caller owns that split.
-/// The estimate is [`prompt_tokens_upper_bound`]'s, deliberately high — over-counting drops one
-/// turn too many, under-counting loses the request.
-pub fn fit_messages_to_budget(messages: &[ChatMessage], budget: u64) -> (Vec<ChatMessage>, usize) {
-    if prompt_tokens_upper_bound(messages) <= budget {
-        return (messages.to_vec(), 0);
-    }
-    let (system, rest): (Vec<_>, Vec<_>) = messages.iter().cloned().partition(|m| m.role == "system");
-    // The newest exchange is never dropped: the last user message, and any assistant text after
-    // it. The latter is a reply being CONTINUED, and dropping the question from under it is how
-    // "continue" reached a model as a bare "please continue" with nothing to continue — measured,
-    // on a 512-token class, as a reply that asked what it was supposed to continue. If the
-    // exchange alone does not fit, the caller gets it back and the error it deserves.
-    let last_user = rest.iter().rposition(|m| m.role == "user").unwrap_or(rest.len().saturating_sub(1));
-    let mut kept: Vec<ChatMessage> = rest[last_user..].iter().rev().cloned().collect();
-    for m in rest[..last_user].iter().rev() {
-        let mut candidate = system.clone();
-        candidate.extend(kept.iter().rev().cloned());
-        candidate.push(m.clone());
-        let mut ordered = candidate.clone();
-        ordered.sort_by_key(|x| if x.role == "system" { 0 } else { 1 });
-        if !kept.is_empty() && prompt_tokens_upper_bound(&ordered) > budget {
-            break;
-        }
-        kept.push(m.clone());
-    }
-    kept.reverse();
-    let dropped = rest.len() - kept.len();
-    let mut out = system;
-    out.extend(kept);
-    (out, dropped)
-}
-
 /// **The context an engine's own refusal names.**
 ///
 /// Engines say the same thing two ways. The free-prompt worker counts the whole request —
@@ -301,7 +264,11 @@ pub fn fit_messages_to_budget(messages: &[ChatMessage], budget: u64) -> (Vec<Cha
 /// `Err` is a sentence for the user when not even the question and a useful tail fit — a reply
 /// that already filled the class's window has no room left to be continued, and saying so beats a
 /// continuation of nothing.
-pub fn continuation_as_instruction(messages: &[ChatMessage], budget: u64) -> Result<Vec<ChatMessage>, String> {
+pub fn continuation_as_instruction(
+    messages: &[ChatMessage],
+    budget: u64,
+    counter: &crate::context::tokens::TokenCounter,
+) -> Result<Vec<ChatMessage>, String> {
     /// Below this, the model is not continuing text, it is guessing at a fragment.
     const MIN_TAIL_TOKENS: u64 = 16;
     let Some(last_user) = messages.iter().rposition(|m| m.role == "user") else {
@@ -316,12 +283,12 @@ pub fn continuation_as_instruction(messages: &[ChatMessage], budget: u64) -> Res
     let japanese = question.chars().chain(partial.chars()).any(|c| !c.is_ascii());
     let (header, marker) = if japanese {
         (
-            "上の質問への回答が途中で切れています。すでに書いた部分を繰り返さず、前置きも付けずに、切れた箇所の直後の文字から続きだけを出力してください。",
+            "上の質問への回答が途中で切れました。繰り返さず、前置きなしで、切れた箇所の続きだけを書いてください。",
             "途中までの回答（末尾）:",
         )
     } else {
         (
-            "The answer to the question above was cut off. Do not repeat what was already written and add no preamble: output only the continuation, starting from the character right after where it stopped.",
+            "The answer above was cut off. Do not repeat it and add no preamble: write only what comes next.",
             "The answer so far (its end):",
         )
     };
@@ -332,7 +299,7 @@ pub fn continuation_as_instruction(messages: &[ChatMessage], budget: u64) -> Res
     };
 
     let chars: Vec<char> = partial.chars().collect();
-    let fits = |start: usize| prompt_tokens_upper_bound(&compose(&chars[start..].iter().collect::<String>())) <= budget;
+    let fits = |start: usize| counter.messages(&compose(&chars[start..].iter().collect::<String>())) <= budget;
     if fits(0) {
         return Ok(compose(&partial));
     }
@@ -343,7 +310,7 @@ pub fn continuation_as_instruction(messages: &[ChatMessage], budget: u64) -> Res
         if fits(mid) { hi = mid } else { lo = mid + 1 }
     }
     let tail: String = chars[lo..].iter().collect();
-    let tail_tokens = prompt_tokens_upper_bound(&[ChatMessage::new("assistant", tail.clone())]).saturating_sub(8);
+    let tail_tokens = counter.text(&tail);
     if lo >= chars.len() || !fits(lo) || tail_tokens < MIN_TAIL_TOKENS {
         return Err(if japanese {
             "この回答はモデルの文脈をほぼ使い切っていて、質問と途中の回答を渡すと続きを書く余地が残りません。新しいチャットで、残りの部分だけを質問してください（例:「(2)だけ解いてください」）。".to_string()
@@ -363,21 +330,18 @@ pub fn context_limit_from_refusal(message: &str) -> Option<u64> {
     after("max_context_tokens ").or_else(|| after("rotary table covers "))
 }
 
-/// The token cost of a whole conversation, over-estimated on purpose.
+/// **The prompt length an engine's own refusal names**, in the engine's tokens.
 ///
-/// One token per non-ASCII character (CJK sits at roughly one, sometimes more), a quarter of the
-/// ASCII, plus the chat template's markers per message. The tokenizer that would answer exactly
-/// lives with the engine, so this is the number an app can compute before it asks.
-pub fn prompt_tokens_upper_bound(messages: &[ChatMessage]) -> u64 {
-    const PER_MESSAGE_MARKERS: u64 = 8;
-    messages
-        .iter()
-        .map(|m| {
-            let ascii = m.content.chars().filter(char::is_ascii).count() as u64;
-            let other = m.content.chars().count() as u64 - ascii;
-            ascii.div_ceil(4) + other + PER_MESSAGE_MARKERS
-        })
-        .sum()
+/// "prompt 51 + decode ceiling 476 exceeds max_context_tokens 512" and "the prompt is 524 tokens
+/// and this artifact's rotary table covers 512" both carry it. Set against what the app counted
+/// for the same prompt, it says how far off the count was — which is what the retry plans with.
+pub fn refusal_prompt_tokens(message: &str) -> Option<u64> {
+    let after = |needle: &str| -> Option<u64> {
+        let rest = message.split(needle).nth(1)?;
+        let digits: String = rest.trim_start().chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    };
+    after("the prompt is ").or_else(|| after("prompt "))
 }
 
 pub fn approximate_tokens(text: &str) -> u64 {
@@ -426,32 +390,16 @@ mod context_fit_tests {
         assert_eq!(context_limit_from_refusal("connection refused"), None, "an unrelated failure must not look like a context limit");
     }
 
-    /// The system prompt is an instruction, not history. Dropping it to make room changes the
-    /// answer's language, which is exactly the setting a user just went and set.
+    /// The engine's count of the prompt, from either spelling — what a retry measures the app's
+    /// own count against.
     #[test]
-    fn the_system_prompt_and_the_question_survive_the_trim() {
-        let long = "あ".repeat(300);
-        let messages = vec![
-            msg("system", "日本語で答えてください。"),
-            msg("user", &long),
-            msg("assistant", &long),
-            msg("user", "Cでhelloworldのコードは"),
-        ];
-        let (kept, dropped) = fit_messages_to_budget(&messages, 416);
-        assert!(dropped > 0, "a conversation past the budget must lose something");
-        assert_eq!(kept.first().map(|m| m.role.as_str()), Some("system"), "the instruction stays first");
-        assert_eq!(kept.last().map(|m| m.content.as_str()), Some("Cでhelloworldのコードは"), "the question is never dropped");
-        assert!(prompt_tokens_upper_bound(&kept) <= 416, "and what is kept must actually fit");
-    }
-
-    /// A conversation that already fits is returned untouched — trimming that is not needed is
-    /// silent context loss.
-    #[test]
-    fn a_conversation_that_fits_is_left_alone() {
-        let messages = vec![msg("system", "hi"), msg("user", "Cで")];
-        let (kept, dropped) = fit_messages_to_budget(&messages, 416);
-        assert_eq!(dropped, 0);
-        assert_eq!(kept.len(), 2);
+    fn either_refusal_names_the_prompt_length() {
+        assert_eq!(
+            refusal_prompt_tokens("the worker refused the job: prompt 51 + decode ceiling 476 exceeds max_context_tokens 512"),
+            Some(51)
+        );
+        assert_eq!(refusal_prompt_tokens("misaka: the prompt is 524 tokens and this artifact's rotary table covers 512"), Some(524));
+        assert_eq!(refusal_prompt_tokens("connection refused"), None);
     }
 
     /// The turn that started this: `qwen25-1.5b-a16` holds 512 positions, the app asks for its
@@ -464,62 +412,25 @@ mod context_fit_tests {
         assert_eq!(answer_room(2048, 64), 96, "and a tiny window still leaves enough for a sentence");
     }
 
-    /// The measured chat: prompt 432 of 512, answer 80 tokens, cut mid-sentence, no refusal. With
-    /// the answer's half reserved first the same conversation loses a turn instead of a sentence.
-    #[test]
-    fn a_conversation_that_would_leave_no_room_to_answer_loses_a_turn_instead() {
-        let window = 512u64;
-        let reserve = answer_room(2048, window);
-        let budget = window - reserve;
-        let messages = vec![
-            msg("system", "日本語で答えてください。"),
-            msg("user", "マクスウェル方程式を導出して"),
-            msg("assistant", &"あ".repeat(217)),
-            msg("user", "F=maを証明して"),
-        ];
-        assert!(prompt_tokens_upper_bound(&messages) < window, "the engine would have ACCEPTED this — that is the whole trap");
-        let (kept, dropped) = fit_messages_to_budget(&messages, budget);
-        assert!(dropped > 0, "and it must still be trimmed, because accepting it leaves nothing to answer with");
-        assert!(prompt_tokens_upper_bound(&kept) + reserve <= window, "what is kept leaves the answer its half");
-        assert_eq!(kept.last().map(|m| m.content.as_str()), Some("F=maを証明して"));
-    }
-
-    /// Continuing a reply: the question and the partial answer are one exchange and neither is
-    /// dropped to make room — the older history goes instead.
-    #[test]
-    fn a_reply_being_continued_keeps_its_question() {
-        let messages = vec![
-            msg("system", "日本語で答えてください。"),
-            msg("user", &"古い質問".repeat(60)),
-            msg("assistant", &"古い回答".repeat(60)),
-            msg("user", "円の接線の中点 Q を求めよ"),
-            msg("assistant", "(1) まず接点を A, B とします。これらを"),
-        ];
-        let (kept, dropped) = fit_messages_to_budget(&messages, 120);
-        assert_eq!(dropped, 2);
-        let roles: Vec<_> = kept.iter().map(|m| m.role.as_str()).collect();
-        assert_eq!(roles, ["system", "user", "assistant"]);
-        assert_eq!(kept[1].content, "円の接線の中点 Q を求めよ");
-    }
-
     /// The instruction form carries the question and the END of the partial answer, fits the
     /// budget, and says what to do in the language of the chat.
     #[test]
     fn a_continuation_for_a_small_window_carries_the_question_and_the_tail() {
+        let counter = crate::context::tokens::TokenCounter::estimate();
         let question = "原点 O を中心とする半径 1 の円に円外の点 P から 2 本の接線を引く。中点 Q の座標を求めよ。";
         let partial = format!("{}これらを x_1 と", "接線の方程式は l_1: y - y_0 = m(x - x_0) です。".repeat(30));
         let messages = vec![msg("system", "日本語で答えてください。"), msg("user", question), msg("assistant", &partial)];
-        let rewritten = continuation_as_instruction(&messages, 256).expect("fits");
+        let rewritten = continuation_as_instruction(&messages, 256, &counter).expect("fits");
         assert_eq!(rewritten.len(), 2, "system + one user turn");
         assert_eq!(rewritten[1].role, "user", "never ends with an assistant turn the template would close");
         let content = &rewritten[1].content;
         assert!(content.starts_with(question), "the question is there, whole");
         assert!(content.contains("繰り返さず"), "the instruction is in Japanese: {content}");
         assert!(content.ends_with("これらを x_1 と"), "the tail is the END of the answer: {content}");
-        assert!(prompt_tokens_upper_bound(&rewritten) <= 256);
+        assert!(counter.messages(&rewritten) <= 256);
 
         let short = vec![msg("user", "Explain RSA."), msg("assistant", "RSA relies on the difficulty of factoring")];
-        let whole = continuation_as_instruction(&short, 10_000).expect("fits");
+        let whole = continuation_as_instruction(&short, 10_000, &counter).expect("fits");
         assert!(whole[0].content.contains("Do not repeat"), "English chat, English instruction");
         assert!(whole[0].content.ends_with("difficulty of factoring"));
     }
@@ -527,21 +438,10 @@ mod context_fit_tests {
     /// No room is a sentence, not a continuation of nothing.
     #[test]
     fn a_continuation_with_no_room_says_so() {
+        let counter = crate::context::tokens::TokenCounter::estimate();
         let messages = vec![msg("user", &"長い質問".repeat(80)), msg("assistant", "答えの途中")];
-        let refused = continuation_as_instruction(&messages, 256).unwrap_err();
+        let refused = continuation_as_instruction(&messages, 256, &counter).unwrap_err();
         assert!(refused.contains("新しいチャット"), "{refused}");
-        assert!(continuation_as_instruction(&[msg("assistant", "x")], 256).is_err(), "nothing to continue to");
-    }
-
-    /// One message too long for the class cannot be fixed by dropping history — there is none.
-    /// The caller distinguishes the two cases by `dropped == 0`, so this must not silently
-    /// return something that fits.
-    #[test]
-    fn a_single_oversized_message_drops_nothing_and_says_so() {
-        let messages = vec![msg("user", &"あ".repeat(900))];
-        let (kept, dropped) = fit_messages_to_budget(&messages, 416);
-        assert_eq!(dropped, 0, "there was no history to drop");
-        assert_eq!(kept.len(), 1, "and the question is still handed back");
-        assert!(prompt_tokens_upper_bound(&kept) > 416, "it genuinely does not fit");
+        assert!(continuation_as_instruction(&[msg("assistant", "x")], 256, &counter).is_err(), "nothing to continue to");
     }
 }

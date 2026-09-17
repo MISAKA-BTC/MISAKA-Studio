@@ -116,9 +116,13 @@ fn resolve_tokenizer(configured: Option<&std::path::Path>, model_path: &std::pat
         return path.to_path_buf();
     }
     if let Some(dir) = model_path.parent() {
-        let beside = dir.join("tokenizer.json");
-        if beside.is_file() {
-            return beside;
+        // The class's pinned tokenizer, as the Studio fetches it: named after the artifact, so two
+        // classes in one models directory do not share one `tokenizer.json`.
+        let stem = model_path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        for beside in [dir.join(format!("{stem}.tokenizer.json")), dir.join("tokenizer.json")] {
+            if beside.is_file() {
+                return beside;
+            }
         }
     }
     PathBuf::from("tokenizer.json")
@@ -190,6 +194,20 @@ impl InferenceBackend for MisakaBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tokenizer the Studio fetches for a class sits beside its artifact under the artifact's
+    /// name, and the integer runtime is given that one before a generic `tokenizer.json`.
+    #[test]
+    fn the_class_named_tokenizer_is_found_beside_its_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = dir.path().join("qwen25-1.5b-a16.palwart");
+        std::fs::write(&artifact, b"PALW").unwrap();
+        assert_eq!(resolve_tokenizer(None, &artifact), PathBuf::from("tokenizer.json"), "nothing there: the bare name");
+        std::fs::write(dir.path().join("tokenizer.json"), b"{}").unwrap();
+        assert_eq!(resolve_tokenizer(None, &artifact), dir.path().join("tokenizer.json"));
+        std::fs::write(dir.path().join("qwen25-1.5b-a16.tokenizer.json"), b"{}").unwrap();
+        assert_eq!(resolve_tokenizer(None, &artifact), dir.path().join("qwen25-1.5b-a16.tokenizer.json"), "the class's own wins");
+    }
 
     fn backend() -> MisakaBackend {
         MisakaBackend::new(Some(PathBuf::from("/nonexistent/misaka-palw-serve")), None, Duration::from_secs(1))

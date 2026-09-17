@@ -501,6 +501,9 @@ fn request_body(request: &GenerationRequest, chat: bool) -> serde_json::Value {
     if !request.stop.is_empty() {
         body["stop"] = serde_json::json!(request.stop);
     }
+    if request.disable_thinking {
+        body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": false });
+    }
     if chat {
         body["messages"] = serde_json::json!(request.messages);
     } else {
@@ -747,6 +750,8 @@ mod tests {
     #[test]
     fn the_request_body_carries_every_sampling_field() {
         let request = GenerationRequest {
+            prompt_tokens: None,
+            disable_thinking: true,
             model: "m".into(),
             messages: vec![super::super::ChatMessage::new("user", "hi")],
             prompt: None,
@@ -759,6 +764,7 @@ mod tests {
         assert_eq!(body["stop"][0], "</s>");
         assert!(body["messages"].is_array());
         assert!(body.get("prompt").is_none(), "a chat request must not also send a raw prompt");
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false, "thinking off when asked");
     }
 
     /// An error's reason lives in its source chain, and a chain that repeats itself is noise.

@@ -24,10 +24,7 @@
 //! confirms it is up and reports what it holds. A model picker that appeared to switch the class
 //! would be describing something that did not happen.
 
-use super::{
-    Availability, ChatMessage, GenerationRequest, InferenceBackend, LoadRequest, LoadedModel, SseParser, StreamEvent,
-    approximate_tokens,
-};
+use super::{Availability, GenerationRequest, InferenceBackend, LoadRequest, LoadedModel, SseParser, StreamEvent};
 use crate::{Error, Result};
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
@@ -197,8 +194,6 @@ impl InferenceBackend for GatewayBackend {
             // ceiling, and the stream flag. Sampling knobs are not sent because the lane's
             // execution is what a seat re-runs — a temperature the seat does not know about is a
             // claim nobody can reproduce.
-            let fallback_prompt_tokens =
-                approximate_tokens(&request.messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join("\n"));
 
             // **The ceiling has to fit the class, not the app's default.**
             //
@@ -213,12 +208,18 @@ impl InferenceBackend for GatewayBackend {
             // The prompt is estimated rather than tokenized here — the class's tokenizer lives with
             // the worker — so a margin is left for the estimate being low and for the chat
             // template's own markers.
+            // Counted with the class's tokenizer when the context manager had it (then the template is
+            // already in the count and a small margin is enough), estimated otherwise.
             const TEMPLATE_MARGIN_TOKENS: u64 = 24;
-            let fallback_prompt_tokens = prompt_upper_bound(&request.messages).max(fallback_prompt_tokens);
+            const EXACT_MARGIN_TOKENS: u64 = 4;
+            let (fallback_prompt_tokens, margin) = match request.prompt_tokens {
+                Some(counted) => (counted, EXACT_MARGIN_TOKENS),
+                None => (crate::context::tokens::TokenCounter::estimate().messages(&request.messages), TEMPLATE_MARGIN_TOKENS),
+            };
             let n_ctx = self.facts.read().await.as_ref().map(|f| f.n_ctx as u64).filter(|n| *n > 0);
             let ceiling = match n_ctx {
                 Some(n_ctx) => {
-                    let used = fallback_prompt_tokens.saturating_add(TEMPLATE_MARGIN_TOKENS);
+                    let used = fallback_prompt_tokens.saturating_add(margin);
                     match decode_ceiling(request.params.max_tokens, used, n_ctx) {
                         Some(ceiling) => ceiling,
                         None => {
@@ -354,28 +355,6 @@ fn decode_ceiling(requested: u64, used: u64, n_ctx: u64) -> Option<u64> {
     (room > 0).then(|| requested.min(room))
 }
 
-/// An UPPER bound on a conversation's tokens — a different job from `approximate_tokens`.
-///
-/// That one is "about four characters per token" and its own doc says it is never for sizing a
-/// context window, which is exactly what this is for. Measured: a two-turn Japanese conversation of
-/// 51 real tokens estimated as 12, the ceiling was computed from the gap, and the worker refused
-/// the whole request — "prompt 51 + decode ceiling 476 exceeds max_context_tokens 512".
-///
-/// So: one token per non-ASCII character (CJK sits at roughly one, sometimes more), a quarter of
-/// the ASCII, and the chat template's markers per message. Over-counting shortens an answer;
-/// under-counting loses the request — and [`ceiling_from_refusal`] repairs the rest.
-fn prompt_upper_bound(messages: &[ChatMessage]) -> u64 {
-    const PER_MESSAGE_MARKERS: u64 = 8;
-    messages
-        .iter()
-        .map(|m| {
-            let ascii = m.content.chars().filter(char::is_ascii).count() as u64;
-            let other = m.content.chars().count() as u64 - ascii;
-            ascii.div_ceil(4) + other + PER_MESSAGE_MARKERS
-        })
-        .sum()
-}
-
 /// **The ceiling the worker's own refusal implies.**
 ///
 /// The refusal names all three numbers — "prompt 51 + decode ceiling 476 exceeds
@@ -422,13 +401,15 @@ mod tests {
     }
 
     /// A Japanese turn is roughly one token per character, and the app's own `approximate_tokens`
-    /// is a quarter of that — the gap that lost a whole request.
+    /// is a quarter of that — the gap that lost a whole request. The estimate the gateway falls
+    /// back on counts the template too.
     #[test]
-    fn the_prompt_bound_does_not_undercount_japanese() {
-        let jp = [ChatMessage::new("user", "東京の天気は")];
-        assert!(prompt_upper_bound(&jp) >= 6 + 8, "one token per kana or kanji, plus the template's markers");
-        let en = [ChatMessage::new("user", "weather in Tokyo")];
-        assert!(prompt_upper_bound(&en) >= 4, "ascii is cheaper, but never free");
+    fn the_prompt_estimate_does_not_undercount_japanese() {
+        let counter = crate::context::tokens::TokenCounter::estimate();
+        let jp = [crate::backend::ChatMessage::new("user", "東京の天気は")];
+        assert!(counter.messages(&jp) >= 6 + 5 + 3, "a token per kana or kanji, plus the template's markers");
+        let en = [crate::backend::ChatMessage::new("user", "weather in Tokyo")];
+        assert!(counter.messages(&en) >= 4 + 5 + 3, "ascii is cheaper, but never free");
     }
 
     /// The measured chat that started this: slot-06 reports `n_ctx` 512, the settings carry a

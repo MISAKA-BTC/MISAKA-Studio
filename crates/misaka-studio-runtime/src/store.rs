@@ -285,15 +285,19 @@ fn scan_dir(dir: &Path, depth: usize, found: &mut HashMap<String, LocalModel>) {
 
 /// **A `.palwart` as a model entry: what the file proves, and nothing else.**
 ///
-/// Every shape field stays `None`. The Studio has no decoder for this format — the integer runtime
-/// does — so a `block_count` or a `context_length` here would be a number nobody measured, in the
-/// one place a user reads to decide whether a model fits their machine. The size and the digest
-/// are facts about the file, and the sidecar's repository is a fact about where it came from.
+/// The size and the digest are facts about the file, and the sidecar's repository is a fact about
+/// where it came from. The layer count and the context window come from the file's own shape
+/// block (`palw::read_artifact_header`, 64 bytes) when its format is one this build reads, and
+/// stay `None` otherwise: a `context_length` guessed here was shown as "4K context" on an artifact
+/// whose rotary table holds 512 positions, in the one place a user reads to size a model.
+/// `kv_cache_bytes_per_token` stays `None` — the header does not say how the runtime stores its
+/// cache, and the estimate says it is one.
 fn inspect_palw_artifact(path: &Path, sidecar: Sidecar) -> Option<LocalModel> {
     let metadata = std::fs::metadata(path).ok()?;
     let size_bytes = metadata.len();
     let modified_at = metadata.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
     let name = path.file_stem()?.to_string_lossy().to_string();
+    let header = palw::read_artifact_header(path);
     let mut model = LocalModel {
         id: name.clone(),
         name,
@@ -302,8 +306,8 @@ fn inspect_palw_artifact(path: &Path, sidecar: Sidecar) -> Option<LocalModel> {
         quantization: None,
         architecture: Some("palw".into()),
         parameter_count: None,
-        context_length: None,
-        block_count: None,
+        context_length: header.map(|h| h.max_position),
+        block_count: header.map(|h| h.n_layers),
         expert_count: None,
         kv_cache_bytes_per_token: None,
         // The runtime renders Qwen's template itself, from the tokenizer file it is given — the

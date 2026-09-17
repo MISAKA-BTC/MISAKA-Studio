@@ -12,6 +12,8 @@ use crate::backend::mlx::MlxBackend;
 use crate::backend::mock::MockBackend;
 use crate::backend::{ChatMessage, GenerationRequest, LoadRequest, LoadedModel, SharedBackend, StreamEvent, Usage};
 use crate::catalog::Catalog;
+use crate::context::tokens::TokenCounter;
+use crate::context::{ContextPlan, ContextReport, PlanInputs, SuppliedMemory};
 use crate::download::DownloadManager;
 use crate::metrics::MetricsHub;
 use crate::records::{RecordStore, StoredRecord};
@@ -79,6 +81,11 @@ pub struct AppState {
     pub mining: Arc<crate::mining_queue::MiningQueue>,
     /// Installs a `llama-server` built for this machine's GPU. See `crate::engines`.
     pub engines: Arc<crate::engines::EngineInstaller>,
+    /// Summarises older turns on a local model, when `context.summarizer_model` names one.
+    pub summarizer: Arc<crate::context::summarizer::Summarizer>,
+    /// Tokenizers by file: loaded, loading, or failed. A `tokenizer.json` is 7 MB of JSON; it is
+    /// read once, in the background.
+    counters: Arc<std::sync::Mutex<std::collections::HashMap<PathBuf, CounterSlot>>>,
     catalog: RwLock<Arc<Catalog>>,
     backend: RwLock<SharedBackend>,
     loaded: RwLock<Option<LoadedState>>,
@@ -119,6 +126,8 @@ impl AppState {
             records: RwLock::new(records),
             mining,
             engines,
+            summarizer: Arc::new(crate::context::summarizer::Summarizer::new()),
+            counters: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             catalog: RwLock::new(catalog),
             backend: RwLock::new(backend),
             loaded: RwLock::new(None),
@@ -297,6 +306,11 @@ impl AppState {
         let recording_changed = new.provenance.record_inferences != old.provenance.record_inferences
             || new.provenance.max_records != old.provenance.max_records;
 
+        if new.context.summarizer_model != old.context.summarizer_model
+            || new.backend.llama_server_path != old.backend.llama_server_path
+        {
+            self.summarizer.shutdown().await;
+        }
         if backend_changed {
             self.unload().await?;
             *self.backend.write().await = build_backend(&new, &self.hardware);
@@ -421,6 +435,9 @@ impl AppState {
             tracing::warn!(model = %model.id, "{note}");
         }
         let state = LoadedState { model, loaded, runtime, identity, backend: backend.name().to_string(), offload_note };
+        // A class's tokenizer is what its 512 tokens are counted in; have it ready before the first
+        // question rather than after it.
+        self.prepare_tokenizer(&state.model).await;
         *self.loaded.write().await = Some(state.clone());
         Ok(self.status_from(Some(&state), true).await)
     }
@@ -517,6 +534,21 @@ impl AppState {
         params: SamplingCommitment,
         stop: Vec<String>,
     ) -> Result<BoxStream<'static, Result<StreamEvent>>> {
+        Ok(self.generate_managed(messages, prompt, params, stop, Vec::new()).await?.1)
+    }
+
+    /// [`Self::generate`], through the context manager, returning what it decided.
+    ///
+    /// `pinned` are the conversation's pinned notes. The report is `None` for a raw completion,
+    /// which has no conversation to manage.
+    pub async fn generate_managed(
+        self: &Arc<Self>,
+        messages: Vec<ChatMessage>,
+        prompt: Option<String>,
+        params: SamplingCommitment,
+        stop: Vec<String>,
+        pinned: Vec<String>,
+    ) -> Result<(Option<ContextReport>, BoxStream<'static, Result<StreamEvent>>)> {
         let state = self.loaded().await.ok_or(Error::NoModelLoaded)?;
         let backend = self.backend().await;
         // An engine that died between two messages is found out here, not by the connection
@@ -529,50 +561,31 @@ impl AppState {
             });
         }
 
-        // **The answer's share of the window, reserved before the question is sent.**
-        //
-        // The retry further down only fires when the engine REFUSES — the prompt alone over the
-        // window. Between "fits" and "refused" sits the case people actually meet: a prompt that
-        // fits with almost nothing behind it. Measured on `qwen25-1.5b-a16`, whose artifact holds
-        // 512 positions: prompt 432, answer 80 tokens, stopped mid-sentence, and every layer
-        // treated that as success. The window is shared between the conversation and the reply,
-        // and on a 512-position class the two cannot both be long — so the reply's half is taken
-        // first and the oldest turns go, which is the trade a person would make and the one they
-        // cannot make by hand.
-        //
-        // Half, not all of `max_tokens`: the app's default ask is 2048, meant for a 32K GGUF, and
-        // reserving it against a small window would leave nothing to remember with. An engine with
-        // room to spare trims nothing — `fit_messages_to_budget` returns a conversation that
-        // already fits untouched.
-        // **Continuing a cut-off reply.** The conversation ends with the partial assistant text.
-        // An engine that continues a turn from inside it gets exactly that; any other engine
-        // would close the partial turn and start a new answer, so it gets the continuation as an
-        // instruction that fits its window — see `continuation_as_instruction`.
-        let continuing = prompt.is_none() && messages.last().is_some_and(|m| m.role == "assistant");
-        let messages = if continuing && !backend.continues_assistant_turn() {
-            let budget = match state.loaded.context_size as u64 {
-                0 => u64::MAX,
-                window => window.saturating_sub(crate::backend::answer_room(params.max_tokens, window)),
-            };
-            crate::backend::continuation_as_instruction(&messages, budget).map_err(|message| Error::BadRequest { message })?
-        } else {
-            messages
-        };
-        let messages = if prompt.is_some() || state.loaded.context_size == 0 {
-            messages
-        } else {
-            let window = state.loaded.context_size as u64;
-            let reserve = crate::backend::answer_room(params.max_tokens, window);
-            let (fitted, dropped) = crate::backend::fit_messages_to_budget(&messages, window.saturating_sub(reserve));
-            if dropped > 0 {
-                tracing::info!(
-                    window,
-                    reserve,
-                    dropped,
-                    "dropped older turns so the answer has room — this class's context is its artifact's"
-                );
+        // **What the model sees** — the context manager's decision (see `crate::context`): the
+        // system prompt and the question always, then the pinned notes, recent turns whole, and a
+        // memory of the older ones, inside the window less the answer's reserve.
+        let window = state.loaded.context_size as u64;
+        let counter = if prompt.is_none() { Some(self.token_counter_for(&state.model).await) } else { None };
+        let mut report: Option<ContextReport> = None;
+        // Kept for a refusal's retry, which plans again from what the client sent.
+        let client_messages = if counter.is_some() { messages.clone() } else { Vec::new() };
+        let messages = match &counter {
+            Some(counter) => {
+                let plan = self.plan_context(&backend, &messages, &pinned, window, params.max_tokens, counter, 1000).await?;
+                if plan.report.managed {
+                    tracing::info!(
+                        window,
+                        prompt_tokens = plan.report.prompt_tokens,
+                        recent = plan.report.recent_messages,
+                        older = plan.report.older_messages,
+                        memory = ?plan.report.memory.as_ref().map(|m| m.source),
+                        "context managed"
+                    );
+                }
+                report = Some(plan.report);
+                plan.messages
             }
-            fitted
+            None => messages,
         };
 
         // The bytes the record commits to. Canonical and length-prefixed — see
@@ -586,28 +599,21 @@ impl AppState {
             }
         };
 
-        let request = GenerationRequest { model: state.model.id.clone(), messages, prompt, params, stop };
-        // Kept for the context retry below, which has to rebuild the request after `request` moves.
-        let (retry_model, retry_messages, retry_params, retry_stop) =
-            (request.model.clone(), request.messages.clone(), request.params, request.stop.clone());
-        let request_messages_len = if request.prompt.is_some() { 0 } else { request.messages.len() };
+        let exact_tokens = counter.as_ref().filter(|c| c.is_exact()).and(report.as_ref()).map(|r| r.prompt_tokens);
+        let request = GenerationRequest {
+            model: state.model.id.clone(),
+            messages,
+            prompt,
+            params,
+            stop: stop.clone(),
+            prompt_tokens: exact_tokens,
+            disable_thinking: false,
+        };
+        let is_chat = request.prompt.is_none();
 
         self.metrics.generation_started();
-        let inner = match backend.generate(request.clone()).await {
+        let inner = match backend.generate(request).await {
             Ok(stream) => stream,
-            // **A conversation that outgrew the model is not a dead end.**
-            //
-            // A class artifact's context is fixed — `qwen25-1.5b-a16`'s rotary table covers 512
-            // positions and that number is inside the root the chain registered — so the app
-            // cannot raise it. But the app is what filled it: every turn re-sent the whole
-            // conversation, and the refusal a person saw was the engine's own string with no
-            // answer behind it ("the prompt is 524 tokens and this artifact's rotary table
-            // covers 512") after typing two characters.
-            //
-            // The refusal names the limit, so the request that fits is arithmetic. Drop the oldest
-            // turns, keep the system prompt and the question, and ask once more. A chat that has
-            // simply run long then keeps working instead of stopping; a single message that is
-            // itself too long still fails, and now says which of the two it was.
             Err(e) => {
                 // The counter must come back down on the failure path too, or "1 generation
                 // active" sticks forever after one bad request.
@@ -617,41 +623,60 @@ impl AppState {
         };
 
         // **The refusal arrives in the stream, not from the call.** The engine answers 200 and
-        // puts "the prompt is 557 tokens and this artifact's rotary table covers 512" in the first
-        // event, so a retry that only watches `generate`'s return value never fires. Nothing has
-        // reached the user at this point, which is what makes taking one item and deciding safe.
+        // puts "prompt 257 + decode ceiling 256 exceeds max_context_tokens 512" in the first event,
+        // so a retry that only watches `generate`'s return value never fires. Nothing has reached
+        // the user at this point, which is what makes taking one item and deciding safe.
+        //
+        // The refusal names the window and the engine's count of the prompt. Planned again with
+        // both — the count scaled by how far the app's own count fell short — the request that
+        // fits is arithmetic, and it is asked for once.
         let mut inner = inner;
         let first = inner.next().await;
-        let (mut inner, first) = match &first {
-            Some(Err(e)) => match crate::backend::context_limit_from_refusal(&e.to_string()) {
-                Some(limit) if request_messages_len > 1 => {
-                    const ANSWER_ROOM_TOKENS: u64 = 96;
-                    let budget = limit.saturating_sub(ANSWER_ROOM_TOKENS);
-                    let (fitted, dropped) = crate::backend::fit_messages_to_budget(&retry_messages, budget);
-                    if dropped == 0 {
-                        (inner, first)
-                    } else {
-                        tracing::info!(
-                            "context {limit}: dropped {dropped} older message(s) and retried — a class's context is its artifact's"
-                        );
-                        let retry = GenerationRequest {
-                            model: retry_model.clone(),
-                            messages: fitted,
-                            prompt: None,
-                            params: retry_params,
-                            stop: retry_stop.clone(),
+        let (mut inner, first) = match (&first, &counter, &report) {
+            (Some(Err(e)), Some(counter), Some(sent)) if is_chat => {
+                let message = e.to_string();
+                match crate::backend::context_limit_from_refusal(&message) {
+                    Some(limit) => {
+                        let engine_count = crate::backend::refusal_prompt_tokens(&message).unwrap_or(0);
+                        let scale = if sent.prompt_tokens > 0 && engine_count > sent.prompt_tokens {
+                            (engine_count * 1000).div_ceil(sent.prompt_tokens) + 50
+                        } else {
+                            1100
                         };
-                        match backend.generate(retry).await {
-                            Ok(mut s2) => {
-                                let f2 = s2.next().await;
-                                (s2, f2)
+                        let window = if window == 0 { limit } else { window.min(limit) };
+                        let before = sent.prompt_tokens;
+                        match self.plan_context(&backend, &client_messages, &pinned, window, params.max_tokens, counter, scale).await {
+                            Ok(plan) if plan.report.prompt_tokens < before => {
+                                tracing::info!(
+                                    limit,
+                                    engine_count,
+                                    scale,
+                                    "the engine refused the prompt's length; planned again in its count and retried"
+                                );
+                                let retry = GenerationRequest {
+                                    model: state.model.id.clone(),
+                                    messages: plan.messages.clone(),
+                                    prompt: None,
+                                    params,
+                                    stop: stop.clone(),
+                                    prompt_tokens: None,
+                                    disable_thinking: false,
+                                };
+                                match backend.generate(retry).await {
+                                    Ok(mut s2) => {
+                                        let f2 = s2.next().await;
+                                        report = Some(plan.report);
+                                        (s2, f2)
+                                    }
+                                    Err(_) => (inner, first),
+                                }
                             }
-                            Err(_) => (inner, first),
+                            _ => (inner, first),
                         }
                     }
+                    None => (inner, first),
                 }
-                _ => (inner, first),
-            },
+            }
             _ => (inner, first),
         };
 
@@ -692,7 +717,187 @@ impl AppState {
             app.record(&state, &prompt_bytes, &text, usage, started_at_unix_ms, duration_ms, ttft, params).await;
         });
 
-        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        Ok((report, Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))))
+    }
+
+    /// Plan the context for one request: the pure decision in `crate::context`, with the memory
+    /// filled in from the summariser when one is configured and needed.
+    #[allow(clippy::too_many_arguments)]
+    async fn plan_context(
+        &self,
+        backend: &SharedBackend,
+        messages: &[ChatMessage],
+        pinned: &[String],
+        window: u64,
+        max_tokens: u64,
+        counter: &TokenCounter,
+        scale_permille: u64,
+    ) -> Result<ContextPlan> {
+        let continues = backend.continues_assistant_turn();
+        let draft = crate::context::plan(&PlanInputs {
+            messages,
+            pinned,
+            window,
+            max_tokens,
+            counter,
+            engine_continues_turns: continues,
+            count_scale_permille: scale_permille,
+        })
+        .map_err(|message| Error::BadRequest { message })?;
+
+        let (supplied, note) = if draft.wants_memory() {
+            let settings = self.settings.read().await.clone();
+            match settings.context.summarizer_model.clone() {
+                None => (None, None),
+                Some(model_id) => match self.store.get(&model_id).await {
+                    None => (None, Some(format!("the summariser model {model_id} is not installed; the older turns were extracted"))),
+                    Some(model) => {
+                        let target = draft.memory_budget.clamp(48, 240);
+                        match self
+                            .summarizer
+                            .summarize(&model, &settings, &self.hardware, &draft.older, target, draft.japanese())
+                            .await
+                        {
+                            Ok(text) => (Some(SuppliedMemory { text, source: crate::context::MemorySource::Summary }), None),
+                            Err(e) => {
+                                tracing::warn!("summariser: {e}");
+                                (None, Some(format!("the summariser failed ({e}); the older turns were extracted")))
+                            }
+                        }
+                    }
+                },
+            }
+        } else {
+            (None, None)
+        };
+        let mut plan = draft.finish(supplied, counter, note);
+
+        // A cut-off reply for an engine that closes every turn: the question and the reply's end,
+        // spelled as one instruction (see `continuation_as_instruction`).
+        if plan.report.continuation && !continues {
+            let budget = plan.report.prompt_budget;
+            let rewritten = crate::backend::continuation_as_instruction(&plan.messages, budget, counter)
+                .map_err(|message| Error::BadRequest { message })?;
+            plan.report.prompt_tokens = counter.messages(&rewritten);
+            plan.report.managed = true;
+            plan.report.sent = Some(rewritten.clone());
+            plan.messages = rewritten;
+        }
+        Ok(plan)
+    }
+
+    /// **The counter for this model's tokens**: its tokenizer when one is at hand, the estimate
+    /// otherwise.
+    ///
+    /// Looked for in order: `context.tokenizer_path`; for a class artifact, the class's pinned
+    /// tokenizer beside it (`<stem>.tokenizer.json`), a `tokenizer.json` beside it, and
+    /// `backend.misaka_tokenizer_path`. A GGUF carries its vocabulary inside and has a window wide
+    /// enough that the estimate is not what decides a turn, so it is estimated.
+    pub async fn token_counter_for(&self, model: &LocalModel) -> Arc<TokenCounter> {
+        let Some(path) = self.tokenizer_path_for(model).await else {
+            return Arc::new(TokenCounter::estimate());
+        };
+        self.start_tokenizer_load(&path);
+        // **A chat never waits on a tokenizer for long.** Measured: a daemon whose tokenizer sat in
+        // a folder the OS asked permission for blocked in `open` forever, and — the load holding
+        // the lock every request took — so did every chat after it. The load runs on its own; a
+        // request waits a moment for it and is otherwise counted with the estimate.
+        let deadline = Instant::now() + TOKENIZER_WAIT;
+        loop {
+            match self.counters.lock().expect("counters").get(&path) {
+                Some(CounterSlot::Ready(counter)) => return counter.clone(),
+                Some(CounterSlot::Failed { .. }) | None => return Arc::new(TokenCounter::estimate()),
+                Some(CounterSlot::Loading) => {}
+            }
+            if Instant::now() >= deadline {
+                tracing::info!(path = %path.display(), "the tokenizer is still loading; this request is counted with the estimate");
+                return Arc::new(TokenCounter::estimate());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Begin loading a tokenizer unless it is loaded, loading, or failed recently.
+    fn start_tokenizer_load(&self, path: &std::path::Path) {
+        {
+            let mut counters = self.counters.lock().expect("counters");
+            match counters.get(path) {
+                Some(CounterSlot::Ready(_)) | Some(CounterSlot::Loading) => return,
+                Some(CounterSlot::Failed { at, .. }) if at.elapsed() < TOKENIZER_RETRY => return,
+                _ => {}
+            }
+            counters.insert(path.to_path_buf(), CounterSlot::Loading);
+        }
+        let counters = self.counters.clone();
+        let path = path.to_path_buf();
+        tokio::spawn(async move {
+            let load_path = path.clone();
+            let outcome = tokio::task::spawn_blocking(move || TokenCounter::from_tokenizer_file(&load_path)).await;
+            let slot = match outcome {
+                Ok(Ok(counter)) => {
+                    tracing::info!(path = %path.display(), "tokenizer loaded; prompts are counted exactly");
+                    CounterSlot::Ready(Arc::new(counter))
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("tokenizer {e}; counting with the estimate");
+                    CounterSlot::Failed { at: Instant::now(), why: e }
+                }
+                Err(e) => CounterSlot::Failed { at: Instant::now(), why: format!("the load did not run: {e}") },
+            };
+            counters.lock().expect("counters").insert(path, slot);
+        });
+    }
+
+    async fn tokenizer_path_for(&self, model: &LocalModel) -> Option<PathBuf> {
+        let settings = self.settings.read().await;
+        if let Some(path) = settings.context.tokenizer_path.clone().filter(|p| p.is_file()) {
+            return Some(path);
+        }
+        let file_name = model.path.file_name().and_then(|n| n.to_str())?;
+        if !palw::is_artifact_filename(file_name) {
+            return None;
+        }
+        let dir = model.path.parent()?;
+        let pinned =
+            palw::class_for_artifact_filename(file_name).and_then(|class| class.tokenizer_filename()).map(|name| dir.join(name));
+        [pinned, Some(dir.join("tokenizer.json")), settings.backend.misaka_tokenizer_path.clone()]
+            .into_iter()
+            .flatten()
+            .find(|p| p.is_file())
+    }
+
+    /// Fetch a class's pinned tokenizer beside its artifact when it is not already at hand, in the
+    /// background and through the download list — 7 MB, verified against the pinned digest.
+    async fn prepare_tokenizer(&self, model: &LocalModel) {
+        if let Some(path) = self.tokenizer_path_for(model).await {
+            self.start_tokenizer_load(&path);
+            return;
+        }
+        if !self.settings.read().await.context.fetch_class_tokenizer {
+            return;
+        }
+        let Some(file_name) = model.path.file_name().and_then(|n| n.to_str()) else { return };
+        let Some(class) = palw::class_for_artifact_filename(file_name) else { return };
+        let (Some(pin), Some(name), Some(dir)) = (class.tokenizer, class.tokenizer_filename(), model.path.parent()) else { return };
+        let url = self.catalog().await.download_url(pin.hf_repo, "main", pin.repo_path);
+        let id = format!("{}/{}", pin.hf_repo, name);
+        match self
+            .downloads
+            .fetch(
+                id,
+                pin.hf_repo.to_string(),
+                name.clone(),
+                format!("{} tokenizer", class.name),
+                url,
+                dir.join(&name),
+                Some(pin.sha256.to_string()),
+                Some(pin.size_bytes),
+            )
+            .await
+        {
+            Ok(_) => tracing::info!(class = class.name, "fetching the class tokenizer beside its artifact"),
+            Err(e) => tracing::warn!(class = class.name, "could not fetch the class tokenizer: {e}"),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -742,6 +947,23 @@ impl AppState {
             })
             .await;
     }
+}
+
+/// How long a request waits for a tokenizer that is still loading before it is counted with the
+/// estimate instead.
+const TOKENIZER_WAIT: Duration = Duration::from_secs(3);
+/// How long a tokenizer that failed to load is left alone before it is tried again.
+const TOKENIZER_RETRY: Duration = Duration::from_secs(300);
+
+/// A tokenizer file's state in the counter cache.
+enum CounterSlot {
+    Ready(Arc<TokenCounter>),
+    Loading,
+    Failed {
+        at: Instant,
+        #[allow(dead_code)]
+        why: String,
+    },
 }
 
 /// Build the backend a settings value asks for.

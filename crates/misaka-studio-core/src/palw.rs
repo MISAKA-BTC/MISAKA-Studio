@@ -122,6 +122,52 @@ pub struct PalwClassSpec {
     /// The floor: default when no class is named, exempt from the per-class epoch budget — the
     /// one class that can always produce.
     pub is_base: bool,
+    /// **The context the class was registered at**, in tokens: the `n_ctx` inside its profile.
+    ///
+    /// A registration choice, not a property of the weights — the node says so in as many words
+    /// ("a class is not a function of an artifact: `n_ctx`, `tile_len` and `n_threads` are
+    /// registration choices that no weight file contains"). One model can therefore be registered
+    /// at 12, 512 or 2M positions as separate classes, and the number decides what a job can hold.
+    /// Pinned beside the id it belongs to; the node does not yet publish it over RPC.
+    pub context_tokens: u32,
+    /// The tokenizer the class's ids mean, where one is published beside the artifact.
+    ///
+    /// The Studio counts a prompt with it, so that a 512-token class is budgeted in the tokens the
+    /// worker will count and not in an estimate of them. Pinned by SHA-256 like the artifact: the
+    /// published A16 artifact declares no tokenizer commitment of its own (the 64 bytes after its
+    /// rotary table are zero — read 2026-09-17), so the digest here is the only binding there is.
+    pub tokenizer: Option<PalwTokenizerPin>,
+}
+
+/// A class's `tokenizer.json`, published in the class's repository and pinned by digest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct PalwTokenizerPin {
+    pub hf_repo: &'static str,
+    pub repo_path: &'static str,
+    pub sha256: &'static str,
+    pub size_bytes: u64,
+}
+
+impl PalwClassSpec {
+    /// The name the class's tokenizer takes on disk: beside the artifact, prefixed with the
+    /// artifact's stem, so two classes' tokenizers in one models directory do not collide.
+    pub fn tokenizer_filename(&self) -> Option<String> {
+        self.tokenizer?;
+        match &self.artifact {
+            PalwArtifactSource::Download { filename, .. } => {
+                let stem = filename.rfind('.').map(|dot| &filename[..dot]).unwrap_or(filename);
+                Some(format!("{stem}.tokenizer.json"))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The class whose published artifact has this file name, if any.
+pub fn class_for_artifact_filename(file_name: &str) -> Option<&'static PalwClassSpec> {
+    TESTNET11_CLASSES
+        .iter()
+        .find(|class| matches!(class.artifact, PalwArtifactSource::Download { filename, .. } if filename == file_name))
 }
 
 /// GiB, binary.
@@ -156,6 +202,9 @@ pub const TESTNET11_CLASSES: &[PalwClassSpec] = &[
         artifact_root_hex: "bcf2d9eb7357bd6c267df2df6588393ca71c67d7c802903ca7031948303c793dcb78bfe26488f52d0393be08e0cc0777b080e2dce9355d3576036b734545b8df",
         artifact: PalwArtifactSource::DerivedFromSeed,
         is_base: true,
+        // `PALW_RC_BASE0_GEOMETRY.n_ctx`: sized by the court's cost ceiling, not by capability.
+        context_tokens: 12,
+        tokenizer: None,
     },
     PalwClassSpec {
         name: "PALW-QWEN25-A16",
@@ -180,6 +229,15 @@ pub const TESTNET11_CLASSES: &[PalwClassSpec] = &[
             convert_command: "qwen25-convert /path/to/Qwen2.5-1.5B-Instruct --a16 --out qwen25-1.5b-a16.palwart",
         },
         is_base: false,
+        // The `@512` in its chain model id, graph-v5@512.
+        context_tokens: 512,
+        // Byte-identical to `Qwen/Qwen2.5-1.5B-Instruct`'s own tokenizer.json (compared 2026-09-17).
+        tokenizer: Some(PalwTokenizerPin {
+            hf_repo: "Misakachain/Qwen2.5-1.5B-PALW-A16-runtime",
+            repo_path: "tokenizer.json",
+            sha256: "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539",
+            size_bytes: 7_031_645,
+        }),
     },
     PalwClassSpec {
         name: "QWEN36",
@@ -204,6 +262,9 @@ pub const TESTNET11_CLASSES: &[PalwClassSpec] = &[
             convert_command: "qwen36-convert --url <gguf url> --header header.bin --out qwen36.palwq36 --context 512",
         },
         is_base: false,
+        // The genesis hybrid row, `palw_qwen36_context_row_profile_v1(512)`.
+        context_tokens: 512,
+        tokenizer: None,
     },
 ];
 
@@ -223,6 +284,75 @@ pub const DEFAULT_CLASS: &str = "PALW-QWEN25-A16";
 /// linked rather than a condition to handle at runtime; the test below is what holds it.
 pub fn default_class() -> &'static PalwClassSpec {
     TESTNET11_CLASSES.iter().find(|class| class.name == DEFAULT_CLASS).expect("DEFAULT_CLASS names a registered class")
+}
+
+/// **What a class artifact's own header says about the model inside it.**
+///
+/// A BASE-0-family container (`PALWB0A1`, `PALWB0A2` — the dense A16 tier included) opens with its
+/// shape, eight little-endian `u64`s straight after the magic, in the order
+/// `misaka-palw-base0::artifact::decode_artifact_file_v1` reads them. Reading those is 64 bytes,
+/// not 1.7 GiB, and every field is something the file itself carries — unlike a class's context,
+/// which is the registration's.
+///
+/// `max_position` is the length of the rotary table: the most positions this file can ever be run
+/// at. A class registered wider than that cannot be served by this file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PalwArtifactHeader {
+    pub n_layers: u64,
+    pub n_heads: u64,
+    pub n_kv_heads: u64,
+    pub d_head: u64,
+    pub d_ff: u64,
+    pub vocab: u64,
+    pub max_position: u64,
+}
+
+/// The magics whose shape block this reads. Other artifact formats (`PALWQ361`, the QWEN36
+/// hybrid) lay their headers out differently and are left unread rather than misread.
+const BASE0_MAGICS: [&[u8; 8]; 2] = [b"PALWB0A2", b"PALWB0A1"];
+
+/// Parse the shape block from the first bytes of an artifact. `None` for another format, a short
+/// read, or a shape the runtime itself would refuse — a number from a file that is not what it
+/// claims is worse than no number.
+pub fn parse_artifact_header(bytes: &[u8]) -> Option<PalwArtifactHeader> {
+    let magic = bytes.get(..8)?;
+    if !BASE0_MAGICS.iter().any(|m| m.as_slice() == magic) {
+        return None;
+    }
+    let field = |i: usize| -> Option<u64> { Some(u64::from_le_bytes(bytes.get(8 + 8 * i..16 + 8 * i)?.try_into().ok()?)) };
+    let header = PalwArtifactHeader {
+        n_layers: field(0)?,
+        n_heads: field(1)?,
+        n_kv_heads: field(2)?,
+        d_head: field(3)?,
+        d_ff: field(4)?,
+        vocab: field(5)?,
+        max_position: field(6)?,
+    };
+    // The runtime's own `Base0ShapeV1::validate`, plus bounds no real model comes near: a header
+    // that decodes to 2^60 layers is not a model.
+    let sane = header.n_layers > 0
+        && header.n_layers <= 4096
+        && header.n_heads > 0
+        && header.n_kv_heads > 0
+        && header.n_kv_heads <= header.n_heads
+        && header.n_heads.is_multiple_of(header.n_kv_heads)
+        && header.d_head > 0
+        && header.d_head.is_multiple_of(2)
+        && header.d_ff > 0
+        && header.vocab > 0
+        && header.max_position > 0
+        && header.max_position <= 1 << 40;
+    sane.then_some(header)
+}
+
+/// Read the header of the artifact at `path`: the first 64 bytes, nothing more.
+pub fn read_artifact_header(path: &std::path::Path) -> Option<PalwArtifactHeader> {
+    use std::io::Read;
+    let mut buf = [0u8; 64];
+    let mut file = std::fs::File::open(path).ok()?;
+    file.read_exact(&mut buf).ok()?;
+    parse_artifact_header(&buf)
 }
 
 /// Whether this machine holds a class's artifact, and whether it plausibly can run it.
@@ -251,6 +381,10 @@ pub struct PalwClassStatus {
     /// A one-line memory note when the artifact is bigger than this machine's RAM — honest
     /// arithmetic (the hybrid runtime maps the artifact), not a benchmark.
     pub memory_note: Option<String>,
+    /// The header of the file on disk, when there is one and its format is one this build reads.
+    /// Its `max_position` is how many positions the file's rotary table covers — an upper bound on
+    /// any class that runs it, and a fact about THIS file rather than about the registration.
+    pub artifact_header: Option<PalwArtifactHeader>,
 }
 
 /// Assess every testnet-11 class against a directory scan and the machine.
@@ -309,7 +443,7 @@ pub fn assess(classes: &[PalwClassSpec], artifact_files: &[(String, String, u64)
                 )
             });
 
-            PalwClassStatus { spec: spec.clone(), readiness, memory_note }
+            PalwClassStatus { spec: spec.clone(), readiness, memory_note, artifact_header: None }
         })
         .collect()
 }
@@ -409,6 +543,65 @@ mod tests {
         }
     }
 
+    /// The first 64 bytes of the real `qwen25-1.5b-a16.palwart` (1,795,427,276 bytes, the file the
+    /// chain pins), copied from `xxd`: Qwen2.5-1.5B's shape and a 512-position rotary table.
+    #[test]
+    fn the_real_a16_artifact_header_reads_as_qwen25_at_512_positions() {
+        let head: [u8; 64] = [
+            0x50, 0x41, 0x4c, 0x57, 0x42, 0x30, 0x41, 0x32, 0x1c, 0, 0, 0, 0, 0, 0, 0, 0x0c, 0, 0, 0, 0, 0, 0, 0, 0x02, 0, 0, 0, 0, 0,
+            0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x23, 0, 0, 0, 0, 0, 0, 0x80, 0x51, 0x02, 0, 0, 0, 0, 0, 0x00, 0x02, 0, 0, 0, 0, 0,
+            0,
+        ];
+        let header = parse_artifact_header(&head).expect("a BASE-0 container");
+        assert_eq!(
+            header,
+            PalwArtifactHeader {
+                n_layers: 28,
+                n_heads: 12,
+                n_kv_heads: 2,
+                d_head: 128,
+                d_ff: 8960,
+                vocab: 151_936,
+                max_position: 512
+            }
+        );
+        let a16 = TESTNET11_CLASSES.iter().find(|c| c.name == "PALW-QWEN25-A16").unwrap();
+        assert_eq!(u64::from(a16.context_tokens), header.max_position, "the registered class uses the whole table");
+    }
+
+    /// Another format, a short read and a nonsense shape are all "not read" — never a number.
+    #[test]
+    fn a_header_this_build_does_not_read_yields_nothing() {
+        let mut qwen36 = [0u8; 64];
+        qwen36[..8].copy_from_slice(b"PALWQ361");
+        qwen36[8] = 40;
+        assert_eq!(parse_artifact_header(&qwen36), None, "the hybrid format lays its header out differently");
+        assert_eq!(parse_artifact_header(b"PALWB0A2\x1c\0\0"), None, "short");
+        let mut zero_layers = [0u8; 64];
+        zero_layers[..8].copy_from_slice(b"PALWB0A2");
+        assert_eq!(parse_artifact_header(&zero_layers), None, "a shape the runtime would refuse");
+    }
+
+    /// The A16 class's tokenizer lands beside its artifact under a name no other class shares.
+    #[test]
+    fn the_a16_tokenizer_is_pinned_and_named_after_its_artifact() {
+        let a16 = class_for_artifact_filename("qwen25-1.5b-a16.palwart").expect("the A16 class");
+        assert_eq!(a16.name, "PALW-QWEN25-A16");
+        assert_eq!(a16.tokenizer_filename().as_deref(), Some("qwen25-1.5b-a16.tokenizer.json"));
+        let pin = a16.tokenizer.expect("pinned");
+        assert_eq!(pin.sha256.len(), 64);
+        assert!(class_for_artifact_filename("nope.palwart").is_none());
+    }
+
+    /// Every class names the context it was registered at, and none claims zero.
+    #[test]
+    fn every_class_names_its_registered_context() {
+        let by_name: std::collections::HashMap<_, _> = TESTNET11_CLASSES.iter().map(|c| (c.name, c.context_tokens)).collect();
+        assert_eq!(by_name["PALW-BASE-0"], 12);
+        assert_eq!(by_name["PALW-QWEN25-A16"], 512);
+        assert_eq!(by_name["QWEN36"], 512);
+    }
+
     /// The convert-locally branch, which no currently registered class takes. Kept covered
     /// because "not reachable today" and "correct" are different claims.
     #[test]
@@ -427,6 +620,8 @@ mod tests {
                 convert_command: "convert --out out.palwart",
             },
             is_base: false,
+            context_tokens: 512,
+            tokenizer: None,
         }];
 
         let missing = assess(ONLY, &[], 64 << 30);

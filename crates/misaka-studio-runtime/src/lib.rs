@@ -25,6 +25,7 @@
 pub mod api;
 pub mod backend;
 pub mod catalog;
+pub mod context;
 pub mod download;
 pub mod engines;
 pub mod error;

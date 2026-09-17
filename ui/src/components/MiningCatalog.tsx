@@ -17,9 +17,10 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../lib/api'
 import { bytes } from '../lib/format'
-import type { PalwClassStatus } from '../lib/types'
+import type { PalwArtifactHeader, PalwClassStatus } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { CopyButton, Icon, Spinner } from './common'
+import { ClassContext } from './ContextBadge'
 
 /**
  * The class the runtime installs on first run — `palw::DEFAULT_CLASS`, repeated here only to put
@@ -91,6 +92,7 @@ export function InstalledMiningArtifacts() {
                 <h4 className="mono text-sm font-semibold">{cls.spec.name}</h4>
                 <span className="badge bg-arc-500/15 text-arc-700 dark:text-arc-300">{cls.spec.share_permille}‰ share</span>
                 {cls.spec.name === DEFAULT_CLASS && <span className="badge bg-arc-600 text-white">default class</span>}
+                <ClassContext registered={cls.spec.context_tokens} header={cls.artifact_header} />
                 {readiness.state === 'artifact_present' ? (
                   <span className="badge bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">on disk</span>
                 ) : (
@@ -99,6 +101,8 @@ export function InstalledMiningArtifacts() {
               </div>
               <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-[0.7rem] text-ink-500 dark:text-ink-400">
                 <span>{bytes(size)}</span>
+                <span>registered at {cls.spec.context_tokens.toLocaleString()} tokens</span>
+                {cls.artifact_header && <FileShape header={cls.artifact_header} />}
                 <span className="mono truncate">{path}</span>
               </div>
               {/* Presence is a filename, not an identity. The node re-derives the registered root
@@ -171,6 +175,15 @@ export function MiningCatalog() {
   )
 }
 
+/** What the file's own header says: its rotary table and its layers. */
+function FileShape({ header }: { header: PalwArtifactHeader }) {
+  return (
+    <span title={`From the artifact's header: ${header.n_layers} layers, ${header.n_heads} heads (${header.n_kv_heads} kv), vocab ${header.vocab.toLocaleString()}`}>
+      file: {header.max_position.toLocaleString()}-position rotary table · {header.n_layers} layers
+    </span>
+  )
+}
+
 function MiningRow({ cls, onInstall }: { cls: PalwClassStatus; onInstall: (name: string) => void }) {
   const { spec, readiness } = cls
   const system = useStudio((s) => s.system)
@@ -207,6 +220,7 @@ function MiningRow({ cls, onInstall }: { cls: PalwClassStatus; onInstall: (name:
         <span className="badge bg-arc-500/15 text-arc-700 dark:text-arc-300">{spec.share_permille}‰ share</span>
         {spec.name === DEFAULT_CLASS && <span className="badge bg-arc-600 text-white">default · installed on first run</span>}
         {spec.is_base && <span className="badge bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300">floor · always producible</span>}
+        <ClassContext registered={spec.context_tokens} header={cls.artifact_header} />
         {badge}
       </div>
 
@@ -235,6 +249,8 @@ function MiningRow({ cls, onInstall }: { cls: PalwClassStatus; onInstall: (name:
           </>
         )}
         {artifact.kind === 'derived_from_seed' && <span>no file — every node derives this class's artifact from a seed</span>}
+        <span>registered at {spec.context_tokens.toLocaleString()} tokens</span>
+        {cls.artifact_header && <FileShape header={cls.artifact_header} />}
         {readiness.state === 'artifact_present' && <span className="mono truncate">{readiness.path}</span>}
       </div>
 

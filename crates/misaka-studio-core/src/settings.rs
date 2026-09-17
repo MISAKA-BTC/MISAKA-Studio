@@ -461,6 +461,32 @@ impl GenerationDefaults {
     }
 }
 
+/// **How a conversation is fitted into a model's window** — the context manager's settings.
+///
+/// A class registered at 512 tokens holds a question and an answer, not a conversation. What the
+/// manager keeps, in order: the system prompt, the question, the conversation's pinned notes, as
+/// many recent turns as fit whole, and a compact memory of the older ones.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextSettings {
+    /// Summarise older turns with this installed GGUF on a local llama.cpp engine, started beside
+    /// the chat engine for the purpose. `None` extracts the memory instead: no model, no memory
+    /// cost, instant, and coarser.
+    pub summarizer_model: Option<String>,
+    /// The `tokenizer.json` to count tokens with. `None` resolves it: the class's pinned tokenizer
+    /// beside its artifact, then `backend.misaka_tokenizer_path`, then an estimate.
+    pub tokenizer_path: Option<PathBuf>,
+    /// Download a class's pinned tokenizer beside its artifact when the class is loaded without
+    /// one. 7 MB, verified against the pinned digest.
+    pub fetch_class_tokenizer: bool,
+}
+
+impl Default for ContextSettings {
+    fn default() -> Self {
+        ContextSettings { summarizer_model: None, tokenizer_path: None, fetch_class_tokenizer: true }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -483,6 +509,7 @@ pub struct Settings {
     pub backend: BackendSettings,
     pub node: NodeSettings,
     pub generation: GenerationDefaults,
+    pub context: ContextSettings,
     pub huggingface: HuggingFaceSettings,
     pub ui: UiSettings,
     pub provenance: ProvenanceSettings,
@@ -497,6 +524,7 @@ impl Default for Settings {
             backend: BackendSettings::default(),
             node: NodeSettings::default(),
             generation: GenerationDefaults::default(),
+            context: ContextSettings::default(),
             huggingface: HuggingFaceSettings::default(),
             ui: UiSettings::default(),
             provenance: ProvenanceSettings::default(),

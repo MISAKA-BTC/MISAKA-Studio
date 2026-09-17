@@ -17,7 +17,8 @@ use futures_util::StreamExt;
 use misaka_studio_core::provenance::SamplingCommitment;
 use misaka_studio_core::settings::{BackendKind, BackendSettings, Settings};
 use misaka_studio_runtime::AppState;
-use misaka_studio_runtime::backend::{ChatMessage, StreamEvent, prompt_tokens_upper_bound};
+use misaka_studio_runtime::backend::{ChatMessage, StreamEvent};
+use misaka_studio_runtime::context::tokens::TokenCounter;
 use std::sync::{Arc, Mutex};
 
 type Seen = Arc<Mutex<Vec<serde_json::Value>>>;
@@ -43,7 +44,7 @@ async fn gateway() -> (String, Seen) {
     (base, seen)
 }
 
-async fn studio(url: &str) -> (Arc<AppState>, tempfile::TempDir) {
+async fn studio(url: &str, tokenizer: Option<std::path::PathBuf>) -> (Arc<AppState>, tempfile::TempDir) {
     let data = tempfile::tempdir().unwrap();
     let models = data.path().join("models");
     std::fs::create_dir_all(&models).unwrap();
@@ -54,15 +55,25 @@ async fn studio(url: &str) -> (Arc<AppState>, tempfile::TempDir) {
         ..Default::default()
     };
     settings.node.palw_gateway_url = Some(url.to_string());
+    // A test must not fetch 7 MB from Hugging Face because it loaded a class artifact.
+    settings.context.fetch_class_tokenizer = false;
+    settings.context.tokenizer_path = tokenizer;
     let state = AppState::new(settings, data.path().join("settings.json"), data.path().to_path_buf()).await;
     state.store.refresh().await.unwrap();
     state.load("qwen25-1.5b-a16", None).await.expect("the gateway 'loads'");
     (state, data)
 }
 
-const QUESTION: &str = "原点 O(0, 0) を中心とする半径 1 の円に, 円外の点 P(x0, y0) から 2 本の接線を引く。\n\
+/// The field report's question, whole. Qwen2.5 counts it at 140 tokens; the estimate the Studio
+/// falls back on without the tokenizer counts 168 — enough that, beside the system prompt and the
+/// instruction, no tail of the answer fits. So the estimate-only test asks part (1) alone, and the
+/// whole question runs with the real tokenizer below.
+const QUESTION_WHOLE: &str = "原点 O(0, 0) を中心とする半径 1 の円に, 円外の点 P(x0, y0) から 2 本の接線を引く。\n\
 (1) 2 つの接点の中点を Q とするとき, 点 Q の座標 (x1, y1) を, 点 P の座標 (x0, y0) を用いて表せ。また, OP･OQ=1 であることを示せ。\n\
 (2) 点 P が直線 x+y=2 上を動くとき, 点 Q の軌跡を求めよ。";
+
+const QUESTION: &str =
+    "原点 O(0, 0) を中心とする半径 1 の円に, 円外の点 P(x0, y0) から 2 本の接線を引く。2 つの接点の中点 Q の座標を求めよ。";
 
 /// The mined answer as it was cut off (the real one, from the queue, 256 tokens).
 const PARTIAL: &str = "(1) まず、点 P から引いた 2 本の接線をそれぞれ $l_1$ と $l_2$ とします。これらの接線の接点を $A$ と $B$ とします。\n\n\
@@ -74,7 +85,7 @@ $l_1: x_1 = \\frac{x_0 - 1}{y_0 - 0}(y - 1)$\n$l_2: x_1 = \\frac{x_0 + 1}{y_0 - 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_lane_is_sent_the_question_and_the_end_of_the_answer_within_its_window() {
     let (url, seen) = gateway().await;
-    let (state, _data) = studio(&url).await;
+    let (state, _data) = studio(&url, None).await;
 
     // What the chat sends on 続きを生成: the conversation as it stands, ending in the cut-off reply.
     let messages = vec![
@@ -106,9 +117,44 @@ async fn the_lane_is_sent_the_question_and_the_end_of_the_answer_within_its_wind
 
     // It fits: the prompt estimate plus the decode ceiling the lane was asked for stay in 512.
     let ceiling = bodies[0]["max_tokens"].as_u64().unwrap();
-    let prompt = prompt_tokens_upper_bound(&sent);
+    let prompt = TokenCounter::estimate().messages(&sent);
     assert!(prompt + ceiling <= 512, "prompt {prompt} + ceiling {ceiling} over the class's window");
     assert!(ceiling >= 96, "and leaves a real answer's worth of room: {ceiling}");
+}
+
+/// The whole field question, counted with Qwen2.5's own tokenizer: it fits, and the lane is sent
+/// the question whole and the end of the answer, inside the window by the tokenizer's count.
+/// Runs when `MISAKA_TEST_QWEN25_TOKENIZER` names the tokenizer file.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_the_real_tokenizer_the_whole_question_and_a_tail_fit() {
+    let Ok(path) = std::env::var("MISAKA_TEST_QWEN25_TOKENIZER") else {
+        eprintln!("skipping: set MISAKA_TEST_QWEN25_TOKENIZER to Qwen2.5's tokenizer.json");
+        return;
+    };
+    let (url, seen) = gateway().await;
+    let (state, _data) = studio(&url, Some(path.clone().into())).await;
+    let counter = TokenCounter::from_tokenizer_file(std::path::Path::new(&path)).unwrap();
+    let messages = vec![
+        ChatMessage::new("system", "日本語で答えてください。"),
+        ChatMessage::new("user", QUESTION_WHOLE),
+        ChatMessage::new("assistant", PARTIAL),
+    ];
+    let params = SamplingCommitment { max_tokens: 2048, ..Default::default() };
+    let (report, mut stream) = state.generate_managed(messages, None, params, Vec::new(), Vec::new()).await.expect("sent");
+    while stream.next().await.is_some() {}
+    let report = report.expect("a chat has a context report");
+    assert!(report.continuation);
+    assert!(matches!(report.counter, misaka_studio_runtime::context::tokens::CounterSource::Tokenizer { .. }));
+    let bodies = seen.lock().unwrap().clone();
+    let sent: Vec<ChatMessage> = serde_json::from_value(bodies[0]["messages"].clone()).unwrap();
+    let turn = &sent.last().unwrap().content;
+    assert!(turn.starts_with(QUESTION_WHOLE), "{turn}");
+    assert!(turn.ends_with("これらを x_1 と"), "{turn}");
+    let prompt = counter.messages(&sent);
+    let ceiling = bodies[0]["max_tokens"].as_u64().unwrap();
+    eprintln!("prompt {prompt} + ceiling {ceiling}");
+    assert!(prompt + ceiling <= 512, "prompt {prompt} + ceiling {ceiling} by the class's own tokenizer");
+    assert_eq!(report.prompt_tokens, prompt, "the report counts what was sent");
 }
 
 /// A question so long that nothing of the answer fits beside it is told so — it is not sent as a
@@ -116,7 +162,7 @@ async fn the_lane_is_sent_the_question_and_the_end_of_the_answer_within_its_wind
 #[tokio::test(flavor = "multi_thread")]
 async fn a_continuation_with_no_room_is_refused_with_a_sentence() {
     let (url, seen) = gateway().await;
-    let (state, _data) = studio(&url).await;
+    let (state, _data) = studio(&url, None).await;
     let messages = vec![ChatMessage::new("user", QUESTION.repeat(3)), ChatMessage::new("assistant", PARTIAL)];
     let refused = match state.generate(messages, None, SamplingCommitment { max_tokens: 2048, ..Default::default() }, Vec::new()).await
     {

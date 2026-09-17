@@ -176,6 +176,8 @@ mod tests {
 
     fn request(text: &str) -> GenerationRequest {
         GenerationRequest {
+            prompt_tokens: None,
+            disable_thinking: false,
             model: "mock".into(),
             messages: vec![ChatMessage::new("user", text)],
             prompt: None,

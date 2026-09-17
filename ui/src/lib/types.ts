@@ -286,6 +286,12 @@ export type Settings = {
     extra_args: string[]
     startup_timeout_secs: number
   }
+  context: {
+    /** A GGUF model id to summarise older turns with; null extracts them instead. */
+    summarizer_model: string | null
+    tokenizer_path: string | null
+    fetch_class_tokenizer: boolean
+  }
   generation: {
     system_prompt: string
     context_size: number | null
@@ -370,6 +376,38 @@ export type ChatMessage = {
   stats?: TurnStats
   /** Set on a user message that was queued for mining behind the chat. */
   mining?: MessageMining
+  /** On an assistant reply: what the context manager sent the model to produce it. */
+  context?: ContextReport
+}
+
+/** How a count of tokens was made: the model's own tokenizer, or an upper-bound estimate. */
+export type CounterSource = { kind: 'tokenizer'; path: string } | { kind: 'estimate' }
+
+export type MemoryReport = {
+  source: 'summary' | 'extract'
+  messages_covered: number
+  tokens: number
+  note: string | null
+}
+
+/** The context manager's account of one request (runtime `context::ContextReport`). */
+export type ContextReport = {
+  /** False when the conversation fitted as it was. */
+  managed: boolean
+  window: number
+  answer_reserve: number
+  prompt_budget: number
+  prompt_tokens: number
+  counter: CounterSource
+  pinned_included: number
+  pinned_omitted: number
+  recent_messages: number
+  older_messages: number
+  memory: MemoryReport | null
+  continuation: boolean
+  question_over_budget: boolean
+  /** The messages exactly as sent, when the manager changed them. */
+  sent: { role: string; content: string }[] | null
 }
 
 export type Conversation = {
@@ -379,6 +417,8 @@ export type Conversation = {
   updatedAt: number
   modelId: string | null
   messages: ChatMessage[]
+  /** Standing facts for this conversation, kept in every request ahead of history. */
+  pinned?: string[]
 }
 
 // --- the Network tab -------------------------------------------------------
@@ -394,6 +434,18 @@ export type PalwClassReadiness =
   | { state: 'artifact_missing'; downloadable: boolean }
   | { state: 'artifact_mismatch'; path: string; size_bytes: number; expected_bytes: number }
 
+/** The shape block of a class artifact on disk, read from its first 64 bytes. */
+export type PalwArtifactHeader = {
+  n_layers: number
+  n_heads: number
+  n_kv_heads: number
+  d_head: number
+  d_ff: number
+  vocab: number
+  /** Positions the file's rotary table covers: the most any class can run this file at. */
+  max_position: number
+}
+
 export type PalwClassStatus = {
   spec: {
     name: string
@@ -404,9 +456,13 @@ export type PalwClassStatus = {
     artifact_root_hex: string
     artifact: PalwArtifactSource
     is_base: boolean
+    /** The n_ctx the class was registered at: 12, 512, 2M… A registration choice, not the weights'. */
+    context_tokens: number
   }
   readiness: PalwClassReadiness
   memory_note: string | null
+  /** Null when no file is on disk or its format is not one the runtime reads a header from. */
+  artifact_header: PalwArtifactHeader | null
 }
 
 export type NodeStatus = {

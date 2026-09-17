@@ -16,6 +16,7 @@ import type { ChatMessage, MessageMining } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { CopyButton, EmptyState, Icon, Spinner } from './common'
 import { Markdown } from './Markdown'
+import { ContextLine, PinnedNotes, pinTextFromMessage } from './ContextPanel'
 import { useClassStatuses } from './MiningCatalog'
 import { ModelBar } from './ModelBar'
 import misakaPi from '../assets/misaka-pi.png'
@@ -166,6 +167,7 @@ export function ChatView() {
   return (
     <div className="flex h-full min-w-0 flex-col">
       <ModelBar />
+      <PinnedNotes />
 
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
         {visibleMessages.length === 0 ? (
@@ -348,6 +350,8 @@ function Message({
               </div>
             )}
 
+            {!isUser && !message.streaming && message.context && <ContextLine report={message.context} />}
+
             {message.error && (
               <p className="mt-2 flex items-start gap-2 rounded-lg bg-red-50 p-2 text-xs text-red-700 dark:bg-red-950/40 dark:text-red-300">
                 <Icon name="warning" className="mt-0.5 size-3.5 shrink-0" />
@@ -367,6 +371,7 @@ function Message({
               </span>
             )}
             {message.content && <CopyButton text={message.content} label="Copy message" className="btn-ghost px-1.5 py-1" />}
+            {message.content && !message.streaming && <PinButton content={message.content} />}
             {isUser && (
               <button type="button" className="btn-ghost px-1.5 py-1" onClick={onEdit} title="Edit and re-run">
                 <Icon name="edit" className="size-3.5" />
@@ -381,5 +386,24 @@ function Message({
         )}
       </div>
     </div>
+  )
+}
+
+/** Pin a message's text to the conversation. Trimmed; the pinned notes panel is where to edit it. */
+function PinButton({ content }: { content: string }) {
+  const addPin = useStudio((s) => s.addPin)
+  const toast = useStudio((s) => s.toast)
+  return (
+    <button
+      type="button"
+      className="btn-ghost px-1.5 py-1"
+      title="Pin to this conversation: kept in every request ahead of the history"
+      onClick={() => {
+        addPin(pinTextFromMessage(content))
+        toast('success', 'Pinned. Edit or remove it under Pinned notes.')
+      }}
+    >
+      <Icon name="pin" className="size-3.5" />
+    </button>
   )
 }
