@@ -50,8 +50,8 @@ pub enum JobStatus {
     Queued,
     /// Handed to the gateway; the worker is inside the request.
     Running,
-    /// The gateway answered with a job block: the claim is committed and the slot's submitter
-    /// carries it to the chain.
+    /// The gateway answered with a job block that says it committed: the claim is queued and the
+    /// slot's submitter carries it to the chain.
     Committed,
     /// The lane said no, about this job: a 4xx with a reason. Not retried.
     Refused,
@@ -478,6 +478,16 @@ async fn run_job(job: &MiningJob, url: &str, token: Option<&str>) -> std::result
             // An answer with no job block is a chat, not a job — it mined nothing.
             return Err(Outcome::Refused("the gateway answered without a job block: that reply was a chat, not a claim".into()));
         }
+        // **A job block is not a commitment.** The gateway answers every prompt and says, in the
+        // same block, whether the answer became a claim (`committed`) and why not
+        // (`not_committed_because`) — the bond's room, the operator's public-job budget, a class
+        // the chain would refuse. Counting every job block as `Committed` showed a chat that mined
+        // nothing as mined. A gateway older than the field says nothing, and is taken at its job
+        // block as before.
+        if misaka.and_then(|m| m.get("committed")).and_then(|v| v.as_bool()) == Some(false) {
+            let why = field("not_committed_because").unwrap_or_else(|| "the gateway gave no reason".to_string());
+            return Err(Outcome::Refused(format!("answered, not committed: {why}")));
+        }
         let usage = |key: &str| body.get("usage").and_then(|u| u.get(key)).and_then(|v| v.as_u64());
         return Ok(Done {
             answer,
@@ -580,5 +590,69 @@ mod tests {
         assert_eq!(queue.list().await.iter().find(|j| j.id == a.id).map(|j| j.status), Some(JobStatus::Queued));
         assert!(!queue.remove(&b.id).await, "a running job belongs to the gateway until it finishes");
         assert!(queue.remove(&a.id).await);
+    }
+
+    /// A gateway that answers every chat with the same job block.
+    async fn fake_gateway(misaka: serde_json::Value) -> String {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let misaka = misaka.clone();
+                async move {
+                    axum::Json(serde_json::json!({
+                        "choices": [{ "message": { "role": "assistant", "content": "answer" } }],
+                        "usage": { "prompt_tokens": 12, "completion_tokens": 3 },
+                        "misaka": misaka,
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// **A job block that says it did not commit is a refusal, not `Committed`.** The 2026-09-20
+    /// economy drill: the gateway answered, kept the claim off the chain ("the public-job budget
+    /// for this window is spent") and said so in `committed: false`; the queue counted the job as
+    /// mined because it only looked for the job block.
+    #[tokio::test]
+    async fn an_answer_the_gateway_did_not_commit_is_refused_with_the_gateways_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue = MiningQueue::open(dir.path().join("q.json")).await;
+        let job = queue.enqueue("hello".into(), None, None, None, "http://gw".into()).await;
+
+        let refused = fake_gateway(serde_json::json!({
+            "fp_job_id": "fp-job-1",
+            "fp_claim_id": "1d1b",
+            "committed": false,
+            "not_committed_because": "the public-job budget for this window is spent",
+        }))
+        .await;
+        match run_job(&job, &refused, None).await {
+            Err(Outcome::Refused(why)) => {
+                assert!(why.contains("not committed") && why.contains("public-job budget"), "{why}")
+            }
+            Err(Outcome::Transient(why)) => panic!("a verdict is not a machine being away: {why}"),
+            Ok(_) => panic!("an answer the gateway did not commit was counted as mined"),
+        }
+
+        let committed = fake_gateway(serde_json::json!({
+            "fp_job_id": "fp-job-2",
+            "fp_claim_id": "2e2c",
+            "committed": true,
+            "not_committed_because": null,
+        }))
+        .await;
+        let done = run_job(&job, &committed, None).await.ok().expect("a committed answer is done");
+        assert_eq!(done.claim_id.as_deref(), Some("2e2c"));
+
+        // A gateway older than the verdict says nothing about it and is taken at its job block.
+        let older = fake_gateway(serde_json::json!({ "fp_job_id": "fp-job-3", "fp_claim_id": "3f3d" })).await;
+        let done = run_job(&job, &older, None).await.ok().expect("a job block without a verdict is done");
+        assert_eq!(done.claim_id.as_deref(), Some("3f3d"));
     }
 }

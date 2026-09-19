@@ -291,10 +291,23 @@ impl InferenceBackend for GatewayBackend {
                     // follow to the chain.
                     tail.extend_from_slice(&chunk);
                     if !claim_seen.load(std::sync::atomic::Ordering::Relaxed)
-                        && let Some(claim) = claim_id_in(&tail)
+                        && let Some(outcome) = claim_outcome_in(&tail)
                     {
                         claim_seen.store(true, std::sync::atomic::Ordering::Relaxed);
-                        tracing::info!(claim = %claim, "free-prompt claim committed");
+                        // The gateway says whether this answer became a claim. A claim id alone
+                        // is not a commitment: it is what the job WOULD claim, reported even when
+                        // the bond's room or the operator's budget kept it off the chain.
+                        match outcome.committed {
+                            Some(true) => tracing::info!(claim = %outcome.claim, "free-prompt claim committed"),
+                            Some(false) => tracing::warn!(
+                                claim = %outcome.claim,
+                                reason = %outcome.not_committed_because.as_deref().unwrap_or("the gateway gave no reason"),
+                                "answered, not committed: this chat is not on its way to the chain"
+                            ),
+                            None => {
+                                tracing::info!(claim = %outcome.claim, "free-prompt claim (this gateway does not say whether it committed)")
+                            }
+                        }
                     }
                     for event in parser.push(&chunk) {
                         if tx.send(Ok(event)).await.is_err() {
@@ -372,14 +385,32 @@ pub(crate) fn ceiling_from_refusal(message: &str) -> Option<u64> {
     ctx.checked_sub(prompt + 1).filter(|room| *room > 0)
 }
 
-/// The claim id out of whatever of the stream has arrived, once the gateway's final event lands.
-fn claim_id_in(bytes: &[u8]) -> Option<String> {
+/// What the gateway's last event says about this chat's claim.
+#[derive(Debug, PartialEq, Eq)]
+struct ClaimOutcome {
+    claim: String,
+    /// `None` from a gateway that does not report it.
+    committed: Option<bool>,
+    not_committed_because: Option<String>,
+}
+
+/// The gateway's verdict out of whatever of the stream has arrived, once its final event — the
+/// one carrying `misaka` — is complete. Parsed as JSON rather than scanned: `committed` and the
+/// reason ride beside the claim id, and the claim id alone read as "committed" when it was not.
+fn claim_outcome_in(bytes: &[u8]) -> Option<ClaimOutcome> {
     let text = String::from_utf8_lossy(bytes);
-    let start = text.find("\"fp_claim_id\"")?;
-    let rest = &text[start + "\"fp_claim_id\"".len()..];
-    let open = rest.find('"')? + 1;
-    let end = rest[open..].find('"')? + open;
-    Some(rest[open..end].to_string())
+    for event in text.split("\n\n") {
+        let Some(data) = event.trim().strip_prefix("data:") else { continue };
+        let Ok(value) = serde_json::from_str::<Value>(data.trim()) else { continue };
+        let Some(misaka) = value.get("misaka") else { continue };
+        let Some(claim) = misaka.get("fp_claim_id").and_then(Value::as_str) else { continue };
+        return Some(ClaimOutcome {
+            claim: claim.to_string(),
+            committed: misaka.get("committed").and_then(Value::as_bool),
+            not_committed_because: misaka.get("not_committed_because").and_then(Value::as_str).map(str::to_string),
+        });
+    }
+    None
 }
 
 #[cfg(test)]
@@ -432,8 +463,28 @@ mod tests {
     fn the_claim_id_is_read_out_of_the_gateways_last_event() {
         let sse =
             b"data: {\"choices\":[]}\n\ndata: {\"misaka\":{\"fp_job_id\":\"aa\",\"fp_claim_id\":\"d6730d8aca86\"},\"usage\":{}}\n\n";
-        assert_eq!(claim_id_in(sse).as_deref(), Some("d6730d8aca86"));
+        assert_eq!(claim_outcome_in(sse).map(|o| o.claim).as_deref(), Some("d6730d8aca86"));
         // Nothing to find yet is not an error: the id arrives in the last event, after every delta.
-        assert_eq!(claim_id_in(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"), None);
+        assert_eq!(claim_outcome_in(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"), None);
+    }
+
+    /// **A claim id is not a commitment.** The 2026-09-20 economy drill: the gateway answered, did
+    /// not commit ("the public-job budget for this window is spent"), and the runtime logged
+    /// "free-prompt claim committed" off the claim id alone.
+    #[test]
+    fn the_gateways_commit_verdict_is_read_beside_the_claim_id() {
+        let refused = b"data: {\"misaka\":{\"fp_claim_id\":\"1d1b\",\"committed\":false,\"not_committed_because\":\"the public-job budget for this window is spent\"}}\n\n";
+        assert_eq!(
+            claim_outcome_in(refused),
+            Some(ClaimOutcome {
+                claim: "1d1b".into(),
+                committed: Some(false),
+                not_committed_because: Some("the public-job budget for this window is spent".into()),
+            })
+        );
+        let committed = b"data: {\"misaka\":{\"fp_claim_id\":\"1d1b\",\"committed\":true,\"not_committed_because\":null}}\n\n";
+        assert_eq!(claim_outcome_in(committed).and_then(|o| o.committed), Some(true));
+        // A final event cut mid-JSON is not read until it is whole.
+        assert_eq!(claim_outcome_in(b"data: {\"misaka\":{\"fp_claim_id\":\"1d1b\",\"comm"), None);
     }
 }
