@@ -1,9 +1,9 @@
 // The question every miner asks first — how many tries is a block? — answered in the node's own
 // numbers, for the two ways a pool slot earns.
 //
-// A prompt is not a lottery ticket. It is one claim, carried by whichever block comes next, paid by
-// its work units when the claim is Final. The slot's own draws ARE a lottery: a draw wins a block
-// when it passes the class ticket and the Layer-0 target, and the node states both odds in its log
+// A prompt in the free-prompt lane is one claim, carried by whichever block comes next, paid by
+// its work units when the claim is Final. The model class's own draws ARE a lottery: a draw wins a
+// separate block when it passes the class ticket and the Layer-0 target, and the node states both odds in its log
 // every five minutes. This card multiplies them out so "1 in 6,300 draws at 0.9 draws/s ≈ 2 h" is
 // read off rather than worked out.
 
@@ -36,7 +36,7 @@ export function MiningDifficultyCard({ pool }: { pool: PoolStatus }) {
       <div className="mt-2 grid gap-2 sm:grid-cols-2">
         <div className="rounded-md bg-ink-50 p-2 dark:bg-ink-900/60">
           <div className="text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">Your prompts</div>
-          <div className="mt-0.5 text-sm font-medium">1 question = 1 claim</div>
+          <div className="mt-0.5 text-sm font-medium">Prompt lane: 1 question = 1 claim</div>
           <div className="mt-0.5 text-[0.7rem] leading-relaxed text-ink-500 dark:text-ink-400">
             No lottery: every prompt you send becomes one committed claim, carried by whichever block comes next (minutes,
             at this chain&apos;s pace) and paid by its work units once Final.
@@ -49,7 +49,7 @@ export function MiningDifficultyCard({ pool }: { pool: PoolStatus }) {
           {d && d.draws_per_block ? (
             <>
               <div className="mt-0.5 text-sm font-medium">
-                1 block per ~{Math.round(d.draws_per_block).toLocaleString()} draws
+                Model lane: 1 block per ~{Math.round(d.draws_per_block).toLocaleString()} draws
                 {d.expected_seconds_per_block ? <> · ≈ {fmtDuration(d.expected_seconds_per_block)} each</> : null}
               </div>
               <div className="mt-0.5 text-[0.7rem] leading-relaxed text-ink-500 dark:text-ink-400">

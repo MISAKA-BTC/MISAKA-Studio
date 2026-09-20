@@ -90,7 +90,7 @@ export function InstalledMiningArtifacts() {
             <div key={cls.spec.name} className="rounded-xl border border-ink-200 p-3 dark:border-ink-800">
               <div className="flex flex-wrap items-center gap-2">
                 <h4 className="mono text-sm font-semibold">{cls.spec.name}</h4>
-                <span className="badge bg-arc-500/15 text-arc-700 dark:text-arc-300">{cls.spec.share_permille}‰ share</span>
+                <span className="badge bg-arc-500/15 text-arc-700 dark:text-arc-300">{cls.spec.share_permille}‰ emission share</span>
                 {cls.spec.name === DEFAULT_CLASS && <span className="badge bg-arc-600 text-white">default class</span>}
                 <ClassContext registered={cls.spec.context_tokens} header={cls.artifact_header} />
                 {readiness.state === 'artifact_present' ? (
@@ -147,7 +147,9 @@ export function MiningCatalog() {
       <p className="mt-1 text-xs leading-relaxed text-ink-500 dark:text-ink-400">
         A block on the MISAKA network is won by verified inference in one of these chain-registered classes, and each one names
         the Hugging Face repository it is installed from. The share is that class's cut of the emission. Everything else in
-        Discover is a model to chat with; only these produce blocks.
+        Discover is a model to chat with; only these produce blocks. The share opens a class-specific epoch block budget — it
+        is not a multiplier on one claim. Each successful model draw can win a separate block, while the claim and block
+        identities remain separate in the Explorer.
       </p>
 
       {error && (
@@ -217,7 +219,9 @@ function MiningRow({ cls, onInstall }: { cls: PalwClassStatus; onInstall: (name:
     <div className="rounded-xl border border-ink-200 p-3 dark:border-ink-800">
       <div className="flex flex-wrap items-center gap-2">
         <h4 className="mono text-sm font-semibold">{spec.name}</h4>
-        <span className="badge bg-arc-500/15 text-arc-700 dark:text-arc-300">{spec.share_permille}‰ share</span>
+        <span className="badge bg-arc-500/15 text-arc-700 dark:text-arc-300" title="This class's share of the epoch emission; consensus budgets it as class-specific blocks">
+          {spec.share_permille}‰ emission share
+        </span>
         {spec.name === DEFAULT_CLASS && <span className="badge bg-arc-600 text-white">default · installed on first run</span>}
         {spec.is_base && <span className="badge bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300">floor · always producible</span>}
         <ClassContext registered={spec.context_tokens} header={cls.artifact_header} />
@@ -225,6 +229,13 @@ function MiningRow({ cls, onInstall }: { cls: PalwClassStatus; onInstall: (name:
       </div>
 
       <p className="mt-1.5 text-xs leading-relaxed text-ink-600 dark:text-ink-300">{spec.description}</p>
+
+      <p className="mt-2 rounded-lg bg-ink-50 p-2 text-[0.7rem] leading-relaxed text-ink-500 dark:bg-ink-900/60 dark:text-ink-400">
+        {spec.is_base
+          ? 'Generation mode: deterministic floor — always producible and outside the model-class epoch budget.'
+          : 'Generation mode: verified-inference lottery — each winning inference can make one block; this class may win multiple blocks up to its epoch budget.'}
+        {' '}The Explorer shows the separate claim ↔ block relationship.
+      </p>
 
       <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[0.7rem] text-ink-500 dark:text-ink-400">
         {repo && (

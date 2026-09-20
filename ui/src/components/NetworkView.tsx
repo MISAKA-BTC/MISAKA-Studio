@@ -855,7 +855,9 @@ function ClassCard({
     <div className="rounded-xl border border-ink-200 p-4 dark:border-ink-800">
       <div className="flex flex-wrap items-center gap-2">
         <h4 className="mono text-sm font-semibold">{spec.name}</h4>
-        <span className="badge bg-arc-500/15 text-arc-700 dark:text-arc-300">{spec.share_permille}‰ share</span>
+        <span className="badge bg-arc-500/15 text-arc-700 dark:text-arc-300" title="This class's share of the epoch emission; it is converted into a class-specific block budget">
+          {spec.share_permille}‰ emission share
+        </span>
         {spec.is_base && <span className="badge bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300">floor · always producible</span>}
         {badge}
         {live && (
@@ -867,6 +869,15 @@ function ClassCard({
       </div>
 
       <p className="mt-2 text-xs leading-relaxed text-ink-600 dark:text-ink-300">{spec.description}</p>
+      <p className="mt-2 rounded-lg bg-ink-50 p-2 text-[0.7rem] leading-relaxed text-ink-500 dark:bg-ink-900/60 dark:text-ink-400">
+        {spec.is_base
+          ? 'Generation mode: deterministic floor — always producible and outside the model-class epoch budget.'
+          : 'Generation mode: verified-inference lottery — each winning inference can produce one block; the class can win multiple blocks up to its epoch budget.'}
+        {live?.budget_blocks !== null && live?.budget_blocks !== undefined && (
+          <> Current node budget: <b>{live.budget_blocks.toLocaleString()} blocks/epoch</b>.</>
+        )}
+        {' '}The Explorer keeps claim and block counts separate.
+      </p>
 
       <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[0.7rem] text-ink-500 dark:text-ink-400">
         {spec.artifact.kind === 'download' && (
