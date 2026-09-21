@@ -19,6 +19,7 @@ use crate::catalog::Catalog;
 use crate::store::{ModelStore, Sidecar};
 use crate::{Error, Result};
 use misaka_studio_core::model::ModelSource;
+use misaka_studio_core::palw;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -207,10 +208,17 @@ impl DownloadManager {
         let id = format!("{repo}/{file}");
 
         if destination.exists() {
-            return Err(Error::bad_request(format!(
-                "{} already exists — delete it first to download it again",
-                destination.display()
-            )));
+            // Class artifacts are installed from Hugging Face by name; "Install anyway" on a card
+            // that already holds the file must be able to replace it. Chat GGUFs still refuse —
+            // overwriting a loaded model mid-session is a different kind of damage.
+            if palw::is_artifact_filename(&file_name) {
+                tokio::fs::remove_file(&destination).await.map_err(|e| Error::io(destination.display(), e))?;
+            } else {
+                return Err(Error::bad_request(format!(
+                    "{} already exists — delete it first to download it again",
+                    destination.display()
+                )));
+            }
         }
         {
             let jobs = self.jobs.read().await;
@@ -715,6 +723,29 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already exists"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn installing_a_class_artifact_again_replaces_the_file() {
+        let (manager, catalog, store, dir) = setup().await;
+        let dest = dir.path().join("qwen25-1.5b-a16.palwart");
+        std::fs::write(&dest, b"stale").expect("write");
+        let progress = manager
+            .start(
+                &catalog,
+                store,
+                dir.path().to_path_buf(),
+                "org/repo".into(),
+                "abc".into(),
+                "qwen25-1.5b-a16.palwart".into(),
+                Some(sha256_of(BODY)),
+                Some(BODY.len() as u64),
+                None,
+            )
+            .await
+            .expect("a class artifact can be installed over one already on disk");
+        wait_for(&manager, &progress.id, DownloadStatus::Completed).await;
+        assert_eq!(std::fs::read(&dest).expect("read"), BODY);
     }
 
     #[test]

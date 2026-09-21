@@ -17,7 +17,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../lib/api'
 import { bytes } from '../lib/format'
-import type { PalwArtifactHeader, PalwClassStatus } from '../lib/types'
+import type { NodeClassRow, PalwArtifactHeader, PalwClassStatus } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { CopyButton, Icon, Spinner } from './common'
 import { ClassContext } from './ContextBadge'
@@ -34,6 +34,40 @@ function repoUrl(endpoint: string | undefined, repo: string): string {
   return `${base}/${repo}`
 }
 
+/** The node's dump row for this spec, if a node is up. Floor by base flag; others by class-id prefix. */
+function matchingNodeRow(spec: PalwClassStatus['spec'], rows: NodeClassRow[]): NodeClassRow | undefined {
+  return rows.find((row) => (spec.is_base ? row.base : spec.class_id_hex ? row.class_id.startsWith(spec.class_id_hex.slice(0, 16)) : false))
+}
+
+/**
+ * Live share is Final work (ADR-0137 D7), not the genesis permille table.
+ *
+ * The dump's `share=` is what the node currently prints for the class. When nothing is connected
+ * we do not fall back to the Relaunch 5f grant — that number is a lottery input the work target
+ * retired.
+ */
+function FinalWorkShare({ spec, rows }: { spec: PalwClassStatus['spec']; rows: NodeClassRow[] }) {
+  const live = matchingNodeRow(spec, rows)?.share_permille ?? null
+  if (live !== null) {
+    return (
+      <span
+        className="badge bg-arc-500/15 text-arc-700 dark:text-arc-300"
+        title="Fraction of finalized work this class provided in the reader's window (ADR-0137). A result, not a lottery input and not an epoch budget."
+      >
+        {live}‰ of Final work
+      </span>
+    )
+  }
+  return (
+    <span
+      className="badge bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300"
+      title="Share is still reported: the fraction of Final work this class provided. A node prints it; the genesis permille table is not it."
+    >
+      share from Finals
+    </span>
+  )
+}
+
 /**
  * The class list, re-read whenever a download settles.
  *
@@ -41,8 +75,9 @@ function repoUrl(endpoint: string | undefined, repo: string): string {
  * list that stays wrong until someone reloads the window, which is exactly the moment they would
  * conclude the download had failed.
  */
-export function useClassStatuses(): { classes: PalwClassStatus[] | null; error: string | null } {
+export function useClassStatuses(): { classes: PalwClassStatus[] | null; nodeRows: NodeClassRow[]; error: string | null } {
   const [classes, setClasses] = useState<PalwClassStatus[] | null>(null)
+  const [nodeRows, setNodeRows] = useState<NodeClassRow[]>([])
   const [error, setError] = useState<string | null>(null)
   const downloads = useStudio((s) => s.downloads)
   const settled = downloads.filter((d) => d.status === 'completed' || d.status === 'failed' || d.status === 'cancelled').length
@@ -54,13 +89,19 @@ export function useClassStatuses(): { classes: PalwClassStatus[] | null; error: 
     } catch (e) {
       setError((e as Error).message)
     }
+    try {
+      const overview = await api.network()
+      setNodeRows(overview.node.classes_from_node)
+    } catch {
+      setNodeRows([])
+    }
   }, [])
 
   useEffect(() => {
     void refresh()
   }, [refresh, settled])
 
-  return { classes, error }
+  return { classes, nodeRows, error }
 }
 
 /**
@@ -71,7 +112,7 @@ export function useClassStatuses(): { classes: PalwClassStatus[] | null; error: 
  * file could sit on disk with nothing in the app willing to admit it was there.
  */
 export function InstalledMiningArtifacts() {
-  const { classes } = useClassStatuses()
+  const { classes, nodeRows } = useClassStatuses()
   const held = (classes ?? []).filter((c) => c.readiness.state === 'artifact_present' || c.readiness.state === 'artifact_mismatch')
   if (held.length === 0) return null
 
@@ -90,7 +131,7 @@ export function InstalledMiningArtifacts() {
             <div key={cls.spec.name} className="rounded-xl border border-ink-200 p-3 dark:border-ink-800">
               <div className="flex flex-wrap items-center gap-2">
                 <h4 className="mono text-sm font-semibold">{cls.spec.name}</h4>
-                <span className="badge bg-arc-500/15 text-arc-700 dark:text-arc-300">{cls.spec.share_permille}‰ emission share</span>
+                <FinalWorkShare spec={cls.spec} rows={nodeRows} />
                 {cls.spec.name === DEFAULT_CLASS && <span className="badge bg-arc-600 text-white">default class</span>}
                 <ClassContext registered={cls.spec.context_tokens} header={cls.artifact_header} />
                 {readiness.state === 'artifact_present' ? (
@@ -124,7 +165,7 @@ export function InstalledMiningArtifacts() {
 }
 
 export function MiningCatalog() {
-  const { classes, error } = useClassStatuses()
+  const { classes, nodeRows, error } = useClassStatuses()
   const toast = useStudio((s) => s.toast)
   const setDownload = useStudio((s) => s.setDownload)
 
@@ -146,10 +187,10 @@ export function MiningCatalog() {
       </div>
       <p className="mt-1 text-xs leading-relaxed text-ink-500 dark:text-ink-400">
         A block on the MISAKA network is won by verified inference in one of these chain-registered classes, and each one names
-        the Hugging Face repository it is installed from. The share is that class's cut of the emission. Everything else in
-        Discover is a model to chat with; only these produce blocks. The share opens a class-specific epoch block budget — it
-        is not a multiplier on one claim. Each successful model draw can win a separate block, while the claim and block
-        identities remain separate in the Explorer.
+        the Hugging Face repository it is installed from. Everything else in Discover is a model to chat with; only these produce
+        blocks. Share is still reported: it is the fraction of finalized work a class provided, never a cut of the emission, never
+        a lottery input, never an epoch block budget. A block buys one unit of work from any model. Each successful model draw can
+        win a separate block; the Explorer keeps claim and block identities apart.
       </p>
 
       {error && (
@@ -170,7 +211,7 @@ export function MiningCatalog() {
 
       <div className="mt-3 space-y-2">
         {classes?.map((cls) => (
-          <MiningRow key={cls.spec.name} cls={cls} onInstall={install} />
+          <MiningRow key={cls.spec.name} cls={cls} nodeRows={nodeRows} onInstall={install} />
         ))}
       </div>
     </section>
@@ -186,7 +227,7 @@ function FileShape({ header }: { header: PalwArtifactHeader }) {
   )
 }
 
-function MiningRow({ cls, onInstall }: { cls: PalwClassStatus; onInstall: (name: string) => void }) {
+function MiningRow({ cls, nodeRows, onInstall }: { cls: PalwClassStatus; nodeRows: NodeClassRow[]; onInstall: (name: string) => void }) {
   const { spec, readiness } = cls
   const system = useStudio((s) => s.system)
   const downloads = useStudio((s) => s.downloads)
@@ -219,11 +260,9 @@ function MiningRow({ cls, onInstall }: { cls: PalwClassStatus; onInstall: (name:
     <div className="rounded-xl border border-ink-200 p-3 dark:border-ink-800">
       <div className="flex flex-wrap items-center gap-2">
         <h4 className="mono text-sm font-semibold">{spec.name}</h4>
-        <span className="badge bg-arc-500/15 text-arc-700 dark:text-arc-300" title="This class's share of the epoch emission; consensus budgets it as class-specific blocks">
-          {spec.share_permille}‰ emission share
-        </span>
+        <FinalWorkShare spec={spec} rows={nodeRows} />
         {spec.name === DEFAULT_CLASS && <span className="badge bg-arc-600 text-white">default · installed on first run</span>}
-        {spec.is_base && <span className="badge bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300">floor · always producible</span>}
+        {spec.is_base && <span className="badge bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300">floor · residual cadence, unpaid</span>}
         <ClassContext registered={spec.context_tokens} header={cls.artifact_header} />
         {badge}
       </div>
@@ -232,8 +271,8 @@ function MiningRow({ cls, onInstall }: { cls: PalwClassStatus; onInstall: (name:
 
       <p className="mt-2 rounded-lg bg-ink-50 p-2 text-[0.7rem] leading-relaxed text-ink-500 dark:bg-ink-900/60 dark:text-ink-400">
         {spec.is_base
-          ? 'Generation mode: deterministic floor — always producible and outside the model-class epoch budget.'
-          : 'Generation mode: verified-inference lottery — each winning inference can make one block; this class may win multiple blocks up to its epoch budget.'}
+          ? 'The floor fills whatever cadence the model classes leave and is paid nothing for it — residual liveness, not a share grant.'
+          : "A block buys one unit of work from any model. This class's ticket is its compute over the work target; a winning inference can make one block. Share is the Final work it provided, not a budget on how many blocks it may win."}
         {' '}The Explorer shows the separate claim ↔ block relationship.
       </p>
 
@@ -255,7 +294,7 @@ function MiningRow({ cls, onInstall }: { cls: PalwClassStatus; onInstall: (name:
         )}
         {artifact.kind === 'convert_locally' && (
           <>
-            <span className="mono">{artifact.extension}</span>
+            <span className="mono">{artifact.filename}</span>
             <span>~{bytes(artifact.approx_size_bytes)} once converted</span>
           </>
         )}
@@ -280,11 +319,11 @@ function MiningRow({ cls, onInstall }: { cls: PalwClassStatus; onInstall: (name:
         </p>
       )}
 
-      {artifact.kind === 'download' && readiness.state !== 'artifact_present' && (
+      {artifact.kind === 'download' && (
         <div className="mt-2.5">
-          {/* Offered even when the artifact is larger than this machine's memory. The note above
-              already says it will not run here, and hiding the button would leave someone
-              installing onto an external disk with no way to do it. */}
+          {/* Every class in this list is installed from Hugging Face. The button stays up when the
+              file is already here or larger than RAM: hiding it would leave a class that cannot be
+              (re)installed from the card that names it. */}
           <button
             type="button"
             className={cls.memory_note ? 'btn-ghost' : 'btn-outline'}
@@ -292,11 +331,7 @@ function MiningRow({ cls, onInstall }: { cls: PalwClassStatus; onInstall: (name:
             onClick={() => onInstall(spec.name)}
           >
             {inFlight ? <Spinner className="size-3.5" /> : <Icon name="download" className="size-3.5" />}
-            {inFlight
-              ? 'Installing…'
-              : cls.memory_note
-                ? `Install anyway — ${bytes(artifact.size_bytes)}`
-                : `Install ${bytes(artifact.size_bytes)}`}
+            {inFlight ? 'Installing…' : `Install anyway — ${bytes(artifact.size_bytes)}`}
           </button>
         </div>
       )}

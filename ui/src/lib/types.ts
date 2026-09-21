@@ -428,7 +428,7 @@ export type Conversation = {
 export type PalwArtifactSource =
   | { kind: 'derived_from_seed' }
   | { kind: 'download'; filename: string; repo_path: string; sha256: string; size_bytes: number; hf_repo: string; convert_command: string }
-  | { kind: 'convert_locally'; extension: string; approx_size_bytes: number; source_repo: string; convert_command: string }
+  | { kind: 'convert_locally'; filename: string; approx_size_bytes: number; source_repo: string; convert_command: string }
 
 export type PalwClassReadiness =
   | { state: 'ready_built_in' }
@@ -452,6 +452,7 @@ export type PalwClassStatus = {
   spec: {
     name: string
     description: string
+    /** Genesis-table leftover. Live share is Final work (ADR-0137), not this number. */
     share_permille: number
     class_id_hex: string
     class_id_complete: boolean

@@ -8,13 +8,20 @@
 //!
 //! Three classes ship in testnet-11's genesis (`docs/testnet11-join-mining.md` §5–6c and
 //! `docs/palw-public-testnet-classes-runbook.md` in the misakas repository, plus the pinned
-//! constants in its `consensus/core/src/config/params.rs`):
+//! constants in its `consensus/core/src/config/params.rs`). A fourth row is the held-context
+//! 2M class (`docs/qwen25-a16-2m-held-artifact.md`): same Instruct weights as the dense genesis
+//! class, a different graph (`graph-v7@2097152`) and a 2M rotary table.
 //!
-//! | class | artifact | share |
+//! Past ADR-0137 (testnet-11 DAA 6,001) **share is not an input**. A block buys one unit of work
+//! from any model (`CCU_m / W`); genesis permille below is the Relaunch 5f table, kept so a card
+//! can still name the row, and live share is the fraction of Final work a reader computes.
+//!
+//! | class | artifact | genesis ‰ (legacy table) |
 //! |---|---|---|
-//! | `PALW-BASE-0` | none — derived from a seed on every node | 22‰ |
-//! | `PALW-QWEN25-A16` | `qwen25-1.5b-a16.palwart`, 1.7 GiB, downloadable (chain id graph-v5@512) | 489‰ |
-//! | `QWEN36` | `qwen36.palwq36`, 34 GiB, downloadable (chain id graph-v3) | 489‰ |
+//! | `PALW-BASE-0` | none — derived from a seed on every node | 22 |
+//! | `PALW-QWEN25-A16` | `qwen25-1.5b-a16.palwart`, 1.7 GiB (chain id graph-v5@512) | 489 |
+//! | `QWEN36` | `qwen36.palwq36`, 34 GiB (chain id graph-v3) | 489 |
+//! | `PALW-QWEN25-A16-2M` | `qwen25-1.5b-a16-2m.palwart`, 2.7 GiB (chain id graph-v7@2097152) | 0 |
 //!
 //! # What this table is, and is not
 //!
@@ -59,8 +66,9 @@ pub enum PalwArtifactSource {
     },
     /// Must be converted locally from public weights — no direct download is published.
     ConvertLocally {
-        /// Extension the converted artifact carries, e.g. `.palwart`.
-        extension: &'static str,
+        /// The name the converted file takes on disk. Matched exactly, not by extension: two
+        /// classes can share `.palwart` and must not see each other's file as installed.
+        filename: &'static str,
         approx_size_bytes: u64,
         /// The public weights the conversion reads.
         source_repo: &'static str,
@@ -78,8 +86,7 @@ impl PalwArtifactSource {
     pub fn file_extension(&self) -> Option<&'static str> {
         let filename = match self {
             PalwArtifactSource::DerivedFromSeed => return None,
-            PalwArtifactSource::ConvertLocally { extension, .. } => return Some(extension),
-            PalwArtifactSource::Download { filename, .. } => *filename,
+            PalwArtifactSource::ConvertLocally { filename, .. } | PalwArtifactSource::Download { filename, .. } => *filename,
         };
         // `rfind`, not `find`: every artifact filename in the table carries a version dot
         // (`qwen2.5-…`), and the first dot would name `.5-1` as the extension.
@@ -107,7 +114,10 @@ pub struct PalwClassSpec {
     /// The name operators know it by.
     pub name: &'static str,
     pub description: &'static str,
-    /// Share of emission, in permille. The floor's is what remains after the model classes.
+    /// Genesis-table leftover (Relaunch 5f permille). Past ADR-0137 this is **not** a lottery
+    /// input and **not** an epoch budget: live share is the fraction of Final work a reader
+    /// computes (`share_m = Σ Finals of m of W / Σ all Finals of W`). Zero for a post-genesis
+    /// class; the chain reports the live number, not this field.
     pub share_permille: u16,
     /// The class id (`shape_profile_id()` over the execution graph), 128 hex chars where the
     /// docs publish it in full; a documented prefix otherwise. Display, never verification —
@@ -119,8 +129,8 @@ pub struct PalwClassSpec {
     /// What `--root-only` must print for the artifact to be the registered class.
     pub artifact_root_hex: &'static str,
     pub artifact: PalwArtifactSource,
-    /// The floor: default when no class is named, exempt from the per-class epoch budget — the
-    /// one class that can always produce.
+    /// The floor: default when no class is named. Past ADR-0137 it fills whatever cadence the
+    /// models leave and is paid nothing for it — residual liveness, not an emission grant.
     pub is_base: bool,
     /// **The context the class was registered at**, in tokens: the `n_ctx` inside its profile.
     ///
@@ -154,7 +164,7 @@ impl PalwClassSpec {
     pub fn tokenizer_filename(&self) -> Option<String> {
         self.tokenizer?;
         match &self.artifact {
-            PalwArtifactSource::Download { filename, .. } => {
+            PalwArtifactSource::Download { filename, .. } | PalwArtifactSource::ConvertLocally { filename, .. } => {
                 let stem = filename.rfind('.').map(|dot| &filename[..dot]).unwrap_or(filename);
                 Some(format!("{stem}.tokenizer.json"))
             }
@@ -165,9 +175,10 @@ impl PalwClassSpec {
 
 /// The class whose published artifact has this file name, if any.
 pub fn class_for_artifact_filename(file_name: &str) -> Option<&'static PalwClassSpec> {
-    TESTNET11_CLASSES
-        .iter()
-        .find(|class| matches!(class.artifact, PalwArtifactSource::Download { filename, .. } if filename == file_name))
+    TESTNET11_CLASSES.iter().find(|class| match class.artifact {
+        PalwArtifactSource::Download { filename, .. } | PalwArtifactSource::ConvertLocally { filename, .. } => filename == file_name,
+        PalwArtifactSource::DerivedFromSeed => false,
+    })
 }
 
 /// GiB, binary.
@@ -189,8 +200,8 @@ pub const TESTNET11_CLASSES: &[PalwClassSpec] = &[
     PalwClassSpec {
         name: "PALW-BASE-0",
         description: "The deterministic integer floor. Its artifact is derived from a seed on every node — no GGUF, \
-                      no download, no GPU — and it is exempt from the per-class epoch budget, so it can always \
-                      produce. The default class when none is named.",
+                      no download, no GPU. Past ADR-0137 it fills whatever cadence the model classes leave and is \
+                      paid nothing for it. The default class when none is named.",
         share_permille: 22,
         // docs/palw-rc-testnet11-launch-runbook.md prints the first half; the id is computed by
         // the node (`shape_profile_id()`), and the Studio shows the node's own value once one is
@@ -265,6 +276,40 @@ pub const TESTNET11_CLASSES: &[PalwClassSpec] = &[
         // The genesis hybrid row, `palw_qwen36_context_row_profile_v1(512)`.
         context_tokens: 512,
         tokenizer: None,
+    },
+    PalwClassSpec {
+        name: "PALW-QWEN25-A16-2M",
+        description: "Qwen2.5-1.5B-Instruct, W8A16, at 2,097,152 tokens — the held-context row (ADR-0103), chain \
+                      model id Qwen/Qwen2.5-1.5B/graph-v7@2097152. Same Instruct weights as PALW-QWEN25-A16; a \
+                      different graph and a 2M rotary table, so the 512-position artifact cannot serve it. The \
+                      published artifact is the conversion of the public Instruct weights; rebuilding it yourself \
+                      lands on the same container digest, which is the only reason downloading it is safe.",
+        // Post-genesis: no genesis grant. Live share is Final work (ADR-0137 D7).
+        share_permille: 0,
+        // docs/qwen25-a16-2m-held-artifact.md (misakas): the canonical graph-v7 profile id.
+        class_id_hex: "74c67e63d9c03daa05880c5d8a47b354ca20e952b1a2d49c107abe14f890a9c5\
+                       0790371bb715c7cea33ae8ac9213a3a63da409070cb2c98b8e861598db902f7a",
+        class_id_complete: true,
+        // PALW container digest of the 2M artifact, same document — not the 512 inventory root.
+        artifact_root_hex: "b5baca6364135a62bd4512a58c2ca747373019a495505968d884b2c0e52e4ce9\
+                            322a8af0db90d3ec1001c15b5a89fe0e8008519e55a5f3f865e15562fb8967ae",
+        artifact: PalwArtifactSource::Download {
+            filename: "qwen25-1.5b-a16-2m.palwart",
+            repo_path: "palw-runtime/qwen25-1.5b-a16-2m.palwart",
+            // docs/qwen25-a16-2m-held-artifact.md (misakas) — file SHA-256, not the container digest.
+            sha256: "35d41da6272010035894d76bbd0c17edfb76f20a6b6625063e639ccd06739bf3",
+            size_bytes: 2_868_906_956,
+            hf_repo: "Misakachain/Qwen2.5-1.5B-PALW-A16-runtime",
+            convert_command: "qwen25-convert /path/to/Qwen2.5-1.5B-Instruct --a16 --n-ctx 2097152 --out qwen25-1.5b-a16-2m.palwart",
+        },
+        is_base: false,
+        context_tokens: 2_097_152,
+        tokenizer: Some(PalwTokenizerPin {
+            hf_repo: "Misakachain/Qwen2.5-1.5B-PALW-A16-runtime",
+            repo_path: "tokenizer.json",
+            sha256: "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539",
+            size_bytes: 7_031_645,
+        }),
     },
 ];
 
@@ -418,10 +463,10 @@ pub fn assess(classes: &[PalwClassSpec], artifact_files: &[(String, String, u64)
                         None => PalwClassReadiness::ArtifactMissing { downloadable: true },
                     }
                 }
-                PalwArtifactSource::ConvertLocally { extension, .. } => {
-                    match artifact_files.iter().find(|(_, name, _)| name.ends_with(extension)) {
+                PalwArtifactSource::ConvertLocally { filename, .. } => {
+                    match artifact_files.iter().find(|(_, name, _)| name == filename) {
                         // A conversion's byte size varies with its input, so presence is judged
-                        // by extension and the root check is the node's.
+                        // by the exact filename and the root check is the node's.
                         Some((path, _, size)) => {
                             PalwClassReadiness::ArtifactPresent { path: path.clone(), size_bytes: *size, verified: false }
                         }
@@ -455,11 +500,15 @@ mod tests {
     #[test]
     fn the_registry_snapshot_is_internally_consistent() {
         // Relaunch 5f (2026-09-03) seats three classes at genesis: the floor, graph-v5@512 and graph-v3.
-        assert_eq!(TESTNET11_CLASSES.len(), 3);
-        // The GENESIS rows split the whole emission. A post-genesis entrant carries 0 here —
-        // its share follows production (ADR-0054) and is the chain's to report, not this table's.
-        let total: u16 = TESTNET11_CLASSES.iter().map(|c| c.share_permille).sum();
-        assert_eq!(total, 1000, "genesis shares are permille of the whole emission");
+        // The 2M held-context row is catalogued beside them (graph-v7@2097152) with no genesis grant.
+        assert_eq!(TESTNET11_CLASSES.len(), 4);
+        // Genesis rows split the whole emission. A post-genesis entrant carries 0 here — live share
+        // is Final work (ADR-0137 D7), the chain's to report, not this table's.
+        let genesis: u16 = TESTNET11_CLASSES.iter().filter(|c| c.share_permille > 0).map(|c| c.share_permille).sum();
+        assert_eq!(genesis, 1000, "genesis shares are permille of the whole emission");
+        let two_m = TESTNET11_CLASSES.iter().find(|c| c.name == "PALW-QWEN25-A16-2M").expect("2M class");
+        assert_eq!(two_m.share_permille, 0);
+        assert_eq!(two_m.context_tokens, 2_097_152);
 
         let base: Vec<_> = TESTNET11_CLASSES.iter().filter(|c| c.is_base).collect();
         assert_eq!(base.len(), 1, "exactly one floor");
@@ -534,10 +583,11 @@ mod tests {
     fn every_registered_model_class_can_be_installed_without_a_toolchain() {
         let statuses = assess_classes(&[], 64 << 30);
         for status in statuses.iter().filter(|s| !s.spec.is_base) {
+            let downloadable = matches!(status.spec.artifact, PalwArtifactSource::Download { .. });
             assert_eq!(
                 status.readiness,
-                PalwClassReadiness::ArtifactMissing { downloadable: true },
-                "{} publishes an artifact, so an empty machine must be one click from it",
+                PalwClassReadiness::ArtifactMissing { downloadable },
+                "{}: a published file is one click; a convert-locally class is not",
                 status.spec.name
             );
         }
@@ -593,17 +643,33 @@ mod tests {
         assert!(class_for_artifact_filename("nope.palwart").is_none());
     }
 
+    /// The 2M held-context row is a different class: same weights family, different graph, different file.
+    #[test]
+    fn the_2m_class_is_not_the_512_artifact() {
+        let two = class_for_artifact_filename("qwen25-1.5b-a16-2m.palwart").expect("the 2M class");
+        assert_eq!(two.name, "PALW-QWEN25-A16-2M");
+        assert_eq!(two.context_tokens, 2_097_152);
+        assert_eq!(two.share_permille, 0);
+        assert_eq!(two.tokenizer_filename().as_deref(), Some("qwen25-1.5b-a16-2m.tokenizer.json"));
+        assert_eq!(class_for_artifact_filename("qwen25-1.5b-a16.palwart").unwrap().name, "PALW-QWEN25-A16");
+        let files = vec![("/m/qwen25-1.5b-a16.palwart".into(), "qwen25-1.5b-a16.palwart".into(), 1_795_427_276u64)];
+        let two = assess_classes(&files, 64 << 30).into_iter().find(|s| s.spec.name == "PALW-QWEN25-A16-2M").unwrap();
+        assert_eq!(two.readiness, PalwClassReadiness::ArtifactMissing { downloadable: true });
+        assert!(matches!(two.spec.artifact, PalwArtifactSource::Download { filename: "qwen25-1.5b-a16-2m.palwart", .. }));
+    }
+
     /// Every class names the context it was registered at, and none claims zero.
     #[test]
     fn every_class_names_its_registered_context() {
         let by_name: std::collections::HashMap<_, _> = TESTNET11_CLASSES.iter().map(|c| (c.name, c.context_tokens)).collect();
         assert_eq!(by_name["PALW-BASE-0"], 12);
         assert_eq!(by_name["PALW-QWEN25-A16"], 512);
+        assert_eq!(by_name["PALW-QWEN25-A16-2M"], 2_097_152);
         assert_eq!(by_name["QWEN36"], 512);
     }
 
-    /// The convert-locally branch, which no currently registered class takes. Kept covered
-    /// because "not reachable today" and "correct" are different claims.
+    /// The convert-locally branch is covered by a synthetic row: every live class now publishes
+    /// a download, and this path must still compile and assess without one.
     #[test]
     fn a_class_with_no_published_artifact_says_so_instead_of_offering_a_download() {
         const ONLY: &[PalwClassSpec] = &[PalwClassSpec {
@@ -614,7 +680,7 @@ mod tests {
             class_id_complete: false,
             artifact_root_hex: "",
             artifact: PalwArtifactSource::ConvertLocally {
-                extension: ".palwart",
+                filename: "out.palwart",
                 approx_size_bytes: 1 << 30,
                 source_repo: "example/weights",
                 convert_command: "convert --out out.palwart",
@@ -627,8 +693,8 @@ mod tests {
         let missing = assess(ONLY, &[], 64 << 30);
         assert_eq!(missing[0].readiness, PalwClassReadiness::ArtifactMissing { downloadable: false });
 
-        // Presence is judged by extension here: a conversion's byte size varies with its input,
-        // so there is no size to compare against and the root check is the node's.
+        // Presence is judged by the converted filename: a conversion's byte size varies with its
+        // input, so there is no size to compare against and the root check is the node's.
         let files = vec![("/m/out.palwart".to_string(), "out.palwart".to_string(), 12u64)];
         let present = assess(ONLY, &files, 64 << 30);
         assert!(matches!(present[0].readiness, PalwClassReadiness::ArtifactPresent { .. }));
@@ -662,7 +728,7 @@ mod tests {
         assert_eq!(download.file_extension(), Some(".palwart"));
         assert_eq!(
             PalwArtifactSource::ConvertLocally {
-                extension: ".palwq36",
+                filename: "qwen36.palwq36",
                 approx_size_bytes: 1,
                 source_repo: "example/weights",
                 convert_command: "convert",
@@ -681,7 +747,10 @@ mod tests {
     #[test]
     fn every_registered_artifact_is_recognised_by_its_own_filename() {
         for class in TESTNET11_CLASSES {
-            let PalwArtifactSource::Download { filename, .. } = class.artifact else { continue };
+            let filename = match class.artifact {
+                PalwArtifactSource::Download { filename, .. } | PalwArtifactSource::ConvertLocally { filename, .. } => filename,
+                PalwArtifactSource::DerivedFromSeed => continue,
+            };
             assert!(is_artifact_filename(filename), "{}: {filename} is not recognised as an artifact", class.name);
         }
     }
@@ -692,6 +761,7 @@ mod tests {
     #[test]
     fn a_gguf_and_a_half_downloaded_artifact_are_not_artifacts() {
         assert!(is_artifact_filename("qwen25-1.5b-a16.palwart"));
+        assert!(is_artifact_filename("qwen25-1.5b-a16-2m.palwart"));
         assert!(is_artifact_filename("qwen36.palwq36"));
         assert!(is_artifact_filename("QWEN36.PALWQ36"), "the models directory is not case-sensitive everywhere");
         assert!(!is_artifact_filename("qwen2.5-1.5b-instruct-q4_k_m.gguf"));

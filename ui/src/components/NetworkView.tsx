@@ -793,7 +793,7 @@ function ChainClassCard({ row }: { row: NodeClassRow }) {
       <p className="mt-2 text-xs text-ink-600 dark:text-ink-300">
         {active ? (
           <>
-            Live and carrying share: this class can win blocks now. The Studio ships no artifact for it, so whether THIS
+            Live and producing Final work: this class can win blocks now. The Studio ships no artifact for it, so whether THIS
             machine can produce for it is the node&apos;s answer, not the app&apos;s — point <span className="mono">--palw-producer-class</span> at
             it with the artifact its registration commits to.
           </>
@@ -855,10 +855,12 @@ function ClassCard({
     <div className="rounded-xl border border-ink-200 p-4 dark:border-ink-800">
       <div className="flex flex-wrap items-center gap-2">
         <h4 className="mono text-sm font-semibold">{spec.name}</h4>
-        <span className="badge bg-arc-500/15 text-arc-700 dark:text-arc-300" title="This class's share of the epoch emission; it is converted into a class-specific block budget">
-          {spec.share_permille}‰ emission share
+        <span className="badge bg-arc-500/15 text-arc-700 dark:text-arc-300" title="Fraction of finalized work this class provided (ADR-0137). A result, not a lottery input and not an epoch budget.">
+          {live?.share_permille !== null && live?.share_permille !== undefined
+            ? `${live.share_permille}‰ of Final work`
+            : 'share from Finals'}
         </span>
-        {spec.is_base && <span className="badge bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300">floor · always producible</span>}
+        {spec.is_base && <span className="badge bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300">floor · residual cadence, unpaid</span>}
         {badge}
         {live && (
           <span className="badge bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300" title="From the connected node's own class table">
@@ -871,11 +873,8 @@ function ClassCard({
       <p className="mt-2 text-xs leading-relaxed text-ink-600 dark:text-ink-300">{spec.description}</p>
       <p className="mt-2 rounded-lg bg-ink-50 p-2 text-[0.7rem] leading-relaxed text-ink-500 dark:bg-ink-900/60 dark:text-ink-400">
         {spec.is_base
-          ? 'Generation mode: deterministic floor — always producible and outside the model-class epoch budget.'
-          : 'Generation mode: verified-inference lottery — each winning inference can produce one block; the class can win multiple blocks up to its epoch budget.'}
-        {live?.budget_blocks !== null && live?.budget_blocks !== undefined && (
-          <> Current node budget: <b>{live.budget_blocks.toLocaleString()} blocks/epoch</b>.</>
-        )}
+          ? 'The floor fills whatever cadence the model classes leave and is paid nothing for it — residual liveness, not a share grant.'
+          : "A block buys one unit of work from any model. This class's ticket is its compute over the work target; a winning inference can make one block. Share is the Final work it provided, not a budget on how many blocks it may win."}
         {' '}The Explorer keeps claim and block counts separate.
       </p>
 
@@ -891,6 +890,7 @@ function ClassCard({
         )}
         {spec.artifact.kind === 'convert_locally' && (
           <>
+            <span className="mono">{spec.artifact.filename}</span>
             <span>~{bytes(spec.artifact.approx_size_bytes)}</span>
             <span>
               from <span className="mono">{spec.artifact.source_repo}</span>
@@ -912,10 +912,10 @@ function ClassCard({
       )}
 
       <div className="mt-3 flex flex-wrap gap-2">
-        {readiness.state === 'artifact_missing' && readiness.downloadable && !cls.memory_note && (
-          <button type="button" className="btn-outline" onClick={() => onDownload(spec.name)}>
+        {spec.artifact.kind === 'download' && (
+          <button type="button" className={cls.memory_note ? 'btn-ghost' : 'btn-outline'} onClick={() => onDownload(spec.name)}>
             <Icon name="download" className="size-3.5" />
-            Download artifact
+            {`Install anyway — ${bytes(spec.artifact.size_bytes)}`}
           </button>
         )}
         {spec.artifact.kind === 'convert_locally' && readiness.state === 'artifact_missing' && (

@@ -205,7 +205,10 @@ async fn run(State(state): State<Arc<AppState>>, Json(request): Json<RunRequest>
     let body: serde_json::Value =
         response.json().await.map_err(|e| Error::bad_request(format!("the gateway's answer was not JSON: {e}")))?;
     if !status.is_success() {
-        let message = body.get("error").and_then(|e| e.as_str()).unwrap_or("unexplained");
+        let message = body
+            .get("error")
+            .and_then(|e| e.as_str().map(str::to_string).or_else(|| e.get("message").and_then(|m| m.as_str()).map(str::to_string)))
+            .unwrap_or_else(|| "unexplained".to_string());
         return Err(Error::bad_request(format!("the gateway refused ({status}): {message}")));
     }
 
