@@ -15,7 +15,7 @@
 //! | class | artifact | chain model id |
 //! |---|---|---|
 //! | `PALW-BASE-0` | none — derived from a seed on every node | — |
-//! | `PALW-QWEN25-A16-8K` | `qwen25-1.5b-a16-8k.palwart`, 1.68 GiB, converted locally | `Qwen/Qwen2.5-1.5B/graph-v7@8192` |
+//! | `PALW-QWEN25-A16-8K` | `qwen25-1.5b-a16-8k.palwart`, 1.68 GiB | `Qwen/Qwen2.5-1.5B/graph-v7@8192` |
 //! | `PALW-QWEN25-A16-2M` | `qwen25-1.5b-a16-2m.palwart`, 2.7 GiB | `Qwen/Qwen2.5-1.5B/graph-v7@2097152` |
 //!
 //! The 512-position dense row and the Qwen3.6 hybrid are **not** testnet-12 classes: the held
@@ -285,9 +285,10 @@ pub const TESTNET12_CLASSES: &[PalwClassSpec] = &[
         name: "PALW-QWEN25-A16-8K",
         description: "Qwen2.5-1.5B-Instruct, W8A16, at 8,192 tokens — the held-context row testnet-12 actually runs, \
                       chain model id Qwen/Qwen2.5-1.5B/graph-v7@8192. An 8k attempt prefills 1,023 positions in about \
-                      290 s; a full-seat replay needs ≈ 3.37 GiB. No download is published: convert the public \
-                      Instruct weights with qwen25-convert and the conversion is deterministic — it lands on the \
-                      registered inventory root, or it is not this class and the node refuses it.",
+                      290 s; a full-seat replay needs ≈ 3.37 GiB. The published artifact is the conversion of the \
+                      public Instruct weights (qwen25-convert --n-ctx 8192); the conversion is deterministic, so \
+                      rebuilding it yourself lands on the same bytes and the same registered inventory root, which is \
+                      the only reason downloading it is safe.",
         // A genesis model row declares the minimum grantable share and never an allocation
         // (`t12_regenesis.rs`: "block rights come from verified work").
         share_permille: 1,
@@ -299,16 +300,16 @@ pub const TESTNET12_CLASSES: &[PalwClassSpec] = &[
         // flat artifact digest `f4af38d9…` the same sidecar also names.
         artifact_root_hex: "88096dc177826d880c1c5fca4ec93cffe5ab51af108ed169a8e03cd4726308f9\
                             1263f79f81904b043327bfa277e3558b1656f14259f6dd33603a9f91871aae20",
-        artifact: PalwArtifactSource::ConvertLocally {
+        artifact: PalwArtifactSource::Download {
             filename: "qwen25-1.5b-a16-8k.palwart",
-            approx_size_bytes: 1_799_359_436,
-            // `contrib/t12-deploy-kit/fleet.env.example` (misakas): ART_8K_BYTES / ART_8K_SHA256,
+            // Published 2026-09-26 beside the 512 and 2M files, copied from the fleet's own file
+            // (ibm `/root/palw-class/`), whose SHA-256 is the one the deploy kit pins.
+            repo_path: "palw-runtime/qwen25-1.5b-a16-8k.palwart",
+            // `contrib/t12-deploy-kit/fleet.env.example` (misakas): ART_8K_SHA256 / ART_8K_BYTES,
             // pinned to the build by `t12_deploy_kit_constants.rs`.
-            exact: Some(PalwConvertedPin {
-                size_bytes: 1_799_359_436,
-                sha256: "b73600cfeef3f54fd6e9f6a831c504588aa3b20ea2506ae824799206201e8ac8",
-            }),
-            source_repo: "Qwen/Qwen2.5-1.5B-Instruct",
+            sha256: "b73600cfeef3f54fd6e9f6a831c504588aa3b20ea2506ae824799206201e8ac8",
+            size_bytes: 1_799_359_436,
+            hf_repo: "Misakachain/Qwen2.5-1.5B-PALW-A16-runtime",
             // The join guide's two steps: the conversion, then the sidecar the node reads the
             // root from (without it the node derives the root itself at startup).
             convert_command: "qwen25-convert /path/to/Qwen2.5-1.5B-Instruct --a16 --n-ctx 8192 --out qwen25-1.5b-a16-8k.palwart \
@@ -456,8 +457,8 @@ pub const TESTNET11_CLASSES: &[PalwClassSpec] = &[
 /// that actually run a model, which one can a desktop hold? testnet-12 registers two, and the 2M
 /// row needs ≈ 11.6 GiB and a week of CPU per attempt. That leaves the 8k row, at 1.68 GiB.
 ///
-/// It publishes no download, so the first-run install (`install_default_class_artifact`) has
-/// nothing to fetch on testnet-12 and says so; the file comes from `qwen25-convert`.
+/// It is a single verified download from the A16 repository (published 2026-09-26), so the
+/// first-run install (`install_default_class_artifact`) can fetch it.
 pub const DEFAULT_CLASS: &str = "PALW-QWEN25-A16-8K";
 
 /// testnet-11's equivalent: the 512-position dense row, which did publish a download.
@@ -741,18 +742,20 @@ mod tests {
 
     /// The 8k row is converted, and its output is pinned: the file the node accepts has one size.
     #[test]
-    fn the_8k_row_is_a_pinned_conversion() {
+    fn the_8k_row_is_a_verified_download_and_a_reproducible_conversion() {
         let eight = class_for_artifact_filename("qwen25-1.5b-a16-8k.palwart").expect("the 8k class");
         assert_eq!(eight.name, "PALW-QWEN25-A16-8K");
         assert_eq!(eight.tokenizer_filename().as_deref(), Some("qwen25-1.5b-a16-8k.tokenizer.json"));
         match &eight.artifact {
-            PalwArtifactSource::ConvertLocally { exact: Some(pin), convert_command, .. } => {
-                assert_eq!(pin.size_bytes, 1_799_359_436);
-                assert!(pin.sha256.starts_with("b73600cf"));
+            PalwArtifactSource::Download { size_bytes, sha256, repo_path, hf_repo, convert_command, .. } => {
+                assert_eq!(*size_bytes, 1_799_359_436);
+                assert!(sha256.starts_with("b73600cf"));
+                assert_eq!(*repo_path, "palw-runtime/qwen25-1.5b-a16-8k.palwart");
+                assert_eq!(*hf_repo, "Misakachain/Qwen2.5-1.5B-PALW-A16-runtime");
                 assert!(convert_command.contains("--n-ctx 8192"), "{convert_command}");
                 assert!(convert_command.contains("palw-class manifest --network testnet-12"), "{convert_command}");
             }
-            other => panic!("expected a pinned conversion, got {other:?}"),
+            other => panic!("expected a download, got {other:?}"),
         }
         let at = |size: u64| {
             let files = vec![("/m/qwen25-1.5b-a16-8k.palwart".to_string(), "qwen25-1.5b-a16-8k.palwart".to_string(), size)];
@@ -763,8 +766,36 @@ mod tests {
         let missing = assess_classes(NodeNetwork::Testnet12, &[], 64 << 30);
         assert_eq!(
             missing.iter().find(|s| s.spec.name == eight.name).unwrap().readiness,
-            PalwClassReadiness::ArtifactMissing { downloadable: false }
+            PalwClassReadiness::ArtifactMissing { downloadable: true }
         );
+    }
+
+    /// A conversion whose output is pinned has one right size, like a download — kept reachable by
+    /// a synthetic row now that the 8k row publishes its file.
+    #[test]
+    fn a_pinned_conversion_of_another_size_is_a_mismatch() {
+        const ONLY: &[PalwClassSpec] = &[PalwClassSpec {
+            name: "PINNED",
+            description: "",
+            share_permille: 1,
+            class_id_hex: "",
+            class_id_complete: false,
+            artifact_root_hex: "",
+            artifact: PalwArtifactSource::ConvertLocally {
+                filename: "out.palwart",
+                approx_size_bytes: 100,
+                exact: Some(PalwConvertedPin { size_bytes: 100, sha256: "00" }),
+                source_repo: "example/weights",
+                convert_command: "convert --out out.palwart",
+            },
+            is_base: false,
+            context_tokens: 8_192,
+            tokenizer: None,
+            min_memory_bytes: 0,
+        }];
+        let at = |size: u64| assess(ONLY, &[("/m/out.palwart".into(), "out.palwart".into(), size)], 64 << 30)[0].readiness.clone();
+        assert!(matches!(at(100), PalwClassReadiness::ArtifactPresent { .. }));
+        assert!(matches!(at(99), PalwClassReadiness::ArtifactMismatch { expected_bytes: 100, .. }));
     }
 
     /// The memory note is about what serving costs, not only the file: an 8k seat on a 3 GiB machine

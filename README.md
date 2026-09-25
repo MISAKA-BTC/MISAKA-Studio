@@ -166,9 +166,10 @@ that makes the block.**
   inference in one of the chain-registered classes. The Studio defaults to **testnet-12**, the
   public network since 2026-09-25/26 (release `0e8ec984e`), whose genesis registers
   `PALW-BASE-0` (the deterministic floor, needs nothing), `PALW-QWEN25-A16-8K` (chain model id
-  `Qwen/Qwen2.5-1.5B/graph-v7@8192`, a 1.68 GiB W8A16 artifact converted locally with
-  `qwen25-convert --n-ctx 8192`; the conversion is deterministic and its size and SHA-256 are
-  pinned) and `PALW-QWEN25-A16-2M` (`graph-v7@2097152`, a 2.7 GiB download, ≈ 11.6 GiB and a week
+  `Qwen/Qwen2.5-1.5B/graph-v7@8192`, a 1.68 GiB W8A16 artifact downloaded from
+  `Misakachain/Qwen2.5-1.5B-PALW-A16-runtime` and verified against the SHA-256 the chain's deploy
+  kit pins — or rebuilt with `qwen25-convert --n-ctx 8192`, which is deterministic and lands on the
+  same bytes) and `PALW-QWEN25-A16-2M` (`graph-v7@2097152`, a 2.7 GiB download, ≈ 11.6 GiB and a week
   of CPU per attempt). testnet-11's Relaunch 5f table is kept for a Studio pointed there. The list is the top half of **Models → Discover**, above the free-text search,
   because nobody guesses these repository names; each card shows its share, what installs, this
   machine's readiness — including an honest "this machine cannot run this class" when the

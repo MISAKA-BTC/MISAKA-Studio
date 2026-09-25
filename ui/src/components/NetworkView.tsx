@@ -1338,7 +1338,7 @@ function NodeSettingsPanel({ settings, save }: { settings: Settings; save: (s: S
       </Field>
       <Toggle
         label="Install the default class artifact on first run"
-        hint="testnet-11 only: PALW-QWEN25-A16, 1.7 GB, fetched once and verified against the digest the chain registered. testnet-12's model class (PALW-QWEN25-A16-8K) publishes no download — it is converted locally with qwen25-convert — so on testnet-12 this has nothing to fetch."
+        hint="PALW-QWEN25-A16-8K on testnet-12 (PALW-QWEN25-A16 on testnet-11), 1.7 GB, fetched once and verified against the digest the chain's deploy pins — so a fresh install can serve the model class without hunting for a file. It appears in the download list and can be cancelled there. Turn it off on a metered connection, or if this machine will only ever chat."
         checked={draft.install_default_class_artifact}
         onChange={(v) => set('install_default_class_artifact', v)}
       />
