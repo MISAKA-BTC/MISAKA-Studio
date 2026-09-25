@@ -32,7 +32,7 @@ export function BondSetupCard({ onChanged }: { onChanged?: () => void }) {
   const [setup, setSetup] = useState<BondSetup | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState<'key' | 'register' | 'finish' | 'faucet' | null>(null)
-  // `undefined` = not chosen yet (the saved setting, else the node's own sizing); `null` = the node sizes it.
+  // `undefined` = not chosen yet (the saved setting, else the first offered amount); `null` = the node sizes it (off testnet-12).
   const [choice, setChoice] = useState<number | null | undefined>(undefined)
   const [custom, setCustom] = useState('')
 
@@ -55,9 +55,13 @@ export function BondSetupCard({ onChanged }: { onChanged?: () => void }) {
   if (!setup) return null
   const current = STEPS.findIndex((s) => s.phase.includes(setup.phase))
   const floor = setup.floor_sompi
-  // The amount named on the command line, or null for the node's own sizing.
+  // The amount named on the command line, or null for the node's own sizing (offered only off testnet-12).
   const named: number | null =
-    custom.trim() !== '' ? Math.round(Number(custom) * SOMPI) : choice !== undefined ? choice : setup.collateral_sompi
+    custom.trim() !== ''
+      ? Math.round(Number(custom) * SOMPI)
+      : choice !== undefined
+        ? choice
+        : (setup.collateral_sompi ?? setup.choices[0]?.collateral_sompi ?? null)
   const customBad = custom.trim() !== '' && (!Number.isFinite(Number(custom)) || Number(custom) <= 0)
   const belowFloor = named !== null && floor !== null && named < floor
   // What the deposit has to reach. The node's own figure once it has printed one; before that, for
@@ -68,7 +72,7 @@ export function BondSetupCard({ onChanged }: { onChanged?: () => void }) {
   const needed = collateral !== null && collateral > 0 ? collateral + setup.recommended_margin_sompi : null
   const largest = setup.funds?.largest_output_sompi ?? null
   const enough = named === null || largest === null || largest >= named + setup.margin_sompi
-  const belowLifetime = named !== null && nodeSized !== null && named < nodeSized
+  const claimsAtOnce = named !== null && setup.floor_claim_sompi ? Math.floor(named / setup.floor_claim_sompi) : null
 
   const act = async (kind: 'key' | 'register' | 'finish', run: () => Promise<unknown>) => {
     setBusy(kind)
@@ -198,10 +202,12 @@ export function BondSetupCard({ onChanged }: { onChanged?: () => void }) {
                   }}
                 >
                   <div className="font-medium">
-                    {c.label} · {c.collateral_sompi === null && setup.node_wanted_sompi === null ? 'about ' : ''}
                     {msk(c.collateral_sompi === null ? (setup.node_wanted_sompi ?? c.approx_sompi) : c.collateral_sompi)}
+                    {c.floor_claims_at_once !== null && ` · ${c.floor_claims_at_once} floor claims at once`}
                   </div>
-                  <div className={`mt-0.5 text-[0.7rem] ${c.below_lifetime_sizing ? 'text-amber-700 dark:text-amber-300' : 'text-ink-500 dark:text-ink-400'}`}>{c.note}</div>
+                  <div className="mt-0.5 text-[0.7rem] text-ink-500 dark:text-ink-400">
+                    {c.label}. {c.note}
+                  </div>
                 </button>
               )
             })}
@@ -214,8 +220,10 @@ export function BondSetupCard({ onChanged }: { onChanged?: () => void }) {
             onChange={(e) => setCustom(e.target.value)}
           />
           <p className="mt-1 text-[0.7rem] leading-relaxed text-ink-500 dark:text-ink-400">
-            A claim's exposure stays on the bond until the claim is Final, so the collateral has to hold every claim in flight at once;
-            more collateral is more claims at once. Collateral cannot be topped up later — a bigger bond needs a new key.
+            Each claim reserves its escrow plus its weight on the bond (about 3,201 MSK for a floor claim, 3,226 MSK for an 8k claim) and
+            the room is half the collateral, so each claim held at once needs about {setup.floor_claim_sompi ? msk(setup.floor_claim_sompi) : '—'}.
+            A full bond waits until a claim is licensed with every seat Valid (its escrow comes back early) or reaches Final — it does not
+            wedge. More collateral is more claims at once. Collateral cannot be topped up later — a bigger bond needs a new key.
             {floor !== null && ` ${NETWORK_LABEL[setup.network]} refuses a producer bond under ${msk(floor)}.`} Deposit about{' '}
             {msk(setup.recommended_margin_sompi)} more than the collateral: it pays the registration and the declaration and stays as the
             fee float.
@@ -226,13 +234,17 @@ export function BondSetupCard({ onChanged }: { onChanged?: () => void }) {
             disabled={busy !== null || customBad || belowFloor || !enough}
             onClick={() => void act('register', () => api.bondRegister(named))}
           >
-            {busy === 'register' ? 'Starting…' : named === null ? 'Register the bond (the node sizes it)' : `Register the bond with ${msk(named)}`}
+            {busy === 'register'
+              ? 'Starting…'
+              : named === null
+                ? 'Register the bond (the node sizes it)'
+                : `Register the bond with ${msk(named)}${claimsAtOnce !== null ? ` · ${claimsAtOnce} claims at once` : ''}`}
           </button>
           {belowFloor && <p className="mt-1 text-[0.7rem] text-red-600 dark:text-red-400">Below the floor — the chain would refuse it.</p>}
-          {belowLifetime && !belowFloor && (
-            <p className="mt-1 text-[0.7rem] text-amber-700 dark:text-amber-300">
-              Under the node's own sizing ({msk(nodeSized)}): it will register, and the node warns its producer may then hold forever with
-              no room for another claim.
+          {floor !== null && (
+            <p className="mt-1 text-[0.7rem] text-ink-500 dark:text-ink-400">
+              Under about 31,191 MSK the node's log warns the bond "may then hold forever". That warning is a legacy formula from the devnet
+              economy, not testnet-12's rule — the bond holds the claims above and waits when full.
             </p>
           )}
           {!enough && !belowFloor && named !== null && (

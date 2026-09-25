@@ -222,10 +222,12 @@ that makes the block.**
 
 * **Bond setup — key, deposits, bond, mining.** The Network tab creates the producer key, shows
   its `misakatest:` address (derived by the `misaka` CLI from the key file, before any node runs),
-  reads the deposits from the node's utxo index and starts `kaspad --palw-register-bond`. By
-  default the node sizes the collateral itself (≈ 31,191 MSK for the floor on 2026-09-26; the
-  chain's minimum is 13,000 MSK, which the node warns may hold forever) and the card shows the exact
-  amount the node asks for. It asks for **two transfers**: the collateral plus about 1 MSK, which
+  reads the deposits from the node's utxo index and starts `kaspad --palw-register-bond` with a
+  **named** collateral — 13,000 MSK (the minimum, 2 floor claims at once) or more; each claim held
+  at once needs ≈ 6,402 MSK (escrow + weight, room = half the collateral). The node's own default is
+  never used on testnet-12: it is a legacy weight-only formula (≈ 31,191 MSK for the floor,
+  ≈ 2 billion MSK for the 8k class) and its "may then hold forever" warning is not the chain's rule.
+  It asks for **two transfers**: the collateral plus about 1 MSK, which
   the registration spends whole (its change becomes the node's reserved fee float), and a separate
   ≈ 1 MSK that pays the capability declaration — a single transfer leaves nothing the CLI may spend
   for it. When the node reports `registered bond <txid>:0` the Studio saves it, declares the floor

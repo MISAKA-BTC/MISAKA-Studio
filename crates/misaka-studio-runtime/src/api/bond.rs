@@ -61,13 +61,24 @@ pub const TESTNET12_PRODUCER_FLOOR_SOMPI: u64 = 13_000 * SOMPI_PER_MSK;
 pub const REGISTRATION_MARGIN_SOMPI: u64 = SOMPI_PER_MSK / 10;
 pub const RECOMMENDED_MARGIN_SOMPI: u64 = SOMPI_PER_MSK;
 
-/// **The node's own sizing of a floor bond on testnet-12, as last measured**: 3,119,145,986,560
-/// sompi (≈ 31,191 MSK), printed by release `0e8ec984e` on 2026-09-26 as "the … sompi that a claim of
-/// class f1c5635c… needs on this chain for its whole life" — the same figure the 2026-09-23 drill
-/// measured. The node derives it from the class's live producer facts
-/// (`palw_v2_collateral_for_claim_lifetime_v1`), so it moves; this is shown only as "about" until
-/// the registration run prints the exact amount it wants, and nothing is decided on it.
-pub const TESTNET12_FLOOR_LIFETIME_ESTIMATE_SOMPI: u64 = 3_119_145_986_560;
+/// **Collateral per claim held at once** on testnet-12, re-checked against release `0e8ec984e` on
+/// 2026-09-26 (the release's `palw_claim_bond_reservation_v1` on the testnet-12 parameters, and the
+/// live chain's per-claim `escrowSompi` / `reservedSompi`). A claim reserves escrow + weight from the
+/// block that accepts it — 3,200.85 MSK of escrow at the block-one subsidy, plus 0.1075 MSK (floor) or
+/// 24.716 MSK (8k) of weight — and the room is `collateral × 500‰ − what the bond already backs`, so
+/// one claim held at once costs twice its reservation. The escrow part is released early, at licence,
+/// when every seat of an unredrawn panel returned Valid; a full bond waits for a release, it does not
+/// wedge. The escrow scales with the subsidy, so these are figures for choosing an amount; `misaka
+/// bond status` (`exposure_ceiling`, `reserved_exposure`) is the live answer.
+pub const TESTNET12_FLOOR_CLAIM_SOMPI: u64 = 640_190_805_480;
+pub const TESTNET12_8K_CLAIM_SOMPI: u64 = 645_112_500_620;
+
+/// **The node's own default collateral is not the rule.** Without `--palw-bond-collateral` the node
+/// locks `palw_v2_collateral_for_claim_lifetime_v1`, a devnet weight-only formula R-core+ did not
+/// replace: 3,119,145,986,560 sompi for the floor (holds 4 claims) and ≈ 2,000,332,625 MSK for the 8k
+/// class (read off the live chain), and it warns that a smaller named bond "may then hold forever",
+/// which is wrong on testnet-12. So on testnet-12 the Studio always names the amount.
+pub const TESTNET12_NODE_DEFAULT_FLOOR_SOMPI: u64 = 3_119_145_986_560;
 
 /// How long the registration run may take before the Studio stops waiting for its line. The node
 /// itself waits up to ten minutes for the carrier after it is funded; the rest is the person's time
@@ -134,13 +145,15 @@ pub struct Funds {
 #[derive(Clone, Debug, Serialize)]
 pub struct CollateralChoice {
     pub label: String,
-    /// `None` = no `--palw-bond-collateral`: the node sizes the bond for a claim's whole life.
+    /// `None` = no `--palw-bond-collateral`: the node sizes it (offered only off testnet-12).
     pub collateral_sompi: Option<u64>,
-    /// The deposit this choice needs, as far as it is known before the node says: exact for a
-    /// named amount, the last measured sizing for the node's own.
+    /// The deposit this choice needs, as far as it is known before the node says.
     pub approx_sompi: u64,
-    /// Whether the node warns that this amount may hold forever.
-    pub below_lifetime_sizing: bool,
+    /// Floor claims this collateral holds at once ([`TESTNET12_FLOOR_CLAIM_SOMPI`]); `None` off
+    /// testnet-12.
+    pub floor_claims_at_once: Option<u64>,
+    /// 8k claims it holds at once.
+    pub claims_8k_at_once: Option<u64>,
     pub note: String,
 }
 
@@ -177,6 +190,8 @@ pub struct BondSetup {
     pub floor_sompi: Option<u64>,
     pub margin_sompi: u64,
     pub recommended_margin_sompi: u64,
+    /// Collateral per floor claim held at once, where this build knows it (testnet-12).
+    pub floor_claim_sompi: Option<u64>,
     pub choices: Vec<CollateralChoice>,
     /// The collateral the next registration run locks (`node.bond_collateral_sompi`); `None` lets
     /// the node size it.
@@ -363,31 +378,42 @@ async fn utxos_at(settings: &NodeSettings, address: &str) -> Result<Vec<Utxo>> {
     Ok(utxos_from(&value))
 }
 
-/// The amounts to offer. The node's own sizing first: it is the only amount a producer is sure not
-/// to wedge on, and the only one this app does not have to derive.
-fn choices(network: NodeNetwork, lifetime: Option<u64>) -> Vec<CollateralChoice> {
-    let mut offered = vec![CollateralChoice {
-        label: "Recommended — the node sizes it".into(),
-        collateral_sompi: None,
-        approx_sompi: lifetime.unwrap_or(if network == NodeNetwork::Testnet12 { TESTNET12_FLOOR_LIFETIME_ESTIMATE_SOMPI } else { 0 }),
-        below_lifetime_sizing: false,
-        note: "Enough to hold a floor claim for its whole life (exposure is released at Final, not at bind). The node \
-               derives it from the chain's live facts and says the exact amount once it runs."
-            .into(),
-    }];
-    if let Some(floor) = floor_for(network) {
-        let lifetime = lifetime.unwrap_or(TESTNET12_FLOOR_LIFETIME_ESTIMATE_SOMPI);
-        offered.push(CollateralChoice {
-            label: "The chain's minimum".into(),
-            collateral_sompi: Some(floor),
-            approx_sompi: floor,
-            below_lifetime_sizing: floor < lifetime,
-            note: "The least a producer bond may lock. The node registers it but warns that such a producer \
-                   \"may then hold forever\" with no room for another claim."
-                .into(),
-        });
+/// The amounts to offer. On testnet-12, named amounts from the producer floor up, each with the
+/// claims it holds at once; the node's own default is never offered there (see
+/// [`TESTNET12_NODE_DEFAULT_FLOOR_SOMPI`]). Elsewhere the node's sizing is the only thing known.
+fn choices(network: NodeNetwork) -> Vec<CollateralChoice> {
+    if floor_for(network).is_none() {
+        return vec![CollateralChoice {
+            label: "The node sizes it".into(),
+            collateral_sompi: None,
+            approx_sompi: 0,
+            floor_claims_at_once: None,
+            claims_8k_at_once: None,
+            note: "This network's amounts are not known to this build; the node derives one and says it once it runs.".into(),
+        }];
     }
-    offered
+    [
+        (
+            "The chain's minimum",
+            13_000,
+            "The least a producer bond may lock. Holds 2 floor claims at once; a full bond waits for one to be licensed or Final.",
+        ),
+        ("Room for about 5 claims", 32_100, "More claims in flight at once, so fewer waits while panels judge."),
+        ("Room for about 10 claims", 64_100, "For a machine that produces continuously."),
+    ]
+    .into_iter()
+    .map(|(label, msk_, note)| {
+        let collateral = msk_ * SOMPI_PER_MSK;
+        CollateralChoice {
+            label: label.into(),
+            collateral_sompi: Some(collateral),
+            approx_sompi: collateral,
+            floor_claims_at_once: Some(collateral / TESTNET12_FLOOR_CLAIM_SOMPI),
+            claims_8k_at_once: Some(collateral / TESTNET12_8K_CLAIM_SOMPI),
+            note: note.into(),
+        }
+    })
+    .collect()
 }
 
 fn floor_for(network: NodeNetwork) -> Option<u64> {
@@ -464,11 +490,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<BondSetup> {
         (Some(list), Some(floor)) => Some(list.iter().any(|c| c.eq_ignore_ascii_case(floor))),
         _ => None,
     };
-    let collateral = facts
-        .amounts
-        .wanted_sompi
-        .or(settings.bond_collateral_sompi)
-        .unwrap_or(if settings.network == NodeNetwork::Testnet12 { TESTNET12_FLOOR_LIFETIME_ESTIMATE_SOMPI } else { 0 });
+    let collateral = facts.amounts.wanted_sompi.or(settings.bond_collateral_sompi).or(floor_for(settings.network)).unwrap_or(0);
     let job = job().lock().expect("job lock").clone();
     let registering = state.node.supervised_role().await == Some(NetworkRole::Producer) && settings.producer_bond.is_none();
     let phase = phase_of(
@@ -493,8 +515,9 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<BondSetup> {
         funds_error,
         floor_sompi: floor_for(settings.network),
         margin_sompi: REGISTRATION_MARGIN_SOMPI,
+        floor_claim_sompi: floor_for(settings.network).map(|_| TESTNET12_FLOOR_CLAIM_SOMPI),
         recommended_margin_sompi: RECOMMENDED_MARGIN_SOMPI,
-        choices: choices(settings.network, facts.amounts.lifetime_sompi),
+        choices: choices(settings.network),
         collateral_sompi: settings.bond_collateral_sompi,
         node_wanted_sompi: facts.amounts.wanted_sompi,
         node_lifetime_sompi: facts.amounts.lifetime_sompi,
@@ -534,6 +557,14 @@ async fn register(State(state): State<Arc<AppState>>, Json(body): Json<RegisterB
         return Err(Error::bad_request(
             "this Studio is attached to another node (Attach to RPC). Only a node started here can run the registration — \
              clear that field, or register on that node with `kaspad --palw-register-bond`",
+        ));
+    }
+    // testnet-12: always a named amount. The node's own default is a legacy formula — ≈ 31,191 MSK
+    // for the floor and ≈ 2 billion MSK for the 8k class — not the chain's rule.
+    if node.network == NodeNetwork::Testnet12 && body.collateral_sompi.is_none() {
+        return Err(Error::bad_request(
+            "name the collateral on testnet-12 (13,000 MSK or more): the node's own default is a legacy formula, \
+             ≈ 31,191 MSK for the floor and ≈ 2 billion MSK for the 8k class",
         ));
     }
     if let (Some(floor), Some(named)) = (floor_for(node.network), body.collateral_sompi)
@@ -853,16 +884,19 @@ mod tests {
         assert_eq!(phase_of(true, Some("x:0"), Some(false), false, false, None, need), BondPhase::NeedsDeclaration);
     }
 
+    /// The join guide's re-checked figures: 13,000 holds 2, 31,191 holds 4, 100,000 holds 15 (floor).
     #[test]
-    fn the_node_sizing_is_offered_first_and_the_minimum_carries_its_warning() {
-        let offered = choices(NodeNetwork::Testnet12, None);
-        assert_eq!(offered[0].collateral_sompi, None, "recommended: no --palw-bond-collateral");
-        assert_eq!(offered[0].approx_sompi, TESTNET12_FLOOR_LIFETIME_ESTIMATE_SOMPI);
-        assert_eq!(offered[1].collateral_sompi, Some(TESTNET12_PRODUCER_FLOOR_SOMPI));
-        assert!(offered[1].below_lifetime_sizing, "13,000 MSK is under the node's own sizing");
-        // Once the node has printed its figure, that figure is the one shown.
-        assert_eq!(choices(NodeNetwork::Testnet12, Some(5)).first().map(|c| c.approx_sompi), Some(5));
-        assert_eq!(choices(NodeNetwork::Devnet, None).len(), 1, "elsewhere only the node's own sizing");
+    fn named_amounts_are_offered_with_the_claims_they_hold() {
+        let offered = choices(NodeNetwork::Testnet12);
+        assert!(offered.iter().all(|c| c.collateral_sompi.is_some()), "never the node's legacy default on testnet-12");
+        assert_eq!(offered[0].collateral_sompi, Some(TESTNET12_PRODUCER_FLOOR_SOMPI));
+        assert_eq!(offered[0].floor_claims_at_once, Some(2));
+        assert_eq!(offered[1].floor_claims_at_once, Some(5));
+        assert_eq!(offered[2].floor_claims_at_once, Some(10));
+        assert_eq!(offered[0].claims_8k_at_once, Some(2));
+        assert_eq!(TESTNET12_NODE_DEFAULT_FLOOR_SOMPI / TESTNET12_FLOOR_CLAIM_SOMPI, 4);
+        assert_eq!(100_000 * SOMPI_PER_MSK / TESTNET12_FLOOR_CLAIM_SOMPI, 15);
+        assert_eq!(choices(NodeNetwork::Devnet)[0].collateral_sompi, None, "elsewhere only the node's own sizing");
     }
 
     /// The registration's change is the node's reserved float and the bond is the bond: neither
@@ -886,6 +920,6 @@ mod tests {
     fn amounts_read_as_msk() {
         assert_eq!(msk(TESTNET12_PRODUCER_FLOOR_SOMPI), "13000");
         assert_eq!(msk(REGISTRATION_MARGIN_SOMPI), "0.1");
-        assert_eq!(msk(TESTNET12_FLOOR_LIFETIME_ESTIMATE_SOMPI), "31191.4598656");
+        assert_eq!(msk(TESTNET12_FLOOR_CLAIM_SOMPI), "6401.9080548");
     }
 }

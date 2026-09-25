@@ -829,8 +829,17 @@ export type BondSetup = {
   floor_sompi: number | null
   margin_sompi: number
   recommended_margin_sompi: number
-  /** `collateral_sompi: null` = the node sizes it (recommended). */
-  choices: { label: string; collateral_sompi: number | null; approx_sompi: number; below_lifetime_sizing: boolean; note: string }[]
+  /** Named amounts on testnet-12 (`collateral_sompi: null` = the node sizes it, offered only elsewhere). */
+  choices: {
+    label: string
+    collateral_sompi: number | null
+    approx_sompi: number
+    floor_claims_at_once: number | null
+    claims_8k_at_once: number | null
+    note: string
+  }[]
+  /** Collateral per floor claim held at once (testnet-12). */
+  floor_claim_sompi: number | null
   collateral_sompi: number | null
   /** "send at least N sompi" — what the registration run will spend, once it has said. */
   node_wanted_sompi: number | null
