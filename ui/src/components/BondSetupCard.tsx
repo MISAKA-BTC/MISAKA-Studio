@@ -24,7 +24,7 @@ const STEPS: { phase: BondPhase[]; label: string }[] = [
   { phase: ['need_key'], label: 'Key' },
   { phase: ['need_funds'], label: 'Deposit' },
   { phase: ['ready_to_register', 'registering'], label: 'Register' },
-  { phase: ['finishing'], label: 'Declare & start' },
+  { phase: ['finishing', 'needs_declaration'], label: 'Declare & start' },
   { phase: ['bonded'], label: 'Mining' },
 ]
 
@@ -117,8 +117,8 @@ export function BondSetupCard({ onChanged }: { onChanged?: () => void }) {
         </ol>
       </div>
       <p className="mt-1 text-xs leading-relaxed text-ink-500 dark:text-ink-400">
-        A producer is one key. Its address receives your deposit; the node locks the collateral from it as the bond, and the
-        rewards come back to the same address. One key registers one bond for the life of the chain.
+        A producer is one key. Its address receives your deposits; the node locks the collateral from one of them as the bond, and
+        the rewards come back to the same address. One key registers one bond for the life of the chain.
       </p>
 
       {/* 1. Key */}
@@ -137,7 +137,7 @@ export function BondSetupCard({ onChanged }: { onChanged?: () => void }) {
       {/* 2. Address and deposit */}
       {setup.key_present && (
         <div className="mt-3 rounded-lg bg-ink-50 p-3 dark:bg-ink-900/60">
-          <div className="text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">Your mining address — send MSK here</div>
+          <div className="text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">Your mining address — send MSK here, as two transfers</div>
           {setup.address ? (
             <div className="mt-0.5 flex flex-wrap items-center gap-2">
               <span className="mono break-all text-xs">{setup.address}</span>
@@ -152,8 +152,17 @@ export function BondSetupCard({ onChanged }: { onChanged?: () => void }) {
             <Stat label="At the address" value={setup.funds ? msk(setup.funds.total_sompi) : '—'} />
             <Stat label="Largest single deposit" value={largest !== null ? msk(largest) : '—'} />
             <Stat label="Needed (collateral + fees)" value={needed !== null ? `${exact ? '' : 'about '}${msk(needed)}` : 'the node decides'} />
-            <Stat label="Key file" value={setup.key_path?.split('/').pop() ?? '—'} />
+            <Stat
+              label="Second deposit (≈ 1 MSK)"
+              value={setup.funds ? (setup.funds.second_output_sompi > 0 ? msk(setup.funds.second_output_sompi) : 'not yet') : '—'}
+            />
           </div>
+          <p className="mt-2 text-[0.7rem] leading-relaxed text-ink-600 dark:text-ink-300">
+            <strong>1.</strong> One transfer of the collateral plus about {msk(setup.recommended_margin_sompi)} — the registration spends it
+            whole, and its change becomes the node's fee float. <strong>2.</strong> A separate transfer of about{' '}
+            {msk(setup.second_deposit_sompi)}: it pays the declaration that lets the bond be drawn onto panels. The node reserves the first
+            transfer's change for its own carriers, so a single transfer leaves nothing to pay the declaration with.
+          </p>
           {setup.funds_error && <p className="mt-1 text-[0.7rem] text-ink-500 dark:text-ink-400">{setup.funds_error} — start the node to see deposits.</p>}
           {setup.funds && largest !== null && needed !== null && largest < needed && setup.funds.total_sompi >= needed && (
             <p className="mt-1 text-[0.7rem] text-amber-700 dark:text-amber-300">
@@ -245,7 +254,7 @@ export function BondSetupCard({ onChanged }: { onChanged?: () => void }) {
       )}
 
       {/* 4. Progress */}
-      {(setup.job.running || setup.phase === 'registering' || setup.job.history.length > 0) && (
+      {(setup.job.running || setup.phase === 'registering' || setup.phase === 'needs_declaration' || setup.job.history.length > 0) && (
         <div className="mt-3 rounded-lg border border-ink-200 p-3 text-xs dark:border-ink-800">
           {setup.job.step && (
             <div className="flex items-center gap-2">
@@ -263,7 +272,13 @@ export function BondSetupCard({ onChanged }: { onChanged?: () => void }) {
             </ol>
           )}
           {setup.job.error && <p className="mt-2 text-[0.7rem] text-red-600 dark:text-red-400">{setup.job.error}</p>}
-          {!setup.job.running && (setup.reported_bond || setup.bond) && (
+          {setup.phase === 'needs_declaration' && !setup.job.running && (
+            <p className="mt-2 text-[0.7rem] text-amber-700 dark:text-amber-300">
+              Bond {setup.bond} is saved, but the chain lists no declaration for it, so it is never drawn onto a panel. Finish declares
+              the floor (it needs a separate deposit of about {msk(setup.second_deposit_sompi)}) and restarts the node as a producer.
+            </p>
+          )}
+          {!setup.job.running && (setup.reported_bond || setup.bond) && setup.phase !== 'bonded' && (
             <button type="button" className="btn-outline mt-2" disabled={busy !== null} onClick={() => void act('finish', () => api.bondFinish())}>
               {busy === 'finish' ? 'Finishing…' : 'Finish: declare and start producing'}
             </button>

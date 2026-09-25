@@ -814,7 +814,7 @@ export interface RegistrationReadiness {
 }
 
 /** `api/bond.rs` — from an empty app to a bonded producer. */
-export type BondPhase = 'need_key' | 'need_funds' | 'ready_to_register' | 'registering' | 'finishing' | 'bonded'
+export type BondPhase = 'need_key' | 'need_funds' | 'ready_to_register' | 'registering' | 'finishing' | 'needs_declaration' | 'bonded'
 
 export type BondSetup = {
   network: NodeNetwork
@@ -824,7 +824,7 @@ export type BondSetup = {
   address: string | null
   address_source: 'cli' | 'node' | null
   address_error: string | null
-  funds: { total_sompi: number; largest_output_sompi: number; outputs: number; coinbase_sompi: number } | null
+  funds: { total_sompi: number; largest_output_sompi: number; second_output_sompi: number; outputs: number; coinbase_sompi: number } | null
   funds_error: string | null
   floor_sompi: number | null
   margin_sompi: number
@@ -839,5 +839,9 @@ export type BondSetup = {
   bond: string | null
   reported_bond: string | null
   registration_wait: string | null
+  /** Classes the chain lists this bond as declaring; null when there is no bond or no answer. */
+  declared: string[] | null
+  /** The separate small deposit that pays the declaration. */
+  second_deposit_sompi: number
   job: { running: boolean; step: string | null; error: string | null; history: string[]; declaration_txid: string | null }
 }

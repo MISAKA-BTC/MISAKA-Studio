@@ -219,18 +219,19 @@ that makes the block.**
   line**, reproducible without the Studio. First run without a bond registers one
   (`--palw-register-bond`); the printed outpoint goes into settings and then mines.
 
-* **Bond setup — key, deposit, bond, mining.** The Network tab creates the producer key, shows
+* **Bond setup — key, deposits, bond, mining.** The Network tab creates the producer key, shows
   its `misakatest:` address (derived by the `misaka` CLI from the key file, before any node runs),
-  reads the deposit from the node's utxo index — the balance and the **largest single output**,
-  because the registration spends exactly one — and starts `kaspad --palw-register-bond`. By
+  reads the deposits from the node's utxo index and starts `kaspad --palw-register-bond`. By
   default the node sizes the collateral itself (≈ 31,191 MSK for the floor on 2026-09-26; the
-  chain's minimum is 13,000 MSK, which the node warns may hold forever), and the card shows the
-  exact amount the node asks for. When the node reports `registered bond <txid>:0` the Studio saves
-  it, declares the bond's capability with `misaka bond capability --declare` (the floor, plus the
-  8k class when its artifact is on disk) through the still-running node, waits until that
-  declaration is in a block, picks a fee float that is not the bond, and restarts the node as a
-  producer — one process per bond throughout, because two sign the same round permit and are
-  slashed.
+  chain's minimum is 13,000 MSK, which the node warns may hold forever) and the card shows the exact
+  amount the node asks for. It asks for **two transfers**: the collateral plus about 1 MSK, which
+  the registration spends whole (its change becomes the node's reserved fee float), and a separate
+  ≈ 1 MSK that pays the capability declaration — a single transfer leaves nothing the CLI may spend
+  for it. When the node reports `registered bond <txid>:0` the Studio saves it, declares the floor
+  with `misaka bond capability` through the still-running node, waits until the registry lists the
+  declaration (`getPalwClaims … bondCapableClasses`), and restarts the node as a producer — one
+  process per bond throughout; the node's Start/Stop are refused while this runs. The 8k class is
+  not declared for you: a seat is convicted for a class it declared and cannot serve.
 
 The node is the [misakas](https://github.com/MISAKA-BTC/misakas) `kaspad`, driven over its JSON
 workflow-RPC (`--rpclisten-json`, loopback only), supervised as a child process the same way

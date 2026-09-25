@@ -16,12 +16,18 @@
 //!    command registers one. The node prints `registered bond <txid>:0 …` and then **keeps
 //!    running** (only its registration worker stops), so the Studio watches for that line;
 //! 5. **a declaration** — a new bond declares no capability, and an undeclared bond is never drawn
-//!    onto a panel. `misaka bond capability --declare` files it.
+//!    onto a panel. `misaka bond capability --declare` files it, and it needs **a second output**:
+//!    the registration carrier's change (`<carrier>:1`) is the node's fee float, which the node
+//!    reserves the moment it persists it, and the CLI will not spend a reserved output. A deposit
+//!    that arrived as one output leaves nothing to pay the declaration with — `misaka mining setup`
+//!    has the same gap — so the card asks for a second, small deposit and waits for it.
 //!
 //! `POST /register` runs 4 and then finishes by itself: the bond goes into the settings, the
-//! capability is declared through the still-running registration node, the Studio waits until that
-//! transaction is in a block (a restarted node's mempool is empty, and a declaration that was only
-//! in it is lost), picks a fee float that is not the bond, and restarts the node as a producer.
+//! Studio waits for a second output, declares the floor through the still-running registration node,
+//! waits until the chain's registry lists the declaration (`getPalwClaims … bondCapableClasses`, the
+//! same read the setup wizard waits on — a restarted node's mempool is empty, and a declaration that
+//! was only in it is lost), and restarts the node as a producer. The fee float is the node's own:
+//! the one its registration persisted in the app dir, or what its scan finds.
 //! **One process per bond throughout**: the registration node is stopped before the producing one
 //! starts — two processes under one bond double-sign round permits and are slashed.
 //!
@@ -34,7 +40,7 @@ use crate::{Error, Result};
 use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use misaka_studio_core::palw::{PalwArtifactSource, classes_for, default_class_for};
+use misaka_studio_core::palw::classes_for;
 use misaka_studio_core::settings::{NetworkRole, NodeNetwork, NodeSettings};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -68,8 +74,22 @@ pub const TESTNET12_FLOOR_LIFETIME_ESTIMATE_SOMPI: u64 = 3_119_145_986_560;
 /// to fund it, which the watcher does not need to hurry.
 const REGISTRATION_WATCH: Duration = Duration::from_secs(6 * 3600);
 
-/// How long to wait for the capability declaration to be in a block before restarting anyway.
-const DECLARATION_WATCH: Duration = Duration::from_secs(15 * 60);
+/// How long to wait for the chain to list the declaration. On a timeout the registration node is
+/// left running — its mempool still holds the declaration — and Finish picks up from there.
+const DECLARATION_WATCH: Duration = Duration::from_secs(20 * 60);
+
+/// How long to wait for the second deposit that pays the declaration.
+const SECOND_DEPOSIT_WATCH: Duration = Duration::from_secs(6 * 3600);
+
+/// The second deposit the card asks for: it pays the declaration, and what it leaves is the float
+/// the node's scan falls back to when the registration's change runs out.
+pub const SECOND_DEPOSIT_SOMPI: u64 = SOMPI_PER_MSK;
+
+/// The least a second output may hold to pay a carrier: the join guide's fee-float floor.
+const CARRIER_FUNDING_MIN_SOMPI: u64 = SOMPI_PER_MSK / 10;
+
+/// No `misaka` call here needs more than this; one that hangs must not hold the setup forever.
+const CLI_TIMEOUT: Duration = Duration::from_secs(180);
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new().route("/", get(status)).route("/register", post(register)).route("/finish", post(finish))
@@ -89,7 +109,9 @@ pub enum BondPhase {
     Registering,
     /// The bond landed; declaring, waiting for the declaration, restarting.
     Finishing,
-    /// `node.producer_bond` is set: the node mines with it on start.
+    /// A bond is saved but the chain lists no declaration for it: it would never be drawn.
+    NeedsDeclaration,
+    /// `node.producer_bond` is set and declared (or the node could not be asked).
     Bonded,
 }
 
@@ -99,6 +121,9 @@ pub struct Funds {
     pub total_sompi: u64,
     /// The largest single ordinary (non-coinbase) output — what a registration can spend.
     pub largest_output_sompi: u64,
+    /// The next largest: what pays the capability declaration after the registration took the
+    /// largest (the registration's own change is reserved by the node as its fee float).
+    pub second_output_sompi: u64,
     /// Ordinary outputs, counted.
     pub outputs: usize,
     /// Rewards at the address. The node can spend a matured one, but the wizard and the join guide
@@ -168,12 +193,41 @@ pub struct BondSetup {
     pub reported_bond: Option<String>,
     /// The registration run's own reason for waiting.
     pub registration_wait: Option<String>,
+    /// The classes the chain lists this bond as declaring (`getPalwClaims`); `None` when there is
+    /// no bond or the node could not be asked.
+    pub declared: Option<Vec<String>>,
+    pub second_deposit_sompi: u64,
     pub job: BondJob,
 }
 
 fn job() -> &'static Mutex<BondJob> {
     static JOB: OnceLock<Mutex<BondJob>> = OnceLock::new();
     JOB.get_or_init(|| Mutex::new(BondJob::default()))
+}
+
+/// Whether a bond setup is running — the node's own start/stop routes refuse while one is, because
+/// a restart in the middle of it is a second process under one bond, or a lost declaration.
+pub fn job_running() -> bool {
+    job().lock().expect("job lock").running
+}
+
+/// Take the job, or say someone else has it. One lock, one check-and-set: a double click or a
+/// second tab must not start two finishers.
+fn claim_job() -> Result<()> {
+    let mut job = job().lock().expect("job lock");
+    if job.running {
+        return Err(Error::bad_request("a bond setup is already running — its progress is on this card"));
+    }
+    *job = BondJob { running: true, ..Default::default() };
+    Ok(())
+}
+
+fn job_done(line: String) {
+    tracing::info!("[bond setup] {line}");
+    let mut job = job().lock().expect("job lock");
+    job.history.push(line);
+    job.running = false;
+    job.step = None;
 }
 
 fn job_step(step: impl Into<String>) {
@@ -214,9 +268,15 @@ fn cli(settings: &NodeSettings) -> tokio::process::Command {
 
 /// Run a CLI command to completion; its JSON on success, its own sentence on refusal.
 async fn run_cli(mut command: tokio::process::Command, what: &str) -> std::result::Result<String, String> {
-    let output = command.output().await.map_err(|e| {
-        format!("could not run the `misaka` CLI for {what}: {e}. Put it beside the Studio or on PATH, or set node.misaka_cli_path.")
-    })?;
+    command.kill_on_drop(true);
+    let output = tokio::time::timeout(CLI_TIMEOUT, command.output())
+        .await
+        .map_err(|_| format!("the `misaka` CLI did not finish {what} within {} s", CLI_TIMEOUT.as_secs()))?
+        .map_err(|e| {
+            format!(
+                "could not run the `misaka` CLI for {what}: {e}. Put it beside the Studio or on PATH, or set node.misaka_cli_path."
+            )
+        })?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     if output.status.success() {
         return Ok(stdout);
@@ -285,7 +345,12 @@ fn funds_of(utxos: &[Utxo]) -> Funds {
             funds.coinbase_sompi = funds.coinbase_sompi.saturating_add(utxo.amount);
         } else {
             funds.outputs += 1;
-            funds.largest_output_sompi = funds.largest_output_sompi.max(utxo.amount);
+            if utxo.amount > funds.largest_output_sompi {
+                funds.second_output_sompi = funds.largest_output_sompi;
+                funds.largest_output_sompi = utxo.amount;
+            } else {
+                funds.second_output_sompi = funds.second_output_sompi.max(utxo.amount);
+            }
         }
     }
     funds
@@ -333,13 +398,16 @@ fn floor_for(network: NodeNetwork) -> Option<u64> {
 fn phase_of(
     key_present: bool,
     bond: Option<&str>,
+    declared: Option<bool>,
     job_running: bool,
     registering: bool,
     funds: Option<&Funds>,
     needed_sompi: u64,
 ) -> BondPhase {
     if bond.is_some() && !job_running {
-        return BondPhase::Bonded;
+        // Only a registry that answered "not declared" says so; a node that could not be asked is
+        // not evidence against a bond that may well be declared.
+        return if declared == Some(false) { BondPhase::NeedsDeclaration } else { BondPhase::Bonded };
     }
     if job_running && bond.is_some() {
         return BondPhase::Finishing;
@@ -387,6 +455,15 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<BondSetup> {
 
     // What a deposit must reach: the node's own words when it has said them, else the named amount,
     // else the last measured sizing.
+    let floor_id = floor_class_id(settings.network);
+    let declared = match &settings.producer_bond {
+        Some(bond) => declared_classes(&settings, bond).await,
+        None => None,
+    };
+    let declared_ok = match (&declared, floor_id) {
+        (Some(list), Some(floor)) => Some(list.iter().any(|c| c.eq_ignore_ascii_case(floor))),
+        _ => None,
+    };
     let collateral = facts
         .amounts
         .wanted_sompi
@@ -397,6 +474,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<BondSetup> {
     let phase = phase_of(
         key_present,
         settings.producer_bond.as_deref(),
+        declared_ok,
         job.running,
         registering,
         funds.as_ref(),
@@ -423,6 +501,8 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<BondSetup> {
         bond: settings.producer_bond.clone(),
         reported_bond,
         registration_wait,
+        declared,
+        second_deposit_sompi: SECOND_DEPOSIT_SOMPI,
         job,
     })
 }
@@ -438,7 +518,7 @@ struct RegisterBody {
 async fn register(State(state): State<Arc<AppState>>, Json(body): Json<RegisterBody>) -> Result<Json<BondSetup>> {
     let settings = state.settings.read().await.clone();
     let node = &settings.node;
-    if job().lock().expect("job lock").running {
+    if job_running() {
         return Err(Error::bad_request("a bond setup is already running — its progress is on this card"));
     }
     if let Some(bond) = &node.producer_bond {
@@ -493,15 +573,23 @@ async fn register(State(state): State<Arc<AppState>>, Json(body): Json<RegisterB
         }
     }
 
+    // Claimed here, after every check and before the first side effect: from this line on, a second
+    // Register, Finish, Start or Stop is refused until this one is done.
+    claim_job()?;
     let mut next = settings.clone();
     next.node.role = NetworkRole::Producer;
     next.node.bond_collateral_sompi = body.collateral_sompi;
     next.node.producer_bond = None;
     // The float the old chain's carrier left is not this chain's; the registration writes its own.
     next.node.fee_outpoint = None;
-    let applied = state.apply_settings(next).await?;
+    let applied = match state.apply_settings(next).await {
+        Ok(applied) => applied,
+        Err(e) => {
+            job_fail(format!("could not save the settings: {e}"));
+            return Err(e);
+        }
+    };
 
-    *job().lock().expect("job lock") = BondJob { running: true, ..Default::default() };
     job_step(match body.collateral_sompi {
         Some(named) => format!("starting the registration run with {} MSK of collateral", msk(named)),
         None => "starting the registration run; the node sizes the collateral itself".to_string(),
@@ -509,7 +597,10 @@ async fn register(State(state): State<Arc<AppState>>, Json(body): Json<RegisterB
 
     // One node on this data directory, ever: whatever runs now (a verifier, an old producer) stops
     // first. Two processes under one appdir corrupt it, and two under one bond are slashed.
-    state.node.stop().await?;
+    if let Err(e) = state.node.stop().await {
+        job_fail(format!("could not stop the running node: {e}"));
+        return Err(e);
+    }
     let mut node_settings = applied.node.clone();
     if node_settings.class_artifact.is_none() {
         node_settings.class_artifact = super::network::default_class_artifact(node_settings.network, &applied.models_dir).await;
@@ -528,14 +619,14 @@ async fn register(State(state): State<Arc<AppState>>, Json(body): Json<RegisterB
 /// Finish by hand: the bond is known (from the node or the settings) and the automatic run stopped
 /// or was never started — a Studio restarted mid-setup, a declaration that timed out.
 async fn finish(State(state): State<Arc<AppState>>) -> Result<Json<BondSetup>> {
-    if job().lock().expect("job lock").running {
-        return Err(Error::bad_request("a bond setup is already running — its progress is on this card"));
-    }
     let settings = state.settings.read().await.node.clone();
     let Some(bond) = settings.producer_bond.clone().or(state.node.registration_facts().bond) else {
         return Err(Error::bad_request("no bond is known yet — register one first"));
     };
-    *job().lock().expect("job lock") = BondJob { running: true, ..Default::default() };
+    if settings.rpc_url.is_some() {
+        return Err(Error::bad_request("this Studio is attached to another node; finish the bond on that node"));
+    }
+    claim_job()?;
     let worker = state.clone();
     tokio::spawn(async move { complete(worker, bond).await });
     Ok(status(State(state)).await)
@@ -561,97 +652,114 @@ async fn watch_registration(state: Arc<AppState>) {
     }
 }
 
-/// Bond known → settings → declaration (through the running node) → in a block → fee float →
-/// producing node.
+/// The floor's full class id on `network`, where this build's table knows it.
+fn floor_class_id(network: NodeNetwork) -> Option<&'static str> {
+    classes_for(network).iter().find(|c| c.is_base && c.class_id_complete).map(|c| c.class_id_hex)
+}
+
+/// The classes the chain's registry lists `bond` as declaring — `getPalwClaims(bond, "seat")`'s
+/// `bondCapableClasses`, the read `misaka mining setup` waits on. `None` when the node could not be
+/// asked or holds no such bond.
+async fn declared_classes(node: &NodeSettings, bond: &str) -> Option<Vec<String>> {
+    let params = serde_json::json!({ "bond": bond, "role": "seat", "includeTerminal": false, "limit": 1 });
+    let value = wrpc_call(&node_url(node), "getPalwClaims", params, Duration::from_secs(5)).await.ok()?;
+    if !value.get("available").and_then(Value::as_bool).unwrap_or(false)
+        || !value.get("bondKnown").and_then(Value::as_bool).unwrap_or(false)
+    {
+        return None;
+    }
+    Some(value.get("bondCapableClasses")?.as_array()?.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+}
+
+/// An output at the address that can pay the declaration: ordinary, big enough for a carrier, not
+/// the bond, and not the registration's change (`<carrier>:1`, the node's reserved fee float).
+fn declaration_funding(utxos: &[Utxo], bond: &str) -> Option<Utxo> {
+    let carrier = bond.split_once(':').map(|(txid, _)| txid).unwrap_or(bond);
+    let change = format!("{carrier}:1");
+    utxos
+        .iter()
+        .filter(|u| !u.coinbase && u.amount >= CARRIER_FUNDING_MIN_SOMPI && u.outpoint != bond && u.outpoint != change)
+        .max_by_key(|u| u.amount)
+        .cloned()
+}
+
+/// Bond known → settings → a second output → the declaration (through the still-running
+/// registration node) → the registry lists it → producing node.
 async fn complete(state: Arc<AppState>, bond: String) {
     let settings = state.settings.read().await.clone();
-    let mut next = settings.clone();
-    next.node.producer_bond = Some(bond.clone());
-    next.node.role = NetworkRole::Producer;
-    if let Err(e) = state.apply_settings(next).await {
-        return job_fail(format!("could not save the bond outpoint {bond}: {e}"));
+    if settings.node.producer_bond.as_deref() != Some(bond.as_str()) {
+        let mut next = settings.clone();
+        next.node.producer_bond = Some(bond.clone());
+        next.node.role = NetworkRole::Producer;
+        if let Err(e) = state.apply_settings(next).await {
+            return job_fail(format!("could not save the bond outpoint {bond}: {e}"));
+        }
+        job_step(format!("saved {bond} as the producer bond"));
     }
-    job_step(format!("saved {bond} as the producer bond"));
     let node = state.settings.read().await.node.clone();
-    let models_dir = state.settings.read().await.models_dir.clone();
-
-    // The declaration: the floor, plus the model class whose file this machine holds. A class the
-    // bond declares but cannot serve is one it is drawn for and fails; one it serves undeclared is
-    // one it is never drawn for.
-    let mut declare: Vec<&str> = Vec::new();
-    if let Some(floor) = classes_for(node.network).iter().find(|c| c.is_base && c.class_id_complete) {
-        declare.push(floor.class_id_hex);
-    }
-    let model = default_class_for(node.network);
-    let has_model_file = super::network::default_class_artifact(node.network, &models_dir).await.is_some()
-        || node.class_artifact.as_ref().is_some_and(|p| {
-            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                matches!(&model.artifact,
-                PalwArtifactSource::Download { filename, .. } | PalwArtifactSource::ConvertLocally { filename, .. } if *filename == n)
-            })
-        });
-    if has_model_file && model.class_id_complete {
-        declare.push(model.class_id_hex);
-    }
-
     let key = node.producer_key_path.clone().unwrap_or_default();
-    if declare.is_empty() {
-        job_step(format!(
-            "no full class id is known for {} — declare this bond's capability yourself (`misaka bond capability --declare …`)",
+
+    // **The floor only.** A seat is convicted for a class it declared and cannot serve, and this
+    // app cannot tell that it can serve the 8k class (the file's root and the memory for a replay
+    // are the node's to prove); `misaka palw panel join --class --artifact` is the move for that.
+    match floor_class_id(node.network) {
+        None => job_step(format!(
+            "no full floor class id is known for {} — declare this bond's capability yourself (`misaka bond capability --declare …`)",
             node.network.id()
-        ));
-    } else {
-        job_step(format!(
-            "declaring what the bond judges: {}",
-            if declare.len() > 1 { "the floor and the model class" } else { "the floor" }
-        ));
-        let mut command = cli(&node);
-        command
-            .arg("bond")
-            .arg("capability")
-            .arg("--key-file")
-            .arg(&key)
-            .arg("--bond")
-            .arg(&bond)
-            .arg("--declare")
-            .arg(declare.join(","))
-            .arg("--yes");
-        match run_cli(command, "the capability declaration").await {
-            Ok(stdout) => {
-                let txid = super::model_market::field(&stdout, "txid").and_then(|v| v.as_str().map(str::to_string));
-                job().lock().expect("job lock").declaration_txid = txid.clone();
-                if let Some(txid) = txid {
-                    job_step(format!("declaration {txid} filed; waiting for it to be in a block before the restart"));
-                    if !wait_for_outputs_of(&node, &key, &txid).await {
-                        job_step(
-                            "the declaration is not visible in a block after 15 minutes; restarting anyway — re-run Finish if the seat is never drawn",
-                        );
-                    }
+        )),
+        Some(floor) => {
+            let already = declared_classes(&node, &bond).await.is_some_and(|c| c.iter().any(|id| id.eq_ignore_ascii_case(floor)));
+            if already {
+                job_step("the chain already lists the floor as declared for this bond");
+            } else {
+                if let Err(e) = wait_for_declaration_funding(&node, &key, &bond).await {
+                    return job_fail(e);
                 }
+                job_step("declaring the floor as what this bond judges");
+                let mut command = cli(&node);
+                command
+                    .arg("bond")
+                    .arg("capability")
+                    .arg("--key-file")
+                    .arg(&key)
+                    .arg("--bond")
+                    .arg(&bond)
+                    .arg("--class-id")
+                    .arg(floor)
+                    .arg("--declare")
+                    .arg(floor)
+                    .arg("--yes");
+                match run_cli(command, "the capability declaration").await {
+                    Ok(stdout) => {
+                        let txid = super::model_market::field(&stdout, "txid").and_then(|v| v.as_str().map(str::to_string));
+                        job().lock().expect("job lock").declaration_txid = txid.clone();
+                        job_step(format!(
+                            "declaration {} filed; waiting for the chain to list it before the restart",
+                            txid.as_deref().unwrap_or("(no txid printed)")
+                        ));
+                    }
+                    Err(e) => return job_fail(format!("{e}. The bond is saved; press Finish to try the declaration again")),
+                }
+                if !wait_for_declared(&node, &bond, floor).await {
+                    // Not restarting is the point: the declaration is in THIS node's mempool, and a
+                    // restart would drop it.
+                    return job_fail(format!(
+                        "the chain has not listed the declaration after {} minutes. The registration node is left running so it keeps \
+                         the declaration; press Finish to check again",
+                        DECLARATION_WATCH.as_secs() / 60
+                    ));
+                }
+                job_step("the chain lists the floor as declared");
             }
-            Err(e) => return job_fail(format!("{e}. The bond is saved; press Finish to try the declaration again")),
         }
     }
 
-    // A fee float that is not the bond: the largest ordinary output left at the address. The
-    // registration saved `<carrier>:1` in the app dir, but the declaration may have spent it.
-    let mut fee = None;
-    if let Ok(address) = derive_address(&node, &key).await
-        && let Ok(utxos) = utxos_at(&node, &address).await
-    {
-        fee = utxos.iter().filter(|u| !u.coinbase && u.outpoint != bond).max_by_key(|u| u.amount).map(|u| u.outpoint.clone());
-    }
-
     job_step("restarting the node as a producer");
+    // One process per bond: the registration node is gone before the producing one starts.
     if let Err(e) = state.node.stop().await {
         return job_fail(format!("could not stop the registration node: {e}"));
     }
-    let mut next = state.settings.read().await.clone();
-    next.node.fee_outpoint = fee.clone();
-    let applied = match state.apply_settings(next).await {
-        Ok(applied) => applied,
-        Err(e) => return job_fail(format!("could not save the fee outpoint: {e}")),
-    };
+    let applied = state.settings.read().await.clone();
     let mut node_settings = applied.node.clone();
     if node_settings.class_artifact.is_none() {
         node_settings.class_artifact = super::network::default_class_artifact(node_settings.network, &applied.models_dir).await;
@@ -659,24 +767,38 @@ async fn complete(state: Arc<AppState>, bond: String) {
     if let Err(e) = state.node.start(&node_settings).await {
         return job_fail(format!("the producing node did not start: {e}"));
     }
-    let mut job = job().lock().expect("job lock");
-    job.history.push(match fee {
-        Some(fee) => format!("producing with bond {bond}, fee float {fee}"),
-        None => format!("producing with bond {bond} (the node uses the float its registration saved)"),
-    });
-    job.running = false;
-    job.step = None;
+    job_done(format!("producing with bond {bond}; its fee float is the one the registration saved, or what the node's scan finds"));
 }
 
-/// Wait until an output of `txid` is in the address's utxo set — which the node's index reports
-/// only once the transaction is in a block. `false` on timeout.
-async fn wait_for_outputs_of(node: &NodeSettings, key: &PathBuf, txid: &str) -> bool {
-    let Ok(address) = derive_address(node, key).await else { return false };
+/// Wait until the address holds an output the declaration can spend.
+async fn wait_for_declaration_funding(node: &NodeSettings, key: &PathBuf, bond: &str) -> std::result::Result<(), String> {
+    let address = derive_address(node, key).await?;
+    let started = std::time::Instant::now();
+    let mut asked = false;
+    while started.elapsed() < SECOND_DEPOSIT_WATCH {
+        if let Ok(utxos) = utxos_at(node, &address).await
+            && declaration_funding(&utxos, bond).is_some()
+        {
+            return Ok(());
+        }
+        if !asked {
+            job_step(format!(
+                "waiting for a second deposit of about {} MSK at {address}: the registration's change is the node's reserved fee \
+                 float, so the declaration needs an output of its own",
+                msk(SECOND_DEPOSIT_SOMPI)
+            ));
+            asked = true;
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+    Err("no second deposit arrived within six hours. The bond is saved; send about 1 MSK to the address and press Finish".into())
+}
+
+/// Wait until the registry lists `class` among the bond's declared classes. `false` on timeout.
+async fn wait_for_declared(node: &NodeSettings, bond: &str, class: &str) -> bool {
     let started = std::time::Instant::now();
     while started.elapsed() < DECLARATION_WATCH {
-        if let Ok(utxos) = utxos_at(node, &address).await
-            && utxos.iter().any(|u| u.outpoint.starts_with(&format!("{txid}:")))
-        {
+        if declared_classes(node, bond).await.is_some_and(|c| c.iter().any(|id| id.eq_ignore_ascii_case(class))) {
             return true;
         }
         tokio::time::sleep(Duration::from_secs(10)).await;
@@ -704,6 +826,7 @@ mod tests {
         let utxos = utxos_from(&value);
         assert_eq!(utxos[1].outpoint, "bb:1");
         let funds = funds_of(&utxos);
+        assert_eq!(funds.second_output_sompi, 5_000 * SOMPI_PER_MSK);
         assert_eq!(funds.total_sompi, 34_000 * SOMPI_PER_MSK);
         assert_eq!(funds.largest_output_sompi, 9_000 * SOMPI_PER_MSK, "a reward is not counted toward registering");
         assert_eq!(funds.coinbase_sompi, 20_000 * SOMPI_PER_MSK);
@@ -715,13 +838,19 @@ mod tests {
         let enough = Funds { largest_output_sompi: 14_000 * SOMPI_PER_MSK, ..Default::default() };
         let short = Funds { total_sompi: 14_000 * SOMPI_PER_MSK, largest_output_sompi: 7_000 * SOMPI_PER_MSK, ..Default::default() };
         let need = 13_000 * SOMPI_PER_MSK + REGISTRATION_MARGIN_SOMPI;
-        assert_eq!(phase_of(false, None, false, false, None, need), BondPhase::NeedKey);
-        assert_eq!(phase_of(true, None, false, false, None, need), BondPhase::NeedFunds, "an unanswered node is not funds");
-        assert_eq!(phase_of(true, None, false, false, Some(&short), need), BondPhase::NeedFunds, "one output, not the total");
-        assert_eq!(phase_of(true, None, false, false, Some(&enough), need), BondPhase::ReadyToRegister);
-        assert_eq!(phase_of(true, None, false, true, Some(&enough), need), BondPhase::Registering);
-        assert_eq!(phase_of(true, Some("x:0"), true, true, None, need), BondPhase::Finishing);
-        assert_eq!(phase_of(true, Some("x:0"), false, false, None, need), BondPhase::Bonded);
+        assert_eq!(phase_of(false, None, None, false, false, None, need), BondPhase::NeedKey);
+        assert_eq!(phase_of(true, None, None, false, false, None, need), BondPhase::NeedFunds, "an unanswered node is not funds");
+        assert_eq!(phase_of(true, None, None, false, false, Some(&short), need), BondPhase::NeedFunds, "one output, not the total");
+        assert_eq!(phase_of(true, None, None, false, false, Some(&enough), need), BondPhase::ReadyToRegister);
+        assert_eq!(phase_of(true, None, None, false, true, Some(&enough), need), BondPhase::Registering);
+        assert_eq!(phase_of(true, Some("x:0"), None, true, true, None, need), BondPhase::Finishing);
+        assert_eq!(
+            phase_of(true, Some("x:0"), None, false, false, None, need),
+            BondPhase::Bonded,
+            "an unanswered registry is not evidence"
+        );
+        assert_eq!(phase_of(true, Some("x:0"), Some(true), false, false, None, need), BondPhase::Bonded);
+        assert_eq!(phase_of(true, Some("x:0"), Some(false), false, false, None, need), BondPhase::NeedsDeclaration);
     }
 
     #[test]
@@ -734,6 +863,23 @@ mod tests {
         // Once the node has printed its figure, that figure is the one shown.
         assert_eq!(choices(NodeNetwork::Testnet12, Some(5)).first().map(|c| c.approx_sompi), Some(5));
         assert_eq!(choices(NodeNetwork::Devnet, None).len(), 1, "elsewhere only the node's own sizing");
+    }
+
+    /// The registration's change is the node's reserved float and the bond is the bond: neither
+    /// pays the declaration, and a single-output deposit therefore leaves nothing that can.
+    #[test]
+    fn the_declaration_is_funded_from_a_second_output_only() {
+        let bond = format!("{}:0", "ab".repeat(64));
+        let change = format!("{}:1", "ab".repeat(64));
+        let u = |outpoint: &str, msk_: u64, coinbase: bool| Utxo { outpoint: outpoint.into(), amount: msk_ * SOMPI_PER_MSK, coinbase };
+        let one_deposit = vec![u(&bond, 31_192, false), u(&change, 1, false)];
+        assert_eq!(declaration_funding(&one_deposit, &bond), None);
+        let with_reward = vec![u(&bond, 31_192, false), u(&change, 1, false), u("cc:0", 5, true)];
+        assert_eq!(declaration_funding(&with_reward, &bond), None, "a reward is not taken for it");
+        let two = vec![u(&bond, 31_192, false), u(&change, 1, false), u("dd:0", 1, false)];
+        assert_eq!(declaration_funding(&two, &bond).map(|x| x.outpoint), Some("dd:0".to_string()));
+        let dust = vec![u(&bond, 31_192, false), Utxo { outpoint: "ee:0".into(), amount: 1_000, coinbase: false }];
+        assert_eq!(declaration_funding(&dust, &bond), None, "too little to pay a carrier");
     }
 
     #[test]

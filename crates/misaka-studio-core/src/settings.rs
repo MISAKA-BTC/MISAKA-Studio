@@ -584,6 +584,13 @@ impl Settings {
             let holds_testnet11_identity = self.node.producer_bond.is_some() || self.node.rpc_url.is_some();
             if self.node.network == NodeNetwork::Testnet11 && !holds_testnet11_identity {
                 self.node.network = NodeNetwork::Testnet12;
+                // What named testnet-11's chain goes with it: its class ids are not testnet-12's (a
+                // registration run sized for an unknown class waits forever), its fee outpoint is
+                // an outpoint of another chain, and a class artifact path names a testnet-11 file.
+                self.node.producer_class = None;
+                self.node.class_artifact = None;
+                self.node.fee_outpoint = None;
+                self.node.register_class = None;
             }
             self.schema = 1;
         }
@@ -678,9 +685,18 @@ mod tests {
     fn an_old_file_moves_to_testnet12_unless_it_holds_a_testnet11_identity() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("old.json");
-        std::fs::write(&path, r#"{"node":{"network":"testnet11","role":"verifier"}}"#).expect("write");
+        std::fs::write(
+            &path,
+            r#"{"node":{"network":"testnet11","role":"verifier","producer_class":"5bd9ae3d","fee_outpoint":"aa:1","class_artifact":"/m/qwen36.palwq36"}}"#,
+        )
+        .expect("write");
         let s = Settings::load(&path).expect("loads");
         assert_eq!(s.node.network, NodeNetwork::Testnet12);
+        assert_eq!(
+            (s.node.producer_class, s.node.fee_outpoint, s.node.class_artifact),
+            (None, None, None),
+            "testnet-11's chain facts go"
+        );
         assert_eq!(s.schema, SETTINGS_SCHEMA);
 
         std::fs::write(&path, r#"{"node":{"network":"testnet11","producer_bond":"ab:0"}}"#).expect("write");

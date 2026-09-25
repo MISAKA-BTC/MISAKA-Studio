@@ -166,6 +166,11 @@ async fn download_artifact(
 /// data was stale — so it cannot be used as a general "wipe my node" button, and a user who clicks
 /// it is answering the exact question the node asked.
 async fn reset_node(State(state): State<Arc<AppState>>) -> Result<Json<NodeView>> {
+    if super::bond::job_running() {
+        return Err(Error::bad_request(
+            "a bond setup is running and owns the node until it finishes — its progress is on the Bond setup card",
+        ));
+    }
     let settings = state.settings.read().await.clone();
     let view = state.node.view(&settings.node).await?;
     if !matches!(view.blocker, Some(crate::node::NodeBlocker::StaleChainData { .. })) {
@@ -189,6 +194,11 @@ struct StartBody {
 }
 
 async fn start_node(State(state): State<Arc<AppState>>, body: Option<Json<StartBody>>) -> Result<Json<NodeView>> {
+    if super::bond::job_running() {
+        return Err(Error::bad_request(
+            "a bond setup is running and owns the node until it finishes — its progress is on the Bond setup card",
+        ));
+    }
     let settings = state.settings.read().await.clone();
     let mut node_settings = settings.node.clone();
     if let Some(Json(StartBody { role: Some(role) })) = body {
@@ -233,6 +243,11 @@ pub(crate) async fn default_class_artifact(network: NodeNetwork, models_dir: &st
 }
 
 async fn stop_node(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>> {
+    if super::bond::job_running() {
+        return Err(Error::bad_request(
+            "a bond setup is running and owns the node until it finishes — its progress is on the Bond setup card",
+        ));
+    }
     state.node.stop().await?;
     Ok(Json(serde_json::json!({ "stopped": true })))
 }
