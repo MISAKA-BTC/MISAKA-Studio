@@ -17,16 +17,18 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../lib/api'
 import { bytes } from '../lib/format'
-import type { NodeClassRow, PalwArtifactHeader, PalwClassStatus } from '../lib/types'
+import { NETWORK_LABEL } from '../lib/types'
+import type { NodeClassRow, NodeNetwork, PalwArtifactHeader, PalwClassStatus } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { CopyButton, Icon, Spinner } from './common'
 import { ClassContext } from './ContextBadge'
 
 /**
- * The class the runtime installs on first run — `palw::DEFAULT_CLASS`, repeated here only to put
- * a badge on it. The install itself is the runtime's decision and does not consult this.
+ * The model class the runtime points a node at when its file is present — `palw::default_class_for`,
+ * repeated here only to put a badge on it. The decision is the runtime's and does not consult this.
  */
-const DEFAULT_CLASS = 'PALW-QWEN25-A16'
+const DEFAULT_CLASSES = ['PALW-QWEN25-A16-8K', 'PALW-QWEN25-A16']
+const isDefaultClass = (name: string) => DEFAULT_CLASSES.includes(name)
 
 /** `https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct`, honouring an `HF_ENDPOINT` mirror. */
 function repoUrl(endpoint: string | undefined, repo: string): string {
@@ -75,8 +77,14 @@ function FinalWorkShare({ spec, rows }: { spec: PalwClassStatus['spec']; rows: N
  * list that stays wrong until someone reloads the window, which is exactly the moment they would
  * conclude the download had failed.
  */
-export function useClassStatuses(): { classes: PalwClassStatus[] | null; nodeRows: NodeClassRow[]; error: string | null } {
+export function useClassStatuses(): {
+  classes: PalwClassStatus[] | null
+  nodeRows: NodeClassRow[]
+  network: NodeNetwork | null
+  error: string | null
+} {
   const [classes, setClasses] = useState<PalwClassStatus[] | null>(null)
+  const [network, setNetwork] = useState<NodeNetwork | null>(null)
   const [nodeRows, setNodeRows] = useState<NodeClassRow[]>([])
   const [error, setError] = useState<string | null>(null)
   const downloads = useStudio((s) => s.downloads)
@@ -92,6 +100,7 @@ export function useClassStatuses(): { classes: PalwClassStatus[] | null; nodeRow
     try {
       const overview = await api.network()
       setNodeRows(overview.node.classes_from_node)
+      setNetwork(overview.network)
     } catch {
       setNodeRows([])
     }
@@ -101,7 +110,7 @@ export function useClassStatuses(): { classes: PalwClassStatus[] | null; nodeRow
     void refresh()
   }, [refresh, settled])
 
-  return { classes, nodeRows, error }
+  return { classes, nodeRows, network, error }
 }
 
 /**
@@ -132,7 +141,7 @@ export function InstalledMiningArtifacts() {
               <div className="flex flex-wrap items-center gap-2">
                 <h4 className="mono text-sm font-semibold">{cls.spec.name}</h4>
                 <FinalWorkShare spec={cls.spec} rows={nodeRows} />
-                {cls.spec.name === DEFAULT_CLASS && <span className="badge bg-arc-600 text-white">default class</span>}
+                {isDefaultClass(cls.spec.name) && <span className="badge bg-arc-600 text-white">default class</span>}
                 <ClassContext registered={cls.spec.context_tokens} header={cls.artifact_header} />
                 {readiness.state === 'artifact_present' ? (
                   <span className="badge bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">on disk</span>
@@ -152,7 +161,7 @@ export function InstalledMiningArtifacts() {
               <p className="mt-1.5 text-[0.7rem] text-ink-500 dark:text-ink-400">
                 {readiness.state !== 'artifact_present'
                   ? 'A truncated download or a different conversion. Delete it and install again; the node would refuse this file at startup.'
-                  : cls.spec.name === DEFAULT_CLASS
+                  : isDefaultClass(cls.spec.name)
                     ? 'The default class: starting the node as a producer mines this without any further configuration. The node verifies the registered root at startup — a file that does not match is refused there, not here.'
                     : 'Name this path as the class artifact in Network settings to mine this class instead. The node verifies the registered root at startup — a file that does not match is refused there, not here.'}
               </p>
@@ -165,7 +174,7 @@ export function InstalledMiningArtifacts() {
 }
 
 export function MiningCatalog() {
-  const { classes, nodeRows, error } = useClassStatuses()
+  const { classes, nodeRows, network, error } = useClassStatuses()
   const toast = useStudio((s) => s.toast)
   const setDownload = useStudio((s) => s.setDownload)
 
@@ -183,7 +192,7 @@ export function MiningCatalog() {
     <section className="card p-4">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h3 className="text-sm font-semibold">Models you can mine with</h3>
-        <span className="text-[0.7rem] text-ink-500 dark:text-ink-400">testnet-11 genesis registry</span>
+        <span className="text-[0.7rem] text-ink-500 dark:text-ink-400">{network ? `${NETWORK_LABEL[network]} genesis registry` : 'genesis registry'}</span>
       </div>
       <p className="mt-1 text-xs leading-relaxed text-ink-500 dark:text-ink-400">
         A block on the MISAKA network is won by verified inference in one of these chain-registered classes, and each one names
@@ -261,7 +270,7 @@ function MiningRow({ cls, nodeRows, onInstall }: { cls: PalwClassStatus; nodeRow
       <div className="flex flex-wrap items-center gap-2">
         <h4 className="mono text-sm font-semibold">{spec.name}</h4>
         <FinalWorkShare spec={spec} rows={nodeRows} />
-        {spec.name === DEFAULT_CLASS && <span className="badge bg-arc-600 text-white">default · installed on first run</span>}
+        {isDefaultClass(spec.name) && <span className="badge bg-arc-600 text-white">default model class</span>}
         {spec.is_base && <span className="badge bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300">floor · residual cadence, unpaid</span>}
         <ClassContext registered={spec.context_tokens} header={cls.artifact_header} />
         {badge}
@@ -295,7 +304,12 @@ function MiningRow({ cls, nodeRows, onInstall }: { cls: PalwClassStatus; nodeRow
         {artifact.kind === 'convert_locally' && (
           <>
             <span className="mono">{artifact.filename}</span>
-            <span>~{bytes(artifact.approx_size_bytes)} once converted</span>
+            <span>{artifact.exact ? bytes(artifact.exact.size_bytes) : `~${bytes(artifact.approx_size_bytes)}`} once converted</span>
+            {artifact.exact && (
+              <span className="mono" title="SHA-256 a correct conversion produces — the conversion is deterministic">
+                sha256 {artifact.exact.sha256.slice(0, 12)}…
+              </span>
+            )}
           </>
         )}
         {artifact.kind === 'derived_from_seed' && <span>no file — every node derives this class's artifact from a seed</span>}

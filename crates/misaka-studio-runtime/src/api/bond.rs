@@ -1,0 +1,745 @@
+//! `/api/v1/network/bond` — **from an empty app to a bonded producer, in the order a person does it.**
+//!
+//! On testnet-12 (release `0e8ec984e`) a producer is one ML-DSA-87 key: it signs the bond, it is the
+//! operator key (`palw_operator_id_unique` is armed from DAA 0, so the carrier carries both
+//! signatures), and its own address is where rewards land and where the collateral is spent from.
+//! Getting from nothing to producing takes five facts, and until now the Studio asked the person to
+//! assemble them from log lines and settings fields:
+//!
+//! 1. **a key** — minted here (`POST /network/producer-key`, 0600 under the data directory);
+//! 2. **its address** — derived by the `misaka` CLI from the key file, so it is known before any
+//!    node runs (the node's own `[palw] producer pay address` line is the fallback);
+//! 3. **one output at that address holding the collateral plus fees** — registration spends a
+//!    single input (the node picks the largest), so the balance alone is not the answer and the
+//!    largest output is shown beside it;
+//! 4. **the registration run** — only `kaspad --palw-register-bond` can file a bond; no `misaka`
+//!    command registers one. The node prints `registered bond <txid>:0 …` and then **keeps
+//!    running** (only its registration worker stops), so the Studio watches for that line;
+//! 5. **a declaration** — a new bond declares no capability, and an undeclared bond is never drawn
+//!    onto a panel. `misaka bond capability --declare` files it.
+//!
+//! `POST /register` runs 4 and then finishes by itself: the bond goes into the settings, the
+//! capability is declared through the still-running registration node, the Studio waits until that
+//! transaction is in a block (a restarted node's mempool is empty, and a declaration that was only
+//! in it is lost), picks a fee float that is not the bond, and restarts the node as a producer.
+//! **One process per bond throughout**: the registration node is stopped before the producing one
+//! starts — two processes under one bond double-sign round permits and are slashed.
+//!
+//! Nothing here signs anything itself. The bond is the node's transaction and the declaration is
+//! the CLI's, the two implementations the chain's own tests cover.
+
+use crate::node::{NodeManager, normalize_rpc_url, wrpc_call};
+use crate::state::AppState;
+use crate::{Error, Result};
+use axum::extract::State;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use misaka_studio_core::palw::{PalwArtifactSource, classes_for, default_class_for};
+use misaka_studio_core::settings::{NetworkRole, NodeNetwork, NodeSettings};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+const SOMPI_PER_MSK: u64 = 100_000_000;
+
+/// testnet-12's producer floor, 13,000 MSK (`PALW_MAINNET_MIN_COLLATERAL_SOMPI`, "mainnet-assumed
+/// bonds", decided 2026-09-24). The registration refuses less.
+pub const TESTNET12_PRODUCER_FLOOR_SOMPI: u64 = 13_000 * SOMPI_PER_MSK;
+
+/// What the registration carrier needs on top of the collateral: the node's own margin is 0.1 MSK
+/// (`misaka mining setup`'s `REGISTRATION_MARGIN_SOMPI`). The Studio asks for 1 MSK, because the same
+/// output's change then pays the capability declaration and becomes the fee float the seat duties
+/// carry their objects with (the join guide asks for ≥ 0.1 MSK of float).
+pub const REGISTRATION_MARGIN_SOMPI: u64 = SOMPI_PER_MSK / 10;
+pub const RECOMMENDED_MARGIN_SOMPI: u64 = SOMPI_PER_MSK;
+
+/// **The node's own sizing of a floor bond on testnet-12, as last measured**: 3,119,145,986,560
+/// sompi (≈ 31,191 MSK), printed by release `0e8ec984e` on 2026-09-26 as "the … sompi that a claim of
+/// class f1c5635c… needs on this chain for its whole life" — the same figure the 2026-09-23 drill
+/// measured. The node derives it from the class's live producer facts
+/// (`palw_v2_collateral_for_claim_lifetime_v1`), so it moves; this is shown only as "about" until
+/// the registration run prints the exact amount it wants, and nothing is decided on it.
+pub const TESTNET12_FLOOR_LIFETIME_ESTIMATE_SOMPI: u64 = 3_119_145_986_560;
+
+/// How long the registration run may take before the Studio stops waiting for its line. The node
+/// itself waits up to ten minutes for the carrier after it is funded; the rest is the person's time
+/// to fund it, which the watcher does not need to hurry.
+const REGISTRATION_WATCH: Duration = Duration::from_secs(6 * 3600);
+
+/// How long to wait for the capability declaration to be in a block before restarting anyway.
+const DECLARATION_WATCH: Duration = Duration::from_secs(15 * 60);
+
+pub fn router() -> Router<Arc<AppState>> {
+    Router::new().route("/", get(status)).route("/register", post(register)).route("/finish", post(finish))
+}
+
+/// Where the setup stands, as one word the UI can switch on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BondPhase {
+    /// No key file yet.
+    NeedKey,
+    /// A key, but its address holds no single output big enough (or the node could not say).
+    NeedFunds,
+    /// Enough in one output: the registration can run.
+    ReadyToRegister,
+    /// The registration run is up and waiting — for funds, a synced chain, or its carrier.
+    Registering,
+    /// The bond landed; declaring, waiting for the declaration, restarting.
+    Finishing,
+    /// `node.producer_bond` is set: the node mines with it on start.
+    Bonded,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Funds {
+    /// Everything at the address, bond collateral included once there is one.
+    pub total_sompi: u64,
+    /// The largest single ordinary (non-coinbase) output — what a registration can spend.
+    pub largest_output_sompi: u64,
+    /// Ordinary outputs, counted.
+    pub outputs: usize,
+    /// Rewards at the address. The node can spend a matured one, but the wizard and the join guide
+    /// ask for an ordinary output, so these are shown and not counted toward registering.
+    pub coinbase_sompi: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CollateralChoice {
+    pub label: String,
+    /// `None` = no `--palw-bond-collateral`: the node sizes the bond for a claim's whole life.
+    pub collateral_sompi: Option<u64>,
+    /// The deposit this choice needs, as far as it is known before the node says: exact for a
+    /// named amount, the last measured sizing for the node's own.
+    pub approx_sompi: u64,
+    /// Whether the node warns that this amount may hold forever.
+    pub below_lifetime_sizing: bool,
+    pub note: String,
+}
+
+/// The background job that runs the registration to the end, as the UI polls it.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct BondJob {
+    pub running: bool,
+    /// What it is doing now, in a sentence.
+    pub step: Option<String>,
+    /// Why it stopped, when it did not finish.
+    pub error: Option<String>,
+    /// Every step it took, oldest first.
+    pub history: Vec<String>,
+    /// The capability declaration's transaction, once filed.
+    pub declaration_txid: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct BondSetup {
+    pub network: NodeNetwork,
+    pub phase: BondPhase,
+    pub key_path: Option<String>,
+    pub key_present: bool,
+    /// The key's funding address — where to send MSK.
+    pub address: Option<String>,
+    /// `cli` when the `misaka` CLI derived it from the key file, `node` when it came from the
+    /// node's own line.
+    pub address_source: Option<&'static str>,
+    pub address_error: Option<String>,
+    /// `None` when the node could not be asked (not running, no utxo index, not synced).
+    pub funds: Option<Funds>,
+    pub funds_error: Option<String>,
+    /// The chain's floor for a producer bond, where this build knows it (testnet-12).
+    pub floor_sompi: Option<u64>,
+    pub margin_sompi: u64,
+    pub recommended_margin_sompi: u64,
+    pub choices: Vec<CollateralChoice>,
+    /// The collateral the next registration run locks (`node.bond_collateral_sompi`); `None` lets
+    /// the node size it.
+    pub collateral_sompi: Option<u64>,
+    /// What the registration run says it will spend ("send at least N sompi plus a fee"), once it
+    /// has said it — the number a deposit has to reach.
+    pub node_wanted_sompi: Option<u64>,
+    /// The node's whole-claim-lifetime sizing, when it printed it (it does so for a named amount
+    /// below it).
+    pub node_lifetime_sompi: Option<u64>,
+    /// `node.producer_bond`.
+    pub bond: Option<String>,
+    /// The bond the node reported for this key, before the settings carry it.
+    pub reported_bond: Option<String>,
+    /// The registration run's own reason for waiting.
+    pub registration_wait: Option<String>,
+    pub job: BondJob,
+}
+
+fn job() -> &'static Mutex<BondJob> {
+    static JOB: OnceLock<Mutex<BondJob>> = OnceLock::new();
+    JOB.get_or_init(|| Mutex::new(BondJob::default()))
+}
+
+fn job_step(step: impl Into<String>) {
+    let step = step.into();
+    tracing::info!("[bond setup] {step}");
+    let mut job = job().lock().expect("job lock");
+    job.history.push(step.clone());
+    job.step = Some(step);
+}
+
+fn job_fail(error: impl Into<String>) {
+    let error = error.into();
+    tracing::warn!("[bond setup] stopped: {error}");
+    let mut job = job().lock().expect("job lock");
+    job.history.push(format!("stopped: {error}"));
+    job.error = Some(error);
+    job.running = false;
+    job.step = None;
+}
+
+/// (key path, network) → address. The derivation is a pure function of the file, so it is asked of
+/// the CLI once and not on every poll.
+fn address_cache() -> &'static Mutex<Option<(PathBuf, NodeNetwork, String)>> {
+    static CACHE: OnceLock<Mutex<Option<(PathBuf, NodeNetwork, String)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// The `misaka` CLI with this Studio's network and endpoint — the same two global flags every
+/// signing call here must share with the readiness reads.
+fn cli(settings: &NodeSettings) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(NodeManager::resolve_misaka_cli(settings.misaka_cli_path.as_ref()));
+    command.arg("--network").arg(settings.network.id()).arg("--output").arg("json");
+    if let Some(rpc) = &settings.misaka_rpc {
+        command.arg("--rpc").arg(rpc);
+    }
+    command
+}
+
+/// Run a CLI command to completion; its JSON on success, its own sentence on refusal.
+async fn run_cli(mut command: tokio::process::Command, what: &str) -> std::result::Result<String, String> {
+    let output = command.output().await.map_err(|e| {
+        format!("could not run the `misaka` CLI for {what}: {e}. Put it beside the Studio or on PATH, or set node.misaka_cli_path.")
+    })?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if output.status.success() {
+        return Ok(stdout);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let said = super::model_market::field(&stderr, "error")
+        .or_else(|| super::model_market::field(&stdout, "error"))
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| if stderr.trim().is_empty() { stdout.trim().to_string() } else { stderr.trim().to_string() });
+    Err(format!("{what} was refused: {said}"))
+}
+
+async fn derive_address(settings: &NodeSettings, key: &PathBuf) -> std::result::Result<String, String> {
+    if let Some((path, network, address)) = address_cache().lock().expect("cache").as_ref()
+        && path == key
+        && *network == settings.network
+    {
+        return Ok(address.clone());
+    }
+    let mut command = cli(settings);
+    command.arg("key").arg("address").arg("--key-file").arg(key);
+    let stdout = run_cli(command, "deriving the key's address").await?;
+    let address = super::model_market::field(&stdout, "address")
+        .and_then(|v| v.as_str().map(str::to_string))
+        .ok_or_else(|| format!("`misaka key address` printed no address: {}", stdout.trim()))?;
+    *address_cache().lock().expect("cache") = Some((key.clone(), settings.network, address.clone()));
+    Ok(address)
+}
+
+/// The node the Studio talks to: its supervised one, or the configured attach URL.
+fn node_url(settings: &NodeSettings) -> String {
+    normalize_rpc_url(settings.rpc_url.as_deref().unwrap_or(""), settings.network)
+}
+
+/// One `getUtxosByAddresses` entry, as far as this module reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Utxo {
+    outpoint: String,
+    amount: u64,
+    coinbase: bool,
+}
+
+fn utxos_from(value: &Value) -> Vec<Utxo> {
+    let Some(entries) = value.get("entries").and_then(Value::as_array) else { return Vec::new() };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let outpoint = entry.get("outpoint")?;
+            let txid = outpoint.get("transactionId").and_then(Value::as_str)?;
+            let index = outpoint.get("index").and_then(Value::as_u64)?;
+            let utxo = entry.get("utxoEntry")?;
+            Some(Utxo {
+                outpoint: format!("{txid}:{index}"),
+                amount: utxo.get("amount").and_then(Value::as_u64).unwrap_or(0),
+                coinbase: utxo.get("isCoinbase").and_then(Value::as_bool).unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+fn funds_of(utxos: &[Utxo]) -> Funds {
+    let mut funds = Funds::default();
+    for utxo in utxos {
+        funds.total_sompi = funds.total_sompi.saturating_add(utxo.amount);
+        if utxo.coinbase {
+            funds.coinbase_sompi = funds.coinbase_sompi.saturating_add(utxo.amount);
+        } else {
+            funds.outputs += 1;
+            funds.largest_output_sompi = funds.largest_output_sompi.max(utxo.amount);
+        }
+    }
+    funds
+}
+
+async fn utxos_at(settings: &NodeSettings, address: &str) -> Result<Vec<Utxo>> {
+    let value =
+        wrpc_call(&node_url(settings), "getUtxosByAddresses", serde_json::json!({ "addresses": [address] }), Duration::from_secs(5))
+            .await?;
+    Ok(utxos_from(&value))
+}
+
+/// The amounts to offer. The node's own sizing first: it is the only amount a producer is sure not
+/// to wedge on, and the only one this app does not have to derive.
+fn choices(network: NodeNetwork, lifetime: Option<u64>) -> Vec<CollateralChoice> {
+    let mut offered = vec![CollateralChoice {
+        label: "Recommended — the node sizes it".into(),
+        collateral_sompi: None,
+        approx_sompi: lifetime.unwrap_or(if network == NodeNetwork::Testnet12 { TESTNET12_FLOOR_LIFETIME_ESTIMATE_SOMPI } else { 0 }),
+        below_lifetime_sizing: false,
+        note: "Enough to hold a floor claim for its whole life (exposure is released at Final, not at bind). The node \
+               derives it from the chain's live facts and says the exact amount once it runs."
+            .into(),
+    }];
+    if let Some(floor) = floor_for(network) {
+        let lifetime = lifetime.unwrap_or(TESTNET12_FLOOR_LIFETIME_ESTIMATE_SOMPI);
+        offered.push(CollateralChoice {
+            label: "The chain's minimum".into(),
+            collateral_sompi: Some(floor),
+            approx_sompi: floor,
+            below_lifetime_sizing: floor < lifetime,
+            note: "The least a producer bond may lock. The node registers it but warns that such a producer \
+                   \"may then hold forever\" with no room for another claim."
+                .into(),
+        });
+    }
+    offered
+}
+
+fn floor_for(network: NodeNetwork) -> Option<u64> {
+    (network == NodeNetwork::Testnet12).then_some(TESTNET12_PRODUCER_FLOOR_SOMPI)
+}
+
+/// The phase, from the facts. Pure, so the order of the questions is testable.
+fn phase_of(
+    key_present: bool,
+    bond: Option<&str>,
+    job_running: bool,
+    registering: bool,
+    funds: Option<&Funds>,
+    needed_sompi: u64,
+) -> BondPhase {
+    if bond.is_some() && !job_running {
+        return BondPhase::Bonded;
+    }
+    if job_running && bond.is_some() {
+        return BondPhase::Finishing;
+    }
+    if job_running || registering {
+        return BondPhase::Registering;
+    }
+    if !key_present {
+        return BondPhase::NeedKey;
+    }
+    match funds {
+        Some(funds) if funds.largest_output_sompi >= needed_sompi => BondPhase::ReadyToRegister,
+        _ => BondPhase::NeedFunds,
+    }
+}
+
+async fn status(State(state): State<Arc<AppState>>) -> Json<BondSetup> {
+    let settings = state.settings.read().await.node.clone();
+    let key_path = settings.producer_key_path.clone();
+    let key_present = key_path.as_ref().is_some_and(|p| p.is_file());
+    let facts = state.node.registration_facts();
+    let (reported_bond, registration_wait) = (facts.bond.clone(), facts.wait.clone());
+
+    let (mut address, mut address_source, mut address_error) = (None, None, None);
+    if let (Some(key), true) = (&key_path, key_present) {
+        match derive_address(&settings, key).await {
+            Ok(a) => (address, address_source) = (Some(a), Some("cli")),
+            Err(e) => address_error = Some(e),
+        }
+    }
+    if address.is_none()
+        && let Ok(view) = state.node.view(&settings).await
+        && let Some(a) = view.pay_address
+    {
+        (address, address_source) = (Some(a), Some("node"));
+    }
+
+    let (funds, funds_error) = match &address {
+        Some(a) => match utxos_at(&settings, a).await {
+            Ok(utxos) => (Some(funds_of(&utxos)), None),
+            Err(e) => (None, Some(format!("the node could not be asked for this address's funds: {e}"))),
+        },
+        None => (None, None),
+    };
+
+    // What a deposit must reach: the node's own words when it has said them, else the named amount,
+    // else the last measured sizing.
+    let collateral = facts
+        .amounts
+        .wanted_sompi
+        .or(settings.bond_collateral_sompi)
+        .unwrap_or(if settings.network == NodeNetwork::Testnet12 { TESTNET12_FLOOR_LIFETIME_ESTIMATE_SOMPI } else { 0 });
+    let job = job().lock().expect("job lock").clone();
+    let registering = state.node.supervised_role().await == Some(NetworkRole::Producer) && settings.producer_bond.is_none();
+    let phase = phase_of(
+        key_present,
+        settings.producer_bond.as_deref(),
+        job.running,
+        registering,
+        funds.as_ref(),
+        collateral.saturating_add(REGISTRATION_MARGIN_SOMPI),
+    );
+
+    Json(BondSetup {
+        network: settings.network,
+        phase,
+        key_path: key_path.map(|p| p.display().to_string()),
+        key_present,
+        address,
+        address_source,
+        address_error,
+        funds,
+        funds_error,
+        floor_sompi: floor_for(settings.network),
+        margin_sompi: REGISTRATION_MARGIN_SOMPI,
+        recommended_margin_sompi: RECOMMENDED_MARGIN_SOMPI,
+        choices: choices(settings.network, facts.amounts.lifetime_sompi),
+        collateral_sompi: settings.bond_collateral_sompi,
+        node_wanted_sompi: facts.amounts.wanted_sompi,
+        node_lifetime_sompi: facts.amounts.lifetime_sompi,
+        bond: settings.producer_bond.clone(),
+        reported_bond,
+        registration_wait,
+        job,
+    })
+}
+
+#[derive(Deserialize)]
+struct RegisterBody {
+    /// `None` lets the node size the bond (recommended).
+    #[serde(default)]
+    collateral_sompi: Option<u64>,
+}
+
+/// Start the registration run with the chosen collateral, and see it through to a producing node.
+async fn register(State(state): State<Arc<AppState>>, Json(body): Json<RegisterBody>) -> Result<Json<BondSetup>> {
+    let settings = state.settings.read().await.clone();
+    let node = &settings.node;
+    if job().lock().expect("job lock").running {
+        return Err(Error::bad_request("a bond setup is already running — its progress is on this card"));
+    }
+    if let Some(bond) = &node.producer_bond {
+        return Err(Error::bad_request(format!(
+            "this Studio already produces with bond {bond}. One key registers one bond for the life of the chain; \
+             a second bond needs a new key (clear the bond outpoint and the key file in Network settings first)"
+        )));
+    }
+    let Some(key) = node.producer_key_path.clone().filter(|p| p.is_file()) else {
+        return Err(Error::bad_request("there is no producer key yet — generate one first"));
+    };
+    if node.rpc_url.is_some() {
+        return Err(Error::bad_request(
+            "this Studio is attached to another node (Attach to RPC). Only a node started here can run the registration — \
+             clear that field, or register on that node with `kaspad --palw-register-bond`",
+        ));
+    }
+    if let (Some(floor), Some(named)) = (floor_for(node.network), body.collateral_sompi)
+        && named < floor
+    {
+        return Err(Error::bad_request(format!(
+            "{} MSK is below {}'s producer floor of {} MSK — the registration would be refused",
+            msk(named),
+            node.network.id(),
+            msk(floor)
+        )));
+    }
+    // A check where one can be made: a node that answers says what the address holds. A node that
+    // is not running yet cannot, and the registration run itself then waits for the funds and says
+    // so in its own words — refusing here would make the first start impossible.
+    // Only for a named amount: the node's own sizing is the node's to check, and it says what it
+    // wants in its first waiting line.
+    if let Some(named) = body.collateral_sompi
+        && let Ok(address) = derive_address(node, &key).await
+        && let Ok(utxos) = utxos_at(node, &address).await
+    {
+        let funds = funds_of(&utxos);
+        let needed = named.saturating_add(REGISTRATION_MARGIN_SOMPI);
+        if funds.largest_output_sompi < needed {
+            return Err(Error::bad_request(format!(
+                "registration spends ONE output, and the largest at {address} holds {} MSK against the {} MSK needed \
+                 (collateral + {} MSK). {}",
+                msk(funds.largest_output_sompi),
+                msk(needed),
+                msk(REGISTRATION_MARGIN_SOMPI),
+                if funds.total_sompi >= needed {
+                    "The address holds enough in total — merge its outputs first (`misaka wallet utxo consolidate --key-file <key> --yes`)."
+                } else {
+                    "Send more MSK to it."
+                }
+            )));
+        }
+    }
+
+    let mut next = settings.clone();
+    next.node.role = NetworkRole::Producer;
+    next.node.bond_collateral_sompi = body.collateral_sompi;
+    next.node.producer_bond = None;
+    // The float the old chain's carrier left is not this chain's; the registration writes its own.
+    next.node.fee_outpoint = None;
+    let applied = state.apply_settings(next).await?;
+
+    *job().lock().expect("job lock") = BondJob { running: true, ..Default::default() };
+    job_step(match body.collateral_sompi {
+        Some(named) => format!("starting the registration run with {} MSK of collateral", msk(named)),
+        None => "starting the registration run; the node sizes the collateral itself".to_string(),
+    });
+
+    // One node on this data directory, ever: whatever runs now (a verifier, an old producer) stops
+    // first. Two processes under one appdir corrupt it, and two under one bond are slashed.
+    state.node.stop().await?;
+    let mut node_settings = applied.node.clone();
+    if node_settings.class_artifact.is_none() {
+        node_settings.class_artifact = super::network::default_class_artifact(node_settings.network, &applied.models_dir).await;
+    }
+    if let Err(e) = state.node.start(&node_settings).await {
+        job_fail(format!("the registration run did not start: {e}"));
+        return Err(e);
+    }
+    job_step("waiting for the node to sync, see the funds and confirm the bond carrier");
+
+    let watcher = state.clone();
+    tokio::spawn(async move { watch_registration(watcher).await });
+    Ok(status(State(state)).await)
+}
+
+/// Finish by hand: the bond is known (from the node or the settings) and the automatic run stopped
+/// or was never started — a Studio restarted mid-setup, a declaration that timed out.
+async fn finish(State(state): State<Arc<AppState>>) -> Result<Json<BondSetup>> {
+    if job().lock().expect("job lock").running {
+        return Err(Error::bad_request("a bond setup is already running — its progress is on this card"));
+    }
+    let settings = state.settings.read().await.node.clone();
+    let Some(bond) = settings.producer_bond.clone().or(state.node.registration_facts().bond) else {
+        return Err(Error::bad_request("no bond is known yet — register one first"));
+    };
+    *job().lock().expect("job lock") = BondJob { running: true, ..Default::default() };
+    let worker = state.clone();
+    tokio::spawn(async move { complete(worker, bond).await });
+    Ok(status(State(state)).await)
+}
+
+async fn watch_registration(state: Arc<AppState>) {
+    let started = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        if let Some(bond) = state.node.registration_facts().bond {
+            job_step(format!("the node registered bond {bond}"));
+            return complete(state, bond).await;
+        }
+        if state.node.supervised_role().await.is_none() {
+            return job_fail("the registration node stopped before it reported a bond — its log says why");
+        }
+        if started.elapsed() > REGISTRATION_WATCH {
+            return job_fail(
+                "no bond after six hours. The node is still running and will register once it can; this card stops \
+                 watching — press Finish once the node reports the bond",
+            );
+        }
+    }
+}
+
+/// Bond known → settings → declaration (through the running node) → in a block → fee float →
+/// producing node.
+async fn complete(state: Arc<AppState>, bond: String) {
+    let settings = state.settings.read().await.clone();
+    let mut next = settings.clone();
+    next.node.producer_bond = Some(bond.clone());
+    next.node.role = NetworkRole::Producer;
+    if let Err(e) = state.apply_settings(next).await {
+        return job_fail(format!("could not save the bond outpoint {bond}: {e}"));
+    }
+    job_step(format!("saved {bond} as the producer bond"));
+    let node = state.settings.read().await.node.clone();
+    let models_dir = state.settings.read().await.models_dir.clone();
+
+    // The declaration: the floor, plus the model class whose file this machine holds. A class the
+    // bond declares but cannot serve is one it is drawn for and fails; one it serves undeclared is
+    // one it is never drawn for.
+    let mut declare: Vec<&str> = Vec::new();
+    if let Some(floor) = classes_for(node.network).iter().find(|c| c.is_base && c.class_id_complete) {
+        declare.push(floor.class_id_hex);
+    }
+    let model = default_class_for(node.network);
+    let has_model_file = super::network::default_class_artifact(node.network, &models_dir).await.is_some()
+        || node.class_artifact.as_ref().is_some_and(|p| {
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                matches!(&model.artifact,
+                PalwArtifactSource::Download { filename, .. } | PalwArtifactSource::ConvertLocally { filename, .. } if *filename == n)
+            })
+        });
+    if has_model_file && model.class_id_complete {
+        declare.push(model.class_id_hex);
+    }
+
+    let key = node.producer_key_path.clone().unwrap_or_default();
+    if declare.is_empty() {
+        job_step(format!(
+            "no full class id is known for {} — declare this bond's capability yourself (`misaka bond capability --declare …`)",
+            node.network.id()
+        ));
+    } else {
+        job_step(format!(
+            "declaring what the bond judges: {}",
+            if declare.len() > 1 { "the floor and the model class" } else { "the floor" }
+        ));
+        let mut command = cli(&node);
+        command
+            .arg("bond")
+            .arg("capability")
+            .arg("--key-file")
+            .arg(&key)
+            .arg("--bond")
+            .arg(&bond)
+            .arg("--declare")
+            .arg(declare.join(","))
+            .arg("--yes");
+        match run_cli(command, "the capability declaration").await {
+            Ok(stdout) => {
+                let txid = super::model_market::field(&stdout, "txid").and_then(|v| v.as_str().map(str::to_string));
+                job().lock().expect("job lock").declaration_txid = txid.clone();
+                if let Some(txid) = txid {
+                    job_step(format!("declaration {txid} filed; waiting for it to be in a block before the restart"));
+                    if !wait_for_outputs_of(&node, &key, &txid).await {
+                        job_step(
+                            "the declaration is not visible in a block after 15 minutes; restarting anyway — re-run Finish if the seat is never drawn",
+                        );
+                    }
+                }
+            }
+            Err(e) => return job_fail(format!("{e}. The bond is saved; press Finish to try the declaration again")),
+        }
+    }
+
+    // A fee float that is not the bond: the largest ordinary output left at the address. The
+    // registration saved `<carrier>:1` in the app dir, but the declaration may have spent it.
+    let mut fee = None;
+    if let Ok(address) = derive_address(&node, &key).await
+        && let Ok(utxos) = utxos_at(&node, &address).await
+    {
+        fee = utxos.iter().filter(|u| !u.coinbase && u.outpoint != bond).max_by_key(|u| u.amount).map(|u| u.outpoint.clone());
+    }
+
+    job_step("restarting the node as a producer");
+    if let Err(e) = state.node.stop().await {
+        return job_fail(format!("could not stop the registration node: {e}"));
+    }
+    let mut next = state.settings.read().await.clone();
+    next.node.fee_outpoint = fee.clone();
+    let applied = match state.apply_settings(next).await {
+        Ok(applied) => applied,
+        Err(e) => return job_fail(format!("could not save the fee outpoint: {e}")),
+    };
+    let mut node_settings = applied.node.clone();
+    if node_settings.class_artifact.is_none() {
+        node_settings.class_artifact = super::network::default_class_artifact(node_settings.network, &applied.models_dir).await;
+    }
+    if let Err(e) = state.node.start(&node_settings).await {
+        return job_fail(format!("the producing node did not start: {e}"));
+    }
+    let mut job = job().lock().expect("job lock");
+    job.history.push(match fee {
+        Some(fee) => format!("producing with bond {bond}, fee float {fee}"),
+        None => format!("producing with bond {bond} (the node uses the float its registration saved)"),
+    });
+    job.running = false;
+    job.step = None;
+}
+
+/// Wait until an output of `txid` is in the address's utxo set — which the node's index reports
+/// only once the transaction is in a block. `false` on timeout.
+async fn wait_for_outputs_of(node: &NodeSettings, key: &PathBuf, txid: &str) -> bool {
+    let Ok(address) = derive_address(node, key).await else { return false };
+    let started = std::time::Instant::now();
+    while started.elapsed() < DECLARATION_WATCH {
+        if let Ok(utxos) = utxos_at(node, &address).await
+            && utxos.iter().any(|u| u.outpoint.starts_with(&format!("{txid}:")))
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+    false
+}
+
+fn msk(sompi: u64) -> String {
+    let whole = sompi / SOMPI_PER_MSK;
+    let frac = sompi % SOMPI_PER_MSK;
+    if frac == 0 { whole.to_string() } else { format!("{whole}.{}", format!("{frac:08}").trim_end_matches('0')) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_largest_ordinary_output_is_what_a_registration_can_spend() {
+        let value = serde_json::json!({ "entries": [
+            { "outpoint": { "transactionId": "aa", "index": 0 }, "utxoEntry": { "amount": 5_000 * SOMPI_PER_MSK, "isCoinbase": false } },
+            { "outpoint": { "transactionId": "bb", "index": 1 }, "utxoEntry": { "amount": 9_000 * SOMPI_PER_MSK, "isCoinbase": false } },
+            { "outpoint": { "transactionId": "cc", "index": 0 }, "utxoEntry": { "amount": 20_000 * SOMPI_PER_MSK, "isCoinbase": true } },
+        ]});
+        let utxos = utxos_from(&value);
+        assert_eq!(utxos[1].outpoint, "bb:1");
+        let funds = funds_of(&utxos);
+        assert_eq!(funds.total_sompi, 34_000 * SOMPI_PER_MSK);
+        assert_eq!(funds.largest_output_sompi, 9_000 * SOMPI_PER_MSK, "a reward is not counted toward registering");
+        assert_eq!(funds.coinbase_sompi, 20_000 * SOMPI_PER_MSK);
+        assert_eq!(funds.outputs, 2);
+    }
+
+    #[test]
+    fn the_phase_follows_the_facts_in_order() {
+        let enough = Funds { largest_output_sompi: 14_000 * SOMPI_PER_MSK, ..Default::default() };
+        let short = Funds { total_sompi: 14_000 * SOMPI_PER_MSK, largest_output_sompi: 7_000 * SOMPI_PER_MSK, ..Default::default() };
+        let need = 13_000 * SOMPI_PER_MSK + REGISTRATION_MARGIN_SOMPI;
+        assert_eq!(phase_of(false, None, false, false, None, need), BondPhase::NeedKey);
+        assert_eq!(phase_of(true, None, false, false, None, need), BondPhase::NeedFunds, "an unanswered node is not funds");
+        assert_eq!(phase_of(true, None, false, false, Some(&short), need), BondPhase::NeedFunds, "one output, not the total");
+        assert_eq!(phase_of(true, None, false, false, Some(&enough), need), BondPhase::ReadyToRegister);
+        assert_eq!(phase_of(true, None, false, true, Some(&enough), need), BondPhase::Registering);
+        assert_eq!(phase_of(true, Some("x:0"), true, true, None, need), BondPhase::Finishing);
+        assert_eq!(phase_of(true, Some("x:0"), false, false, None, need), BondPhase::Bonded);
+    }
+
+    #[test]
+    fn the_node_sizing_is_offered_first_and_the_minimum_carries_its_warning() {
+        let offered = choices(NodeNetwork::Testnet12, None);
+        assert_eq!(offered[0].collateral_sompi, None, "recommended: no --palw-bond-collateral");
+        assert_eq!(offered[0].approx_sompi, TESTNET12_FLOOR_LIFETIME_ESTIMATE_SOMPI);
+        assert_eq!(offered[1].collateral_sompi, Some(TESTNET12_PRODUCER_FLOOR_SOMPI));
+        assert!(offered[1].below_lifetime_sizing, "13,000 MSK is under the node's own sizing");
+        // Once the node has printed its figure, that figure is the one shown.
+        assert_eq!(choices(NodeNetwork::Testnet12, Some(5)).first().map(|c| c.approx_sompi), Some(5));
+        assert_eq!(choices(NodeNetwork::Devnet, None).len(), 1, "elsewhere only the node's own sizing");
+    }
+
+    #[test]
+    fn amounts_read_as_msk() {
+        assert_eq!(msk(TESTNET12_PRODUCER_FLOOR_SOMPI), "13000");
+        assert_eq!(msk(REGISTRATION_MARGIN_SOMPI), "0.1");
+        assert_eq!(msk(TESTNET12_FLOOR_LIFETIME_ESTIMATE_SOMPI), "31191.4598656");
+    }
+}

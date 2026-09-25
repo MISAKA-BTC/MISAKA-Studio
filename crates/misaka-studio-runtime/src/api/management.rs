@@ -360,7 +360,11 @@ async fn get_settings(State(state): State<Arc<AppState>>) -> Json<Settings> {
     Json(state.settings.read().await.clone())
 }
 
-async fn put_settings(State(state): State<Arc<AppState>>, Json(new): Json<Settings>) -> Result<Json<Settings>> {
+async fn put_settings(State(state): State<Arc<AppState>>, Json(mut new): Json<Settings>) -> Result<Json<Settings>> {
+    // Migrations are for files an older build wrote. A settings object sent here is what the
+    // user sees now, choices included — a body that omits `schema` must not re-run a migration
+    // over a network they picked since.
+    new.schema = misaka_studio_core::settings::SETTINGS_SCHEMA;
     // The one setting that can lock the user out of their own app: a public bind with no key
     // would serve unauthenticated inference to the network on the next start.
     if new.server.requires_api_key() {

@@ -30,7 +30,7 @@ use crate::{Error, Result};
 use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use misaka_studio_core::palw::TESTNET11_CLASSES;
+use misaka_studio_core::palw::TESTNET12_CLASSES;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -137,14 +137,14 @@ fn gateway_url(settings: &misaka_studio_core::settings::Settings) -> String {
 /// Compare against the ids this build knows. Verification of a class is the artifact root and the
 /// node does it; this is the client-side question "is the thing I am talking to even on the map".
 fn classify(class_id: &str) -> ClassMatch {
-    let complete: Vec<&misaka_studio_core::palw::PalwClassSpec> = TESTNET11_CLASSES.iter().filter(|c| c.class_id_complete).collect();
+    let complete: Vec<&misaka_studio_core::palw::PalwClassSpec> = TESTNET12_CLASSES.iter().filter(|c| c.class_id_complete).collect();
     if let Some(hit) = complete.iter().find(|c| c.class_id_hex.eq_ignore_ascii_case(class_id)) {
         return ClassMatch::Registered { name: hit.name.to_string() };
     }
-    if complete.len() == TESTNET11_CLASSES.len() {
+    if complete.len() == TESTNET12_CLASSES.len() {
         ClassMatch::NotRegistered
     } else {
-        ClassMatch::Unknown { complete_ids: complete.len(), total_classes: TESTNET11_CLASSES.len() }
+        ClassMatch::Unknown { complete_ids: complete.len(), total_classes: TESTNET12_CLASSES.len() }
     }
 }
 
@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn a_complete_catalog_id_is_recognised() {
-        let complete = TESTNET11_CLASSES.iter().find(|c| c.class_id_complete).expect("one class publishes its full id");
+        let complete = TESTNET12_CLASSES.iter().find(|c| c.class_id_complete).expect("one class publishes its full id");
         assert_eq!(classify(complete.class_id_hex), ClassMatch::Registered { name: complete.name.to_string() });
         // Case is not identity's business: an id is the same id in either case.
         assert_eq!(classify(&complete.class_id_hex.to_uppercase()), ClassMatch::Registered { name: complete.name.to_string() });
@@ -268,11 +268,11 @@ mod tests {
     fn an_unknown_id_is_unknown_while_any_catalog_id_is_a_prefix() {
         let stranger = "03a3c66c221fa263da9c2f9077f9eec5f5886ee11eb6132ebffccda716ad0328\
                         f88593cf7ad36cead597e337aa04c3ae7686434f34ed137686ffe2b3b76f776c";
-        let complete = TESTNET11_CLASSES.iter().filter(|c| c.class_id_complete).count();
-        let expected = if complete == TESTNET11_CLASSES.len() {
+        let complete = TESTNET12_CLASSES.iter().filter(|c| c.class_id_complete).count();
+        let expected = if complete == TESTNET12_CLASSES.len() {
             ClassMatch::NotRegistered
         } else {
-            ClassMatch::Unknown { complete_ids: complete, total_classes: TESTNET11_CLASSES.len() }
+            ClassMatch::Unknown { complete_ids: complete, total_classes: TESTNET12_CLASSES.len() }
         };
         assert_eq!(classify(stranger), expected);
     }

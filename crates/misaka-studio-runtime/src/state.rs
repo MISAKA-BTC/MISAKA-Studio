@@ -223,12 +223,20 @@ impl AppState {
                 return;
             }
 
-            let spec = misaka_studio_core::palw::default_class();
+            let spec = misaka_studio_core::palw::default_class_for(settings.node.network);
             let misaka_studio_core::palw::PalwArtifactSource::Download { filename, repo_path, sha256, size_bytes, hf_repo, .. } =
                 &spec.artifact
             else {
                 // A class with no published artifact cannot be preinstalled, and inventing a
-                // conversion the user did not ask for is not the fallback.
+                // conversion the user did not ask for is not the fallback. Said, not swallowed:
+                // testnet-12's default is such a class, and a setting that is on and does nothing
+                // is the question this line answers.
+                if let misaka_studio_core::palw::PalwArtifactSource::ConvertLocally { convert_command, .. } = &spec.artifact {
+                    tracing::info!(
+                        "{} publishes no download, so there is nothing to install on first run; convert it with `{convert_command}` and put the file in the models directory",
+                        spec.name
+                    );
+                }
                 return;
             };
 

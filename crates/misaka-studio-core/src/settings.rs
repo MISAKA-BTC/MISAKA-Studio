@@ -214,13 +214,16 @@ impl Default for HuggingFaceSettings {
 
 /// Which MISAKA network a supervised or attached node is on.
 ///
-/// `Testnet11` is the live public network; `Devnet` and `Simnet` are the local, permissionless
-/// presets — the ones a sandboxed machine (or anyone who just wants to see PALW produce blocks)
-/// can run without reaching the internet at all.
+/// `Testnet12` is the live public network (launched 2026-09-25/26 JST). `Testnet11` is its
+/// predecessor, still running but joined only by builds of misakas `1f98d3bf4` — a node built from
+/// current `main` carries testnet-12's identity and state v21/v22. `Devnet` and `Simnet` are the
+/// local, permissionless presets — the ones a sandboxed machine (or anyone who just wants to see
+/// PALW produce blocks) can run without reaching the internet at all.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeNetwork {
     #[default]
+    Testnet12,
     Testnet11,
     Devnet,
     Simnet,
@@ -234,6 +237,7 @@ impl NodeNetwork {
     /// CLI's own `getServerInfo` check can only catch it if the two names came from one place.
     pub fn id(self) -> &'static str {
         match self {
+            NodeNetwork::Testnet12 => "testnet-12",
             NodeNetwork::Testnet11 => "testnet-11",
             NodeNetwork::Devnet => "devnet",
             NodeNetwork::Simnet => "simnet",
@@ -302,6 +306,13 @@ pub struct NodeSettings {
     /// The bond outpoint (`<txid>:<index>`) printed once by the registration run. Absent means
     /// the next producer start registers a bond instead of mining with one.
     pub producer_bond: Option<String>,
+    /// **The collateral the registration run locks**, in sompi (`--palw-bond-collateral`).
+    ///
+    /// `None` lets the node size it itself — the floor class's whole claim lifetime, which the
+    /// 2026-09-23 drill measured at ≈ 31,191 MSK, more than most deposits hold. The Bond setup card
+    /// writes the amount the person chose against the funds they actually deposited, and the join
+    /// guide asks for it explicitly for the same reason. Read only by a registration run.
+    pub bond_collateral_sompi: Option<u64>,
     /// The fee outpoint that funds the panel submitter (usually the bond carrier's change,
     /// `<txid>:1`). Absent runs the panel receipts-only, which the node states at startup.
     pub fee_outpoint: Option<String>,
@@ -513,7 +524,16 @@ pub struct Settings {
     pub huggingface: HuggingFaceSettings,
     pub ui: UiSettings,
     pub provenance: ProvenanceSettings,
+    /// Which one-time migrations this file has been through. Absent (0) in every file written
+    /// before the first one existed; see [`Settings::migrate`]. The field's own default (0), not
+    /// the struct's: a file that lacks the key predates every migration, and reading it as current
+    /// would skip them all.
+    #[serde(default)]
+    pub schema: u32,
 }
+
+/// The schema a settings file written by this build carries.
+pub const SETTINGS_SCHEMA: u32 = 1;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -528,6 +548,7 @@ impl Default for Settings {
             huggingface: HuggingFaceSettings::default(),
             ui: UiSettings::default(),
             provenance: ProvenanceSettings::default(),
+            schema: SETTINGS_SCHEMA,
         }
     }
 }
@@ -541,11 +562,32 @@ impl Settings {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         match std::fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str(&text)
+            Ok(text) => serde_json::from_str::<Settings>(&text)
+                .map(Settings::migrate)
                 .map_err(|e| Error::Settings { path: path.display().to_string(), reason: format!("not valid settings JSON: {e}") }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
             Err(e) => Err(Error::io(path.display(), e)),
         }
+    }
+
+    /// Bring a file written by an older build up to [`SETTINGS_SCHEMA`].
+    ///
+    /// **Schema 1 — testnet-12 is the public network.** Every file before it says `testnet11`,
+    /// because that was the default and the Studio writes the whole file, so the value records no
+    /// choice. It moves to testnet-12 — unless the file holds something that exists only on
+    /// testnet-11: a registered bond outpoint (an outpoint of testnet-11's chain; a testnet-12 node
+    /// would refuse it) or a node to attach to (whose network is that node's, not this file's).
+    /// Those stay where they are and change network only by the operator's hand. Either way the
+    /// file is then schema 1, so a testnet-11 chosen after this is kept.
+    pub fn migrate(mut self) -> Self {
+        if self.schema < 1 {
+            let holds_testnet11_identity = self.node.producer_bond.is_some() || self.node.rpc_url.is_some();
+            if self.node.network == NodeNetwork::Testnet11 && !holds_testnet11_identity {
+                self.node.network = NodeNetwork::Testnet12;
+            }
+            self.schema = 1;
+        }
+        self
     }
 
     /// Write atomically: temp file in the same directory, then rename over the target.
@@ -628,6 +670,30 @@ mod tests {
         assert_eq!(s.server.port, 9000);
         assert_eq!(s.server.host, "127.0.0.1", "absent fields fall back to defaults");
         assert_eq!(s.generation.temperature, 0.7);
+    }
+
+    /// A file from before testnet-12 says `testnet11` because that was the default, not because
+    /// anyone chose it: it moves. One that holds a testnet-11 bond or attaches to a node does not.
+    #[test]
+    fn an_old_file_moves_to_testnet12_unless_it_holds_a_testnet11_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("old.json");
+        std::fs::write(&path, r#"{"node":{"network":"testnet11","role":"verifier"}}"#).expect("write");
+        let s = Settings::load(&path).expect("loads");
+        assert_eq!(s.node.network, NodeNetwork::Testnet12);
+        assert_eq!(s.schema, SETTINGS_SCHEMA);
+
+        std::fs::write(&path, r#"{"node":{"network":"testnet11","producer_bond":"ab:0"}}"#).expect("write");
+        assert_eq!(Settings::load(&path).expect("loads").node.network, NodeNetwork::Testnet11, "a testnet-11 bond stays");
+        std::fs::write(&path, r#"{"node":{"network":"testnet11","rpc_url":"10.0.0.5:28210"}}"#).expect("write");
+        assert_eq!(Settings::load(&path).expect("loads").node.network, NodeNetwork::Testnet11, "an attached node stays");
+
+        // Once migrated, testnet-11 is a choice, and a choice is kept.
+        std::fs::write(&path, r#"{"schema":1,"node":{"network":"testnet11"}}"#).expect("write");
+        assert_eq!(Settings::load(&path).expect("loads").node.network, NodeNetwork::Testnet11);
+        // A fresh install is testnet-12 and current.
+        assert_eq!(Settings::default().node.network, NodeNetwork::Testnet12);
+        assert_eq!(Settings::default().schema, SETTINGS_SCHEMA);
     }
 
     /// The check that stops a convenience setting from becoming an open inference endpoint.

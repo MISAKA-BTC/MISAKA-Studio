@@ -429,7 +429,7 @@ async fn market_is_open(
 /// A reader that assumed either one silently returns nothing against the other, and "nothing"
 /// here reads as "no market" or "no transaction" — both wrong, both quiet. So the whole output is
 /// tried first, then each line.
-fn field(stdout: &str, name: &str) -> Option<serde_json::Value> {
+pub(crate) fn field(stdout: &str, name: &str) -> Option<serde_json::Value> {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim())
         && let Some(found) = v.get(name)
     {

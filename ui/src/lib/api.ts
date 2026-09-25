@@ -6,6 +6,7 @@
 // A private channel for the UI would let that endpoint rot unnoticed.
 
 import type {
+  BondSetup,
   BackendInfo,
   CatalogEntry,
   CatalogRepo,
@@ -133,6 +134,11 @@ export const api = {
   poolFaucet: () => request<Record<string, unknown>>('/api/v1/network/pool/faucet', { method: 'POST' }),
   faucetFor: (address: string) => request<Record<string, unknown>>('/api/v1/network/faucet', { method: 'POST', body: JSON.stringify({ address }) }),
   producerKey: () => request<{ producer_key_path: string; next: string }>('/api/v1/network/producer-key', { method: 'POST' }),
+  bondSetup: () => request<BondSetup>('/api/v1/network/bond'),
+  /** `null` lets the node size the collateral (recommended). */
+  bondRegister: (collateralSompi: number | null) =>
+    request<BondSetup>('/api/v1/network/bond/register', { method: 'POST', body: JSON.stringify({ collateral_sompi: collateralSompi }) }),
+  bondFinish: () => request<BondSetup>('/api/v1/network/bond/finish', { method: 'POST' }),
 
   // ADR-0087/0090 — adding a model, and opening its market. Two separate acts on the chain, so
   // two separate calls here.

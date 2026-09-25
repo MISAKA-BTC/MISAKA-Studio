@@ -163,14 +163,16 @@ on this network there is no separate miner program: **the thing that runs the mo
 that makes the block.**
 
 * **Mining classes, as a list you can act on.** A block on MISAKA is won by verified LLM
-  inference in one of the chain-registered classes — on testnet-11 Relaunch 5f (2026-09-03):
-  `PALW-BASE-0` (the deterministic floor, 22‰ of the epoch's blocks, needs nothing),
-  `PALW-QWEN25-A16` (489‰, chain model id `Qwen/Qwen2.5-1.5B/graph-v5@512`, a 1.7 GiB W8A16
-  artifact), `QWEN36` (489‰, chain model id `Qwen3.6-35B-A3B/graph-v3`, a 34 GiB artifact). Both
-  model classes are downloadable and digest-pinned. The list is the top half of **Models → Discover**, above the free-text search,
+  inference in one of the chain-registered classes. The Studio defaults to **testnet-12**, the
+  public network since 2026-09-25/26 (release `0e8ec984e`), whose genesis registers
+  `PALW-BASE-0` (the deterministic floor, needs nothing), `PALW-QWEN25-A16-8K` (chain model id
+  `Qwen/Qwen2.5-1.5B/graph-v7@8192`, a 1.68 GiB W8A16 artifact converted locally with
+  `qwen25-convert --n-ctx 8192`; the conversion is deterministic and its size and SHA-256 are
+  pinned) and `PALW-QWEN25-A16-2M` (`graph-v7@2097152`, a 2.7 GiB download, ≈ 11.6 GiB and a week
+  of CPU per attempt). testnet-11's Relaunch 5f table is kept for a Studio pointed there. The list is the top half of **Models → Discover**, above the free-text search,
   because nobody guesses these repository names; each card shows its share, what installs, this
   machine's readiness — including an honest "this machine cannot run this class" when the
-  artifact exceeds RAM — and, when a node is running, the class's **live on-chain status** from
+  replay or attempt needs more memory than the machine has — and, when a node is running, the class's **live on-chain status** from
   the node's own `--palw-dump-classes` table. The artifact download reuses the model download
   pipeline, verified against the chain-pinned SHA-256.
 * **What a Studio node mines today is the floor.** A producer started without a class named
@@ -216,6 +218,19 @@ that makes the block.**
   a bonded key on the line must be able to audit what ran — always displays the **exact command
   line**, reproducible without the Studio. First run without a bond registers one
   (`--palw-register-bond`); the printed outpoint goes into settings and then mines.
+
+* **Bond setup — key, deposit, bond, mining.** The Network tab creates the producer key, shows
+  its `misakatest:` address (derived by the `misaka` CLI from the key file, before any node runs),
+  reads the deposit from the node's utxo index — the balance and the **largest single output**,
+  because the registration spends exactly one — and starts `kaspad --palw-register-bond`. By
+  default the node sizes the collateral itself (≈ 31,191 MSK for the floor on 2026-09-26; the
+  chain's minimum is 13,000 MSK, which the node warns may hold forever), and the card shows the
+  exact amount the node asks for. When the node reports `registered bond <txid>:0` the Studio saves
+  it, declares the bond's capability with `misaka bond capability --declare` (the floor, plus the
+  8k class when its artifact is on disk) through the still-running node, waits until that
+  declaration is in a block, picks a fee float that is not the bond, and restarts the node as a
+  producer — one process per bond throughout, because two sign the same round permit and are
+  slashed.
 
 The node is the [misakas](https://github.com/MISAKA-BTC/misakas) `kaspad`, driven over its JSON
 workflow-RPC (`--rpclisten-json`, loopback only), supervised as a child process the same way

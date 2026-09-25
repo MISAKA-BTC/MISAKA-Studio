@@ -13,13 +13,15 @@
 //   Studio afterwards.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { BondSetupCard } from './BondSetupCard'
 import { MiningDifficultyCard } from './MiningDifficultyCard'
 import { ModelMarketPanel } from './ModelMarketPanel'
 import { MiningQueuePanel } from './MiningQueuePanel'
 import { PromptMiningPanel } from './PromptMiningPanel'
 import { api } from '../lib/api'
 import { bytes, count, shortHash } from '../lib/format'
-import type { Effort, MiningState, NetworkOverview, NodeClassRow, NodeStatus, NodeView, PalwClassStatus, PoolBlock, PoolFunds, PoolStatus, ProducedBlock, Settings } from '../lib/types'
+import { NETWORK_LABEL } from '../lib/types'
+import type { Effort, MiningState, NetworkOverview, NodeClassRow, NodeNetwork, NodeStatus, NodeView, PalwClassStatus, PoolBlock, PoolFunds, PoolStatus, ProducedBlock, Settings } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { CopyButton, EmptyState, Field, Icon, Section, Spinner, Toggle } from './common'
 
@@ -137,7 +139,10 @@ export function NetworkView() {
   return (
     <div className="h-full overflow-y-auto p-4">
       <MiningBanner mining={node.mining} effort={node.effort} pool={pool} commandLine={node.command_line} />
-      {(node.pay_address || node.registered_bond) && <ProducerIdentityCard node={node} />}
+      {/* The way into mining with a node of your own: key → deposit → bond → producing. Hidden while
+          a pool slot is the chosen route — that one's funding address is the pool's, not this key's. */}
+      {!pool?.joined && <BondSetupCard onChanged={() => void refresh()} />}
+      {(node.pay_address || node.registered_bond) && <ProducerIdentityCard node={node} network={overview.network} />}
       <div className="grid gap-4 xl:grid-cols-3">
         <div className="space-y-4 xl:col-span-2">
           <NodePanel
@@ -152,7 +157,7 @@ export function NetworkView() {
             <div className="flex items-baseline justify-between">
               <h3 className="text-sm font-semibold">Mining classes</h3>
               <span className="text-[0.7rem] text-ink-500 dark:text-ink-400">
-                {node.classes_from_node.length > 0 ? "your node's class table" : 'testnet-11 genesis registry'}
+                {node.classes_from_node.length > 0 ? "your node's class table" : `${NETWORK_LABEL[overview.network]} genesis registry`}
               </span>
             </div>
             <p className="mt-1 text-xs text-ink-500 dark:text-ink-400">
@@ -761,7 +766,7 @@ function StatRow({ label, value }: { label: string; value: string }) {
 /** Does this node row belong to that built-in spec? The one place the rule is written.
  *
  * The floor is matched by its base flag — every ConsensusV2 chain has exactly one, and its id is
- * chain-specific (a locally minted chain's floor differs from live testnet-11's). Everything else
+ * chain-specific (a locally minted chain's floor differs from the public network's). Everything else
  * matches by id prefix: the node prints the full id, the snapshot may only know a prefix. A row no
  * spec claims is a class registered after genesis, and gets a card of its own.
  */
@@ -831,7 +836,7 @@ function ClassCard({
   const spec = cls.spec
   // The node's own dump line for this class. The floor is matched by its base flag — every
   // ConsensusV2 chain has exactly one, and its id is chain-specific (a locally minted chain's
-  // floor differs from live testnet-11's). Everything else matches by id prefix: the node
+  // floor differs from the public network's). Everything else matches by id prefix: the node
   // prints the full id, the snapshot may only know a prefix.
   const live = nodeRows.find((row) => matchesSpec(spec, row))
 
@@ -1312,7 +1317,8 @@ function NodeSettingsPanel({ settings, save }: { settings: Settings; save: (s: S
     <Section title="Node configuration" description="Applied on the next node start. Producing fields follow the misakas join runbook.">
       <Field label="Network">
         <select className="input mt-1" value={draft.network} onChange={(e) => set('network', e.target.value as Settings['node']['network'])}>
-          <option value="testnet11">testnet-11 — the live PALW network</option>
+          <option value="testnet12">testnet-12 — the public PALW network</option>
+          <option value="testnet11">testnet-11 — the previous network (nodes built from misakas 1f98d3bf4)</option>
           <option value="devnet">devnet — local development (PALW v1, no class economy)</option>
           <option value="simnet">simnet — simulation, no proof-of-work</option>
         </select>
@@ -1332,7 +1338,7 @@ function NodeSettingsPanel({ settings, save }: { settings: Settings; save: (s: S
       </Field>
       <Toggle
         label="Install the default class artifact on first run"
-        hint="PALW-QWEN25-A16, 1.7 GB, fetched once and verified against the digest the chain registered — so a fresh install can mine a model class without hunting for a file. It appears in the download list and can be cancelled there. Turn it off on a metered connection, or if this machine will only ever chat."
+        hint="testnet-11 only: PALW-QWEN25-A16, 1.7 GB, fetched once and verified against the digest the chain registered. testnet-12's model class (PALW-QWEN25-A16-8K) publishes no download — it is converted locally with qwen25-convert — so on testnet-12 this has nothing to fetch."
         checked={draft.install_default_class_artifact}
         onChange={(v) => set('install_default_class_artifact', v)}
       />
@@ -1344,7 +1350,7 @@ function NodeSettingsPanel({ settings, save }: { settings: Settings; save: (s: S
               <input className="input flex-1" placeholder="~/.misaka/miner.seed" value={draft.producer_key_path ?? ''} onChange={(e) => set('producer_key_path', text(e.target.value))} />
               <button
                 type="button"
-                className="btn-secondary whitespace-nowrap"
+                className="btn-outline whitespace-nowrap"
                 disabled={keyBusy}
                 onClick={async () => {
                   setKeyBusy(true)
@@ -1369,6 +1375,19 @@ function NodeSettingsPanel({ settings, save }: { settings: Settings; save: (s: S
           </Field>
           <Field label="Bond outpoint" hint="txid:index, printed once by the registration run. Empty = the next start registers a bond and prints it.">
             <input className="input mt-1" placeholder="<txid>:0" value={draft.producer_bond ?? ''} onChange={(e) => set('producer_bond', text(e.target.value))} />
+          </Field>
+          <Field label="Bond collateral (MSK)" hint="What the registration run locks. testnet-12 refuses less than 13,000 MSK; about 6,402 MSK per floor claim held at once. Empty = the node sizes it (≈ 31,000 MSK for the floor in the 2026-09-23 drill). The Bond setup card fills this for you.">
+            <input
+              className="input mt-1"
+              inputMode="decimal"
+              placeholder="13000"
+              value={draft.bond_collateral_sompi === null || draft.bond_collateral_sompi === undefined ? '' : String(draft.bond_collateral_sompi / 1e8)}
+              onChange={(e) => {
+                const value = e.target.value.trim()
+                const parsed = Number(value)
+                set('bond_collateral_sompi', value === '' || !Number.isFinite(parsed) ? null : Math.round(parsed * 1e8))
+              }}
+            />
           </Field>
           <Field label="Fee outpoint" hint="Usually your bond carrier's change (txid:1). Empty = panel runs receipts-only.">
             <input className="input mt-1" placeholder="<txid>:1" value={draft.fee_outpoint ?? ''} onChange={(e) => set('fee_outpoint', text(e.target.value))} />
@@ -1410,7 +1429,10 @@ function NodeSettingsPanel({ settings, save }: { settings: Settings; save: (s: S
 /** What the node said about ITS OWN identity: the address it derived from the producer key (the one
  *  to fund) and, once the registration carrier confirmed, the bond outpoint the next start must
  *  carry. Both are read off the node's log lines — the Studio never derives either itself. */
-function ProducerIdentityCard({ node }: { node: NodeView }) {
+function ProducerIdentityCard({ node, network }: { node: NodeView; network: NodeNetwork }) {
+  // testnet-12's bond needs tens of thousands of MSK and has no faucet yet; the Bond setup card above
+  // carries the funding there. The 12 MSK faucet hint is testnet-11's.
+  const faucet = network === 'testnet11'
   const [busy, setBusy] = useState<'faucet' | 'bond' | null>(null)
   const [note, setNote] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -1419,11 +1441,13 @@ function ProducerIdentityCard({ node }: { node: NodeView }) {
       <h3 className="text-sm font-semibold">Your producer, as the node reports it</h3>
       {node.pay_address && (
         <div className="mt-2">
-          <div className="text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">Pay address — fund this to register the bond</div>
+          <div className="text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">
+            {faucet ? 'Pay address — fund this to register the bond' : 'Pay address — rewards land here'}
+          </div>
           <div className="mono mt-0.5 break-all text-xs">{node.pay_address}</div>
           <p className="mt-1 text-[0.7rem] text-ink-500 dark:text-ink-400">
             Derived by the node from the producer key. Rewards land here and the bond's collateral is spent from
-            here; the <strong>misakascan faucet</strong> hands out 12 MSK once per address, which is enough.
+            here{faucet ? <>; the <strong>misakascan faucet</strong> hands out 12 MSK once per address, which is enough.</> : '.'}
           </p>
           {node.rewards && (
             <div className="mt-3 rounded-lg bg-ink-100 p-2 dark:bg-ink-800/60">
@@ -1469,9 +1493,10 @@ function ProducerIdentityCard({ node }: { node: NodeView }) {
             </p>
           )}
           <div className="mt-2 flex flex-wrap gap-2">
-            <button type="button" className="btn-secondary" onClick={() => void navigator.clipboard?.writeText(node.pay_address ?? '')}>
+            <button type="button" className="btn-outline" onClick={() => void navigator.clipboard?.writeText(node.pay_address ?? '')}>
               Copy the address
             </button>
+            {faucet && (
             <button
               type="button"
               className="btn-primary"
@@ -1492,6 +1517,7 @@ function ProducerIdentityCard({ node }: { node: NodeView }) {
             >
               {busy === 'faucet' ? 'Asking the faucet…' : 'Request 12 MSK from the faucet'}
             </button>
+            )}
           </div>
         </div>
       )}
@@ -1501,7 +1527,7 @@ function ProducerIdentityCard({ node }: { node: NodeView }) {
           <div className="mono mt-0.5 break-all text-xs">{node.registered_bond}</div>
           <button
             type="button"
-            className="btn-secondary mt-2"
+            className="btn-outline mt-2"
             disabled={busy !== null}
             onClick={async () => {
               setBusy('bond')

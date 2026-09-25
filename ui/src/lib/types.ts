@@ -306,11 +306,13 @@ export type Settings = {
   node: {
     kaspad_path: string | null
     rpc_url: string | null
-    network: 'testnet11' | 'devnet' | 'simnet'
+    network: NodeNetwork
     role: 'observer' | 'verifier' | 'producer'
     mining_address: string | null
     producer_key_path: string | null
     producer_bond: string | null
+    /** Collateral the next registration run locks (`--palw-bond-collateral`), sompi. */
+    bond_collateral_sompi: number | null
     fee_outpoint: string | null
     producer_class: string | null
     class_artifact: string | null
@@ -428,7 +430,15 @@ export type Conversation = {
 export type PalwArtifactSource =
   | { kind: 'derived_from_seed' }
   | { kind: 'download'; filename: string; repo_path: string; sha256: string; size_bytes: number; hf_repo: string; convert_command: string }
-  | { kind: 'convert_locally'; filename: string; approx_size_bytes: number; source_repo: string; convert_command: string }
+  | {
+      kind: 'convert_locally'
+      filename: string
+      approx_size_bytes: number
+      /** The output's exact size and SHA-256, where the conversion is pinned (testnet-12's 8k row). */
+      exact: { size_bytes: number; sha256: string } | null
+      source_repo: string
+      convert_command: string
+    }
 
 export type PalwClassReadiness =
   | { state: 'ready_built_in' }
@@ -461,6 +471,8 @@ export type PalwClassStatus = {
     is_base: boolean
     /** The n_ctx the class was registered at: 12, 512, 2M… A registration choice, not the weights'. */
     context_tokens: number
+    /** Memory one node needs to serve the class (replay or attempt), where measured; 0 otherwise. */
+    min_memory_bytes: number
   }
   readiness: PalwClassReadiness
   memory_note: string | null
@@ -553,9 +565,20 @@ export type Rewards = {
   next_mature_daa: number | null
 }
 
+/** `settings::NodeNetwork`. testnet-12 is the public network; testnet-11 is kept for nodes built from misakas 1f98d3bf4. */
+export type NodeNetwork = 'testnet12' | 'testnet11' | 'devnet' | 'simnet'
+
+/** How a network is written in the node's and the CLI's own spelling. */
+export const NETWORK_LABEL: Record<NodeNetwork, string> = {
+  testnet12: 'testnet-12',
+  testnet11: 'testnet-11',
+  devnet: 'devnet',
+  simnet: 'simnet',
+}
+
 export type NetworkOverview = {
   role: 'observer' | 'verifier' | 'producer'
-  network: 'testnet11' | 'devnet' | 'simnet'
+  network: NodeNetwork
   node: NodeView
   classes: PalwClassStatus[]
   kaspad_found: boolean
@@ -788,4 +811,33 @@ export interface RegistrationReadiness {
   blocked_because: string | null
   armed: boolean
   command: string[]
+}
+
+/** `api/bond.rs` — from an empty app to a bonded producer. */
+export type BondPhase = 'need_key' | 'need_funds' | 'ready_to_register' | 'registering' | 'finishing' | 'bonded'
+
+export type BondSetup = {
+  network: NodeNetwork
+  phase: BondPhase
+  key_path: string | null
+  key_present: boolean
+  address: string | null
+  address_source: 'cli' | 'node' | null
+  address_error: string | null
+  funds: { total_sompi: number; largest_output_sompi: number; outputs: number; coinbase_sompi: number } | null
+  funds_error: string | null
+  floor_sompi: number | null
+  margin_sompi: number
+  recommended_margin_sompi: number
+  /** `collateral_sompi: null` = the node sizes it (recommended). */
+  choices: { label: string; collateral_sompi: number | null; approx_sompi: number; below_lifetime_sizing: boolean; note: string }[]
+  collateral_sompi: number | null
+  /** "send at least N sompi" — what the registration run will spend, once it has said. */
+  node_wanted_sompi: number | null
+  /** The node's whole-claim-lifetime sizing, when it printed it. */
+  node_lifetime_sompi: number | null
+  bond: string | null
+  reported_bond: string | null
+  registration_wait: string | null
+  job: { running: boolean; step: string | null; error: string | null; history: string[]; declaration_txid: string | null }
 }

@@ -14,7 +14,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use misaka_studio_core::palw;
 use misaka_studio_core::palw::{
-    PalwArtifactSource, PalwClassReadiness, PalwClassStatus, TESTNET11_CLASSES, assess_classes, read_artifact_header,
+    PalwArtifactSource, PalwClassReadiness, PalwClassStatus, assess_classes, classes_for, read_artifact_header,
 };
 use misaka_studio_core::settings::{NetworkRole, NodeNetwork};
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/blocks", get(produced_blocks))
         .route("/producer-key", post(producer_key))
         .route("/faucet", post(super::pool::faucet_for_address))
+        .nest("/bond", super::bond::router())
 }
 
 /// The whole network picture in one response — what the UI's Network tab renders.
@@ -78,7 +79,7 @@ async fn overview(State(state): State<Arc<AppState>>) -> Result<Json<NetworkOver
     let settings = state.settings.read().await.clone();
     let node = state.node.view(&settings.node).await?;
     let artifacts = artifact_scan(&state).await;
-    let classes = with_artifact_headers(assess_classes(&artifacts, state.hardware.total_memory));
+    let classes = with_artifact_headers(assess_classes(settings.node.network, &artifacts, state.hardware.total_memory));
     let kaspad = crate::node::NodeManager::resolve_kaspad(settings.node.kaspad_path.as_ref());
     Ok(Json(NetworkOverview {
         role: settings.node.role,
@@ -104,20 +105,22 @@ fn with_artifact_headers(mut statuses: Vec<PalwClassStatus>) -> Vec<PalwClassSta
 }
 
 async fn classes(State(state): State<Arc<AppState>>) -> Json<Vec<PalwClassStatus>> {
+    let network = state.settings.read().await.node.network;
     let artifacts = artifact_scan(&state).await;
-    Json(with_artifact_headers(assess_classes(&artifacts, state.hardware.total_memory)))
+    Json(with_artifact_headers(assess_classes(network, &artifacts, state.hardware.total_memory)))
 }
 
 /// Download a class artifact into the models directory, verified against the chain-pinned digest.
 ///
-/// Only the classes whose artifact is published as a file (QWEN36) can be downloaded; a
-/// convert-locally class answers 400 carrying the conversion command instead — an error that
+/// Only classes whose artifact is published as a file can be downloaded; a convert-locally class
+/// (testnet-12's 8k row) answers 400 carrying the conversion command instead — an error that
 /// tells the user the actual next step.
 async fn download_artifact(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<crate::download::DownloadProgress>> {
-    let spec = TESTNET11_CLASSES
+    let network = state.settings.read().await.node.network;
+    let spec = classes_for(network)
         .iter()
         .find(|class| class.name.eq_ignore_ascii_case(&name))
         .ok_or_else(|| Error::bad_request(format!("no PALW class named '{name}'")))?;
@@ -172,7 +175,7 @@ async fn reset_node(State(state): State<Arc<AppState>>) -> Result<Json<NodeView>
     }
     let mut node_settings = settings.node.clone();
     if node_settings.class_artifact.is_none() {
-        node_settings.class_artifact = default_class_artifact(&settings.models_dir).await;
+        node_settings.class_artifact = default_class_artifact(node_settings.network, &settings.models_dir).await;
     }
     Ok(Json(state.node.start_accepting_data_loss(&node_settings).await?))
 }
@@ -192,7 +195,7 @@ async fn start_node(State(state): State<Arc<AppState>>, body: Option<Json<StartB
         node_settings.role = role;
     }
     if node_settings.class_artifact.is_none() {
-        node_settings.class_artifact = default_class_artifact(&settings.models_dir).await;
+        node_settings.class_artifact = default_class_artifact(node_settings.network, &settings.models_dir).await;
     }
     // **Disarm before the node can succeed at it, not after.** A class registration is one
     // transaction; the flag that files it must not survive into a second start. Written back
@@ -213,12 +216,20 @@ async fn start_node(State(state): State<Arc<AppState>>, body: Option<Json<StartB
 /// moment someone moves their models, and the node would then refuse to produce over a file that
 /// is sitting right where it should be. Left `None` when the file is absent or the wrong size, so
 /// an empty setting still means "mine the floor" rather than "fail to start".
-async fn default_class_artifact(models_dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    let spec = misaka_studio_core::palw::default_class();
-    let PalwArtifactSource::Download { filename, size_bytes, .. } = &spec.artifact else { return None };
+///
+/// On testnet-12 the default is the 8k row, which is converted rather than downloaded — its output
+/// is pinned all the same, so the size check applies. A conversion with no pinned size is never
+/// handed over on a guess.
+pub(crate) async fn default_class_artifact(network: NodeNetwork, models_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let spec = misaka_studio_core::palw::default_class_for(network);
+    let filename = match &spec.artifact {
+        PalwArtifactSource::Download { filename, .. } | PalwArtifactSource::ConvertLocally { filename, .. } => *filename,
+        PalwArtifactSource::DerivedFromSeed => return None,
+    };
+    let expected = misaka_studio_core::palw::exact_artifact_size(spec)?;
     let path = models_dir.join(filename);
     let meta = tokio::fs::metadata(&path).await.ok()?;
-    (meta.len() == *size_bytes).then_some(path)
+    (meta.len() == expected).then_some(path)
 }
 
 async fn stop_node(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>> {
@@ -260,7 +271,7 @@ pub async fn produced_blocks(State(state): State<Arc<AppState>>) -> Result<Json<
 /// at it. It never reads the file back and never returns the seed: the response names the path,
 /// and the address appears in the node's own log once it starts. Refuses to overwrite an existing
 /// seed — a producer key that is replaced silently is a bond that can no longer sign.
-async fn producer_key(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>> {
+pub(crate) async fn producer_key(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>> {
     let settings = state.settings.read().await.clone();
     // **Never mint a key while a node is running under the old one.** The seed IS the bond: a
     // supervised producer signs its attempts with the key it started with, and a bond registered
@@ -307,20 +318,19 @@ async fn producer_key(State(state): State<Arc<AppState>>) -> Result<Json<serde_j
 #[cfg(test)]
 mod tests {
     use super::*;
-    use misaka_studio_core::palw::default_class;
+    use misaka_studio_core::palw::{default_class, exact_artifact_size};
+
+    const NET: NodeNetwork = NodeNetwork::Testnet12;
 
     fn default_artifact_name() -> &'static str {
         match &default_class().artifact {
-            PalwArtifactSource::Download { filename, .. } => filename,
-            other => panic!("the default class must publish an artifact, got {other:?}"),
+            PalwArtifactSource::Download { filename, .. } | PalwArtifactSource::ConvertLocally { filename, .. } => filename,
+            other => panic!("the default class must have an artifact file, got {other:?}"),
         }
     }
 
     fn default_artifact_size() -> u64 {
-        match &default_class().artifact {
-            PalwArtifactSource::Download { size_bytes, .. } => *size_bytes,
-            other => panic!("the default class must publish an artifact, got {other:?}"),
-        }
+        exact_artifact_size(default_class()).expect("the default class's file has a pinned size")
     }
 
     /// An empty models directory must not produce a path. Handing the node an artifact flag
@@ -328,7 +338,7 @@ mod tests {
     #[tokio::test]
     async fn no_artifact_means_no_flag() {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert_eq!(default_class_artifact(dir.path()).await, None);
+        assert_eq!(default_class_artifact(NET, dir.path()).await, None);
     }
 
     /// The size is the check, not the name. A half-finished copy under the right filename is the
@@ -338,7 +348,7 @@ mod tests {
     async fn a_short_file_is_not_the_default_artifact() {
         let dir = tempfile::tempdir().expect("tempdir");
         tokio::fs::write(dir.path().join(default_artifact_name()), b"not the whole thing").await.expect("write");
-        assert_eq!(default_class_artifact(dir.path()).await, None);
+        assert_eq!(default_class_artifact(NET, dir.path()).await, None);
     }
 
     #[tokio::test]
@@ -350,6 +360,6 @@ mod tests {
         file.set_len(default_artifact_size()).expect("set_len");
         drop(file);
 
-        assert_eq!(default_class_artifact(dir.path()).await, Some(path));
+        assert_eq!(default_class_artifact(NET, dir.path()).await, Some(path));
     }
 }

@@ -55,22 +55,27 @@ use tokio_tungstenite::tungstenite::Message;
 /// Default wRPC-JSON ports, from the node's `network.rs` (upstream Kaspa's + 10000).
 pub fn default_json_rpc_port(network: NodeNetwork) -> u16 {
     match network {
-        NodeNetwork::Testnet11 => 28210,
+        NodeNetwork::Testnet12 | NodeNetwork::Testnet11 => 28210,
         NodeNetwork::Devnet => 28610,
         NodeNetwork::Simnet => 28510,
     }
 }
 
 /// Default wRPC-**Borsh** ports, from the node's `network.rs` (upstream Kaspa's + 10000). Borsh
-/// is keyed by network TYPE there, so testnet-11 and testnet-10 share one — the suffix moves the
-/// P2P port, not this one.
+/// is keyed by network TYPE there, so every testnet shares one — the suffix moves the P2P port,
+/// not this one (testnet-12's join guide lists the same 26210/27210/28210 as testnet-11's).
 pub fn default_borsh_rpc_port(network: NodeNetwork) -> u16 {
     match network {
-        NodeNetwork::Testnet11 => 27210,
+        NodeNetwork::Testnet12 | NodeNetwork::Testnet11 => 27210,
         NodeNetwork::Devnet => 27610,
         NodeNetwork::Simnet => 27510,
     }
 }
+
+/// P2P entry nodes for testnet-12 — for `--addpeer` when DNS is unavailable. The node bootstraps
+/// from its built-in seeders; these are the two public nodes of the deployment record
+/// (`docs/testnet-12-regenesis-2026-09-23.md`: `.113` on the default port, ibm on 26321).
+pub const TESTNET12_FALLBACK_PEERS: &[&str] = &["169.58.232.113:26311", "169.58.39.220:26321"];
 
 /// P2P entry nodes for testnet-11, from the join runbook — used only as `--addpeer` fallbacks
 /// when DNS is unavailable, which is exactly the situation the runbook names them for.
@@ -261,12 +266,72 @@ pub(crate) fn parse_pay_address(line: &str) -> Option<String> {
 }
 
 /// `[palw-panel] registered bond <txid>:<index> …` → `<txid>:<index>`.
+///
+/// Also the Active form of the node's "this key already holds bond <txid>:<index> on this chain —
+/// not registering another" — the same fact reached from the other side: a registration run under
+/// a key that is already bonded files nothing and names the bond instead. The retired form of that
+/// line is not a bond to produce with (a retired key is spent), so only the Active wording counts.
 pub(crate) fn parse_registered_bond(line: &str) -> Option<String> {
-    let rest = line.split("[palw-panel] registered bond ").nth(1)?;
-    let outpoint = rest.split_whitespace().next()?;
-    let (txid, index) = outpoint.split_once(':')?;
-    (txid.len() >= 64 && txid.chars().all(|c| c.is_ascii_hexdigit()) && index.chars().all(|c| c.is_ascii_digit()))
-        .then(|| outpoint.to_string())
+    let outpoint_at = |rest: &str| -> Option<String> {
+        let outpoint = rest.split_whitespace().next()?;
+        let (txid, index) = outpoint.split_once(':')?;
+        (txid.len() >= 64 && txid.chars().all(|c| c.is_ascii_hexdigit()) && index.chars().all(|c| c.is_ascii_digit()))
+            .then(|| outpoint.to_string())
+    };
+    if let Some(rest) = line.split("[palw-panel] registered bond ").nth(1) {
+        return outpoint_at(rest);
+    }
+    let rest = line.split("[palw-panel] this key already holds bond ").nth(1)?;
+    rest.contains("not registering another").then(|| outpoint_at(rest)).flatten()
+}
+
+/// The amounts a registration run names, in sompi.
+///
+/// * `send at least <N> sompi plus a fee to this node's pay address` — what it will spend: the
+///   collateral it was given, or the one it sized itself when it was given none. This is the
+///   number a deposit has to reach, and the node is the only one that can derive it.
+/// * `--palw-bond-collateral <X> is below the <N> sompi that a claim of class … needs on this chain
+///   for its whole life` — its own whole-claim-lifetime sizing, printed when the named amount is
+///   under it ("this bond will register and its producer may then hold forever").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct RegistrationAmounts {
+    pub wanted_sompi: Option<u64>,
+    pub lifetime_sompi: Option<u64>,
+}
+
+pub(crate) fn parse_registration_amounts(line: &str) -> RegistrationAmounts {
+    let number_after = |needle: &str| -> Option<u64> {
+        let rest = line.split(needle).nth(1)?;
+        rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+    };
+    RegistrationAmounts {
+        wanted_sompi: line.contains("[palw-panel]").then(|| number_after("send at least ")).flatten(),
+        lifetime_sompi: (line.contains("[palw-panel] --palw-bond-collateral ") && line.contains("for its whole life"))
+            .then(|| number_after(" is below the "))
+            .flatten(),
+    }
+}
+
+/// What a registration run has said so far, read off its lines.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RegistrationFacts {
+    /// The bond it registered, or the Active one this key already holds.
+    pub bond: Option<String>,
+    /// Its newest reason for waiting; cleared by a bond.
+    pub wait: Option<String>,
+    pub amounts: RegistrationAmounts,
+}
+
+/// Why a registration run is still waiting: `cannot register a bond yet: <why>`, or its repeat
+/// `still cannot register a bond — …: <why>`. The node's own sentence, which is where the answer is
+/// (no funds at the address, an output too small for collateral plus fee, the node still syncing).
+pub(crate) fn parse_registration_wait(line: &str) -> Option<String> {
+    if let Some(why) = line.split("[palw-panel] cannot register a bond yet: ").nth(1) {
+        return Some(why.trim().to_string());
+    }
+    let rest = line.split("[palw-panel] still cannot register a bond").nth(1)?;
+    let why = rest.split_once(" do: ").map_or(rest, |(_, why)| why);
+    Some(why.trim_start_matches([' ', '—', '-']).trim().to_string())
 }
 
 /// A line worth surfacing in the activity feed: production, panel work, holds, and the identity
@@ -449,7 +514,7 @@ pub(crate) fn rewards_from_utxos(value: &Value, virtual_daa: u64) -> Rewards {
         }
         let amount = utxo.get("amount").and_then(Value::as_u64).unwrap_or(0);
         let daa = utxo.get("blockDaaScore").and_then(Value::as_u64).unwrap_or(0);
-        let matures_at = daa.saturating_add(misaka_studio_core::palw::TESTNET11_COINBASE_MATURITY_DAA);
+        let matures_at = daa.saturating_add(misaka_studio_core::palw::COINBASE_MATURITY_DAA);
         rewards.blocks_paid += 1;
         rewards.total_sompi = rewards.total_sompi.saturating_add(amount);
         if virtual_daa >= matures_at {
@@ -535,6 +600,10 @@ struct NodeLogState {
     /// `[palw-panel] registered bond <txid>:<index> …` — printed once by the registration run;
     /// the value `node.producer_bond` must carry from then on.
     registered_bond: Option<String>,
+    /// The registration run's newest "cannot register a bond yet" reason; cleared by a bond.
+    registration_wait: Option<String>,
+    /// The amounts it has named.
+    registration_amounts: RegistrationAmounts,
     /// What the log has said about mining, folded as lines arrive rather than scanned back out
     /// of a 600-line window that rotates in under a minute.
     mining: MiningFacts,
@@ -905,6 +974,10 @@ impl NodeManager {
     pub fn build_args(settings: &NodeSettings, rpc_port: u16) -> Result<Vec<String>> {
         let mut args: Vec<String> = Vec::new();
         match settings.network {
+            NodeNetwork::Testnet12 => {
+                args.push("--testnet".into());
+                args.push("--netsuffix=12".into());
+            }
             NodeNetwork::Testnet11 => {
                 args.push("--testnet".into());
                 args.push("--netsuffix=11".into());
@@ -944,7 +1017,12 @@ impl NodeManager {
             // registration carrier's change is what the panel then persists as one. With a bond
             // this is the PRODUCING run, and the persisted outpoint (or `fee_outpoint`) carries.
             // The same two phases the hosted pool's `run-slot.sh` runs.
-            args.push("--palw-panel".into());
+            //
+            // testnet-12 runs the seat duties on any node that holds a bond key, by construction;
+            // `--palw-panel` is accepted there and does nothing but log a warning, so it is left off.
+            if settings.network != NodeNetwork::Testnet12 {
+                args.push("--palw-panel".into());
+            }
             args.push(format!("--palw-producer-key={}", key.display()));
             // Optional since the node derives the key's own address when the flag is absent
             // (kaspad, 2026-09-04): rewards and the panel's carrier funding then share one
@@ -958,7 +1036,12 @@ impl NodeManager {
                     args.push("--palw-produce".into());
                     args.push(format!("--palw-producer-bond={bond}"));
                 }
-                None => args.push("--palw-register-bond".into()),
+                None => {
+                    args.push("--palw-register-bond".into());
+                    if let Some(collateral) = settings.bond_collateral_sompi {
+                        args.push(format!("--palw-bond-collateral={collateral}"));
+                    }
+                }
             }
             if let Some(outpoint) = &settings.fee_outpoint {
                 args.push(format!("--palw-fee-outpoint={outpoint}"));
@@ -1189,6 +1272,23 @@ impl NodeManager {
         self.supervised.read().await.is_some()
     }
 
+    /// What the running (or last) node said about registering this key's bond.
+    pub fn registration_facts(&self) -> RegistrationFacts {
+        let logs = self.logs.lock().expect("log lock");
+        RegistrationFacts {
+            bond: logs.registered_bond.clone(),
+            wait: logs.registration_wait.clone(),
+            amounts: logs.registration_amounts,
+        }
+    }
+
+    /// The role of the node this Studio supervises, if it supervises one that is still running.
+    pub async fn supervised_role(&self) -> Option<NetworkRole> {
+        let mut guard = self.supervised.write().await;
+        let node = guard.as_mut()?;
+        matches!(node.child.try_wait(), Ok(None)).then_some(node.role)
+    }
+
     pub fn recent_log(&self, limit: usize) -> Vec<String> {
         let logs = self.logs.lock().expect("log lock");
         logs.log.iter().rev().take(limit).cloned().collect::<Vec<_>>().into_iter().rev().collect()
@@ -1224,6 +1324,17 @@ async fn drain_node<R: tokio::io::AsyncRead + Unpin>(stream: R, logs: Arc<Mutex<
         }
         if let Some(outpoint) = parse_registered_bond(&line) {
             state.registered_bond = Some(outpoint);
+            state.registration_wait = None;
+        }
+        if let Some(why) = parse_registration_wait(&line) {
+            state.registration_wait = Some(why);
+        }
+        let amounts = parse_registration_amounts(&line);
+        if amounts.wanted_sompi.is_some() {
+            state.registration_amounts.wanted_sompi = amounts.wanted_sompi;
+        }
+        if amounts.lifetime_sompi.is_some() {
+            state.registration_amounts.lifetime_sompi = amounts.lifetime_sompi;
         }
         if let Some(mut effort) = parse_effort(&line) {
             effort.draws_per_min = draw_rate(state.effort.as_ref(), &effort);
@@ -1498,6 +1609,70 @@ mod tests {
         assert!(is_activity_line("[palw] producer pay address misakadev:qq (derived)"));
     }
 
+    /// The node's own sentences for "already bonded" and "still waiting", as release `0e8ec984e`
+    /// prints them (`kaspad/src/palw_panel.rs`).
+    #[test]
+    fn an_existing_bond_and_a_registration_wait_are_read_off_the_node_lines() {
+        let txid = "cd".repeat(64);
+        let active = format!(
+            "2026-09-26 01:00:00.000+09:00 [INFO ] [palw-panel] this key already holds bond {txid}:0 on this chain — not registering another. Drop --palw-register-bond and run with --palw-producer-bond={txid}:0"
+        );
+        assert_eq!(parse_registered_bond(&active), Some(format!("{txid}:0")));
+        // A retired key's line names a bond too, and it is not one to produce with.
+        assert_eq!(
+            parse_registered_bond(&format!("[palw-panel] this key already holds bond {txid}:0 on this chain, RETIRED — …")),
+            None
+        );
+
+        let why = "no mature, non-bond output at misakatest:qx… holds 13000.1 MSK";
+        assert_eq!(parse_registration_wait(&format!("[WARN ] [palw-panel] cannot register a bond yet: {why}")).as_deref(), Some(why));
+        let again = format!(
+            "[WARN ] [palw-panel] still cannot register a bond — the same refusal, unchanged for 4m across 12 attempts. Nothing about the retry differs, so it will not clear until the funding, the flags or the chain do: {why}"
+        );
+        assert_eq!(parse_registration_wait(&again).as_deref(), Some(why));
+        assert_eq!(parse_registration_wait("[palw-panel] registered bond x"), None);
+    }
+
+    /// Both lines as release `0e8ec984e` printed them on testnet-12, 2026-09-26, for a registration
+    /// run given 13,000 MSK against an empty address.
+    #[test]
+    fn the_amounts_a_registration_run_names_are_read_off_its_lines() {
+        let below = "2026-09-26 00:02:12.767+09:00 [WARN ] [palw-panel] --palw-bond-collateral 1300000000000 is below the 3119145986560 sompi that a claim of class f1c5635c6e47e96e needs on this chain for its whole life (exposure is released at Final, not at bind, so the ceiling has to hold every claim in flight at once); this bond will register and its producer may then hold forever with 'the bond's exposure ceiling leaves no room for another claim'";
+        assert_eq!(
+            parse_registration_amounts(below),
+            RegistrationAmounts { wanted_sompi: None, lifetime_sompi: Some(3_119_145_986_560) }
+        );
+        let wait = "2026-09-26 00:02:12.770+09:00 [WARN ] [palw-panel] cannot register a bond yet: no confirmed UTXO to spend — send at least 1300000000000 sompi plus a fee to this node's pay address";
+        assert_eq!(
+            parse_registration_amounts(wait),
+            RegistrationAmounts { wanted_sompi: Some(1_300_000_000_000), lifetime_sompi: None }
+        );
+        assert_eq!(parse_registration_amounts("[palw-producer] send at least 5 sompi"), RegistrationAmounts::default());
+    }
+
+    /// testnet-12: its own suffix, the explicit collateral on a registration run, and no
+    /// `--palw-panel` (a no-op there that only logs a warning).
+    #[test]
+    fn a_testnet12_registration_run_carries_the_chosen_collateral() {
+        let settings = NodeSettings {
+            network: NodeNetwork::Testnet12,
+            role: NetworkRole::Producer,
+            producer_key_path: Some("/k/producer.seed".into()),
+            bond_collateral_sompi: Some(1_300_000_000_000),
+            ..Default::default()
+        };
+        let joined = NodeManager::build_args(&settings, 28210).expect("builds").join(" ");
+        assert!(joined.contains("--testnet --netsuffix=12"), "{joined}");
+        assert!(joined.contains("--palw-register-bond --palw-bond-collateral=1300000000000"), "{joined}");
+        assert!(!joined.contains("--palw-panel"), "{joined}");
+        assert!(!joined.split(' ').any(|a| a == "--palw-produce"), "a registration run does not produce: {joined}");
+
+        let producing = NodeSettings { producer_bond: Some(format!("{}:0", "ab".repeat(64))), ..settings };
+        let joined = NodeManager::build_args(&producing, 28210).expect("builds").join(" ");
+        assert!(joined.contains("--palw-produce --palw-producer-bond="), "{joined}");
+        assert!(!joined.contains("--palw-bond-collateral"), "the collateral belongs to the registration run only: {joined}");
+    }
+
     #[test]
     fn urls_normalize_to_the_network_default_port() {
         assert_eq!(normalize_rpc_url("", NodeNetwork::Devnet), "ws://127.0.0.1:28610");
@@ -1548,7 +1723,9 @@ mod tests {
 
     #[test]
     fn a_producer_with_a_bond_mines_and_without_one_registers() {
+        // testnet-11 still passes `--palw-panel`; testnet-12's case is the test above.
         let mut settings = NodeSettings {
+            network: NodeNetwork::Testnet11,
             role: NetworkRole::Producer,
             producer_key_path: Some("/keys/miner.seed".into()),
             mining_address: Some("misakatest:qqq".into()),
