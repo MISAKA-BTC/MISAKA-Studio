@@ -13,7 +13,7 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { api, streamChat } from '../lib/api'
 import { joinContinuation } from '../lib/continuation'
-import { hasRepeatedTail, historyForModel, trimRepeatedTail } from '../lib/history'
+import { hasRepeatedTail, historyForModel, trimRepeatedTail, withRetryHint } from '../lib/history'
 import type {
   ChatMessage,
   Conversation,
@@ -79,7 +79,7 @@ type StudioState = {
   deleteConversation: (id: string) => void
   renameConversation: (id: string, title: string) => void
   send: (text: string) => Promise<void>
-  regenerate: () => Promise<void>
+  regenerate: (hint?: boolean) => Promise<void>
   continueGeneration: () => Promise<void>
   editMessage: (messageId: string, content: string) => Promise<void>
   /** Pinned notes on the active conversation: standing facts the context manager keeps. */
@@ -99,6 +99,21 @@ type StudioState = {
 let inFlight: AbortController | null = null
 
 const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36)
+
+/** The two backends that decode greedily by construction: `misaka-palw-serve`'s own `/health`
+ *  reports a fixed `sampler: "greedy-argmax-lowest-id"`, and the free-prompt gateway refuses any
+ *  sampling knob away from its identity value by name (ADR-0096 Decision 4). On either, the same
+ *  request is the same answer, always — plain "Regenerate" cannot do anything a resend does not
+ *  already do. Exported so ChatView can decide, per message, whether to offer it. */
+export function isDeterministicLane(lane: string | undefined): boolean {
+  return lane === 'gateway' || lane === 'misaka'
+}
+
+/** Folded into the question on a hinted regenerate ([`StudioState.regenerate`]'s `hint` argument).
+ *  Its job is mechanical, not persuasive: change the actual input tokens enough that a greedy
+ *  decoder's walk through them does not retrace the walk that just looped, while still asking for
+ *  the same thing a person would ask for after watching an answer repeat itself and stop short. */
+const RETRY_HINT = '（同じ説明を繰り返さず、要点を絞って最初から最後まで一度で解答してください）'
 
 function emptyConversation(): Conversation {
   const now = Date.now()
@@ -369,7 +384,7 @@ export const useStudio = create<StudioState>()(
         }
       },
 
-      regenerate: async () => {
+      regenerate: async (hint = false) => {
         const conversationId = get().activeConversationId
         if (!conversationId) return
         const conversation = get().conversations.find((c) => c.id === conversationId)
@@ -381,7 +396,15 @@ export const useStudio = create<StudioState>()(
         while (messages.length > 0 && messages[messages.length - 1]?.role === 'assistant') messages.pop()
         if (messages.length === 0) return
         set((s) => ({ conversations: s.conversations.map((c) => (c.id === conversationId ? { ...c, messages } : c)) }))
-        await runGeneration(set, get, conversationId)
+        // `hint`: the last attempt stopped for repeating itself on a backend that decodes greedily
+        // (`repetitionNoteFor` below), so an unmodified resend would reproduce the identical prompt
+        // and, deterministically, the identical answer — the field report this line answers
+        // ("regenerate してもここで止まる", 2026-09-27). RETRY_HINT rides along on the question
+        // itself, not as a separate turn, ephemeral to this one request (see `runGeneration`'s
+        // `hint` option) — enough of a change to the actual input tokens that the same greedy walk
+        // does not retrace itself, without pretending this is a guaranteed fix: a different path
+        // can still find a different loop, just not the SAME one.
+        await runGeneration(set, get, conversationId, hint ? { hint: RETRY_HINT } : {})
       },
 
       continueGeneration: async () => {
@@ -451,7 +474,7 @@ async function runGeneration(
   set: Setter,
   get: Getter,
   conversationId: string,
-  options: { targetAssistantId?: string; prompt?: string } = {},
+  options: { targetAssistantId?: string; prompt?: string; hint?: string } = {},
 ) {
   const state = get()
   const conversation = state.conversations.find((c) => c.id === conversationId)
@@ -471,9 +494,12 @@ async function runGeneration(
   const systemPrompt = settings?.generation.system_prompt?.trim()
   // Not every turn in the window is context: failed, looping and superseded replies stay visible
   // but are not sent back — see `lib/history`.
-  const history = historyForModel(conversation.messages)
+  const baseHistory = historyForModel(conversation.messages)
+  const history = options.hint ? withRetryHint(baseHistory, options.hint) : baseHistory
   const continuation = options.prompt ? [{ role: 'user' as const, content: options.prompt }] : []
-  const messages = systemPrompt ? [{ role: 'system' as const, content: systemPrompt }, ...history, ...continuation] : [...history, ...continuation]
+  const messages = systemPrompt
+    ? [{ role: 'system' as const, content: systemPrompt }, ...history, ...continuation]
+    : [...history, ...continuation]
 
   const assistantId = options.targetAssistantId ?? uid()
   const existing = conversation.messages.find((m) => m.id === assistantId)
@@ -508,14 +534,15 @@ async function runGeneration(
       }
     })
 
-  // "Regenerate" only helps where sampling can differ. The mining lane and the integer runtime
-  // decode greedily by construction — the same prompt gives the same answer, and telling someone
-  // to try again there sends them round in a circle they can see for themselves.
+  // Plain "Regenerate" only helps where sampling can differ. The mining lane and the integer
+  // runtime decode greedily by construction — the same prompt gives the same answer, and telling
+  // someone to try again there sends them round in a circle they can see for themselves; ChatView
+  // offers "retry with a hint" instead of a plain regenerate wherever `isDeterministicLane` is true.
   // Which engine answered is the context report's to say: the window's idea of the runtime can be a
   // load behind.
   const repetitionNoteFor = (lane: string | undefined) =>
-    lane === 'gateway' || lane === 'misaka'
-      ? '同じ文章の反復を検出したため、この表示を停止しました。この経路（マイニング用の整数ランタイム）は決定論的で、同じ質問には同じ答えが返ります。質問を言い換えるか、Settings → Backend で別のエンジンを選んでください。'
+    isDeterministicLane(lane)
+      ? '同じ文章の反復を検出したため、この表示を停止しました。この経路（マイニング用の整数ランタイム）は決定論的で、同じ質問には同じ答えが返ります。「ヒントを付けて再試行」を使うか、質問を言い換えるか、Settings → Backend で別のエンジンを選んでください。'
       : '同じ文章の反復を検出したため、この表示を停止しました。再生成すると別の回答を試せます。'
 
   const controller = new AbortController()

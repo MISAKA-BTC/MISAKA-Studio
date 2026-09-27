@@ -122,3 +122,25 @@ export function historyForModel(messages: ChatMessage[]): { role: ChatMessage['r
   })
   return out
 }
+
+/**
+ * `hint` folded into the last turn of `history` if it ends in a user turn, unchanged otherwise.
+ *
+ * Used to retry a reply that stopped for repeating itself on a backend that decodes greedily
+ * (`misaka-palw-serve`'s fixed `greedy-argmax-lowest-id`, or the free-prompt gateway's refusal of
+ * any sampling knob — ADR-0096 Decision 4): an unmodified resend is the identical prompt, and
+ * deterministically the identical answer, stopping at the identical line every time (field report,
+ * 2026-09-27, pressing Regenerate). The hint rides on the question itself, as one more sentence, not
+ * as a turn of its own — a separate trailing user turn would ask the template to place two user
+ * messages back to back, which is not what changes the greedy walk; the bytes of the question are.
+ * Left alone when the history ends in something other than a user turn (empty, or mid-continuation)
+ * — there is nothing to fold it onto.
+ */
+export function withRetryHint(
+  history: { role: ChatMessage['role']; content: string }[],
+  hint: string,
+): { role: ChatMessage['role']; content: string }[] {
+  const last = history.at(-1)
+  if (!last || last.role !== 'user') return history
+  return [...history.slice(0, -1), { role: last.role, content: `${last.content}\n\n${hint}` }]
+}

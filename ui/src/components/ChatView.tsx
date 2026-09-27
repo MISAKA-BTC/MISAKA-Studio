@@ -13,7 +13,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { duration } from '../lib/format'
 import type { ChatMessage, MessageMining } from '../lib/types'
-import { useStudio } from '../store/studio'
+import { isDeterministicLane, useStudio } from '../store/studio'
 import { CopyButton, EmptyState, Icon, Spinner } from './common'
 import { Markdown } from './Markdown'
 import { ContextLine, PinnedNotes, pinTextFromMessage } from './ContextPanel'
@@ -217,6 +217,14 @@ export function ChatView() {
                       }
                     : undefined
                 }
+                onRegenerateWithHint={
+                  message.role === 'assistant' && index === visibleMessages.length - 1 && !generating
+                    ? async () => {
+                        followRef.current = true
+                        await regenerate(true)
+                      }
+                    : undefined
+                }
                 onContinue={
                   message.role === 'assistant' && index === visibleMessages.length - 1 && !generating && message.stats?.finishReason === 'length'
                     ? async () => {
@@ -270,6 +278,7 @@ function Message({
   onCancelEdit,
   onSaveEdit,
   onRegenerate,
+  onRegenerateWithHint,
   onContinue,
 }: {
   message: ChatMessage
@@ -278,6 +287,7 @@ function Message({
   onCancelEdit: () => void
   onSaveEdit: (content: string) => void
   onRegenerate?: () => void
+  onRegenerateWithHint?: () => void
   onContinue?: () => void
 }) {
   const [draft, setDraft] = useState(message.content)
@@ -355,7 +365,14 @@ function Message({
                 into, so the runtime watches the stream itself and ends it as soon as the same rule
                 that keeps a looping reply out of future context (below) can already see one —
                 rather than running to the token ceiling on a reply nobody wants. Never offered as
-                something to continue: continuing a loop only asks it to keep looping. */}
+                something to continue: continuing a loop only asks it to keep looping.
+                And on a lane that decodes greedily (misaka / gateway), plain Regenerate is not
+                offered at all — it would resend the identical prompt and, deterministically,
+                reproduce the identical loop (the field report this distinction answers: pressing
+                Regenerate stopped at the exact same line every time, 2026-09-27). Only "retry with
+                a hint" is, which folds a short instruction into the question itself so the same
+                greedy walk does not retrace itself — a real attempt at a different answer, not a
+                promise that it never loops again. */}
             {!isUser && !message.streaming && message.stats?.finishReason === 'repetition' && (
               <div className="mt-2 rounded-lg bg-ink-100 p-2 text-xs text-ink-600 dark:bg-ink-800/60 dark:text-ink-300">
                 <p className="flex items-start gap-2">
@@ -363,13 +380,25 @@ function Message({
                   <span>
                     Stopped early — the model started repeating itself. This reply is left out of the conversation the
                     model sees going forward, so the loop will not feed itself.
+                    {isDeterministicLane(message.context?.backend) &&
+                      ' This engine decodes the same question the same way every time, so a plain regenerate would only repeat the same loop.'}
                   </span>
                 </p>
-                {onRegenerate && (
-                  <button type="button" className="btn-outline mt-2 px-2 py-1 text-xs" onClick={onRegenerate}>
-                    Regenerate
-                  </button>
-                )}
+                <div className="mt-2 flex gap-2">
+                  {isDeterministicLane(message.context?.backend) ? (
+                    onRegenerateWithHint && (
+                      <button type="button" className="btn-outline px-2 py-1 text-xs" onClick={onRegenerateWithHint}>
+                        Retry with a hint
+                      </button>
+                    )
+                  ) : (
+                    onRegenerate && (
+                      <button type="button" className="btn-outline px-2 py-1 text-xs" onClick={onRegenerate}>
+                        Regenerate
+                      </button>
+                    )
+                  )}
+                </div>
               </div>
             )}
 
