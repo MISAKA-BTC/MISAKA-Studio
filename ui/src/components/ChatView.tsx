@@ -350,6 +350,29 @@ function Message({
               </div>
             )}
 
+            {/* This backend has no anti-repetition mechanism of its own (a fixed greedy decoder, or
+                a lane that refuses `stop`/sampling by design) and no way to escape a loop it falls
+                into, so the runtime watches the stream itself and ends it as soon as the same rule
+                that keeps a looping reply out of future context (below) can already see one —
+                rather than running to the token ceiling on a reply nobody wants. Never offered as
+                something to continue: continuing a loop only asks it to keep looping. */}
+            {!isUser && !message.streaming && message.stats?.finishReason === 'repetition' && (
+              <div className="mt-2 rounded-lg bg-ink-100 p-2 text-xs text-ink-600 dark:bg-ink-800/60 dark:text-ink-300">
+                <p className="flex items-start gap-2">
+                  <Icon name="stop" className="mt-0.5 size-3.5 shrink-0" />
+                  <span>
+                    Stopped early — the model started repeating itself. This reply is left out of the conversation the
+                    model sees going forward, so the loop will not feed itself.
+                  </span>
+                </p>
+                {onRegenerate && (
+                  <button type="button" className="btn-outline mt-2 px-2 py-1 text-xs" onClick={onRegenerate}>
+                    Regenerate
+                  </button>
+                )}
+              </div>
+            )}
+
             {!isUser && !message.streaming && message.context && <ContextLine report={message.context} />}
 
             {message.error && (

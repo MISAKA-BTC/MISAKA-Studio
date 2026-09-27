@@ -33,6 +33,7 @@ pub mod metrics;
 pub mod mining_queue;
 pub mod node;
 pub mod records;
+pub mod repetition;
 pub mod state;
 pub mod store;
 

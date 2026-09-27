@@ -94,6 +94,18 @@ test('a long answer that loops only at its end keeps its answer', () => {
   assert.ok(sent[1]!.content.includes('OP・OQ = 1'))
 })
 
+/** The exact shape `crate::repetition::loops` on the runtime now stops a reply at: three back-to-
+ *  back copies of a short phrase, with no preamble, because the stream was cut the moment a third
+ *  copy landed rather than left to run to the token ceiling. Still recognised as a loop here — the
+ *  detector is the same rule on both sides — and short enough after trimming to one copy that it
+ *  carries nothing worth sending back as context. */
+test('a reply the runtime already cut short for repeating leaves nothing worth sending either', () => {
+  const phrase = 'テスト用の文章です'
+  const messages = [msg('user', '同じ答えを繰り返して'), msg('assistant', phrase.repeat(3)), msg('user', 'next')]
+  const sent = historyForModel(messages)
+  assert.deepEqual(sent.map((m) => m.role), ['user', 'user'], JSON.stringify(sent))
+})
+
 test('a reply that is only a loop leaves nothing worth sending', () => {
   const messages = [msg('user', 'Q'), msg('assistant', `${LOOP_BLOCK.slice(0, 30)}`.repeat(12)), msg('user', 'Q again differently')]
   const sent = historyForModel(messages)
