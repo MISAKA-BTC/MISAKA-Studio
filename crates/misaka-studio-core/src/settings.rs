@@ -581,7 +581,14 @@ impl Settings {
     /// file is then schema 1, so a testnet-11 chosen after this is kept.
     pub fn migrate(mut self) -> Self {
         if self.schema < 1 {
-            let holds_testnet11_identity = self.node.producer_bond.is_some() || self.node.rpc_url.is_some();
+            // A joined pool slot is testnet-11 identity too — the hosted pool
+            // (`misakascan.com/pool`, `contrib/minerpool/pool.py`) runs `--netsuffix=11` and
+            // certifies testnet-11's classes only, so moving the network away from under it does
+            // not migrate the slot; it just makes every job it enqueues unmineable (2026-09-27
+            // field report: "not mined — gave up" on every message, from a slot silently carried
+            // onto a network its gateway was never going to answer for).
+            let holds_testnet11_identity =
+                self.node.producer_bond.is_some() || self.node.rpc_url.is_some() || self.node.pool_slot_id.is_some();
             if self.node.network == NodeNetwork::Testnet11 && !holds_testnet11_identity {
                 self.node.network = NodeNetwork::Testnet12;
                 // What named testnet-11's chain goes with it: its class ids are not testnet-12's (a
@@ -703,6 +710,12 @@ mod tests {
         assert_eq!(Settings::load(&path).expect("loads").node.network, NodeNetwork::Testnet11, "a testnet-11 bond stays");
         std::fs::write(&path, r#"{"node":{"network":"testnet11","rpc_url":"10.0.0.5:28210"}}"#).expect("write");
         assert_eq!(Settings::load(&path).expect("loads").node.network, NodeNetwork::Testnet11, "an attached node stays");
+        std::fs::write(&path, r#"{"node":{"network":"testnet11","pool_slot_id":"slot-06"}}"#).expect("write");
+        assert_eq!(
+            Settings::load(&path).expect("loads").node.network,
+            NodeNetwork::Testnet11,
+            "a joined pool slot stays — the hosted pool is testnet-11 only, and moving the network would just make its jobs unmineable"
+        );
 
         // Once migrated, testnet-11 is a choice, and a choice is kept.
         std::fs::write(&path, r#"{"schema":1,"node":{"network":"testnet11"}}"#).expect("write");

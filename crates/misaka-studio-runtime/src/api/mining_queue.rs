@@ -10,9 +10,24 @@ use crate::{Error, Result};
 use axum::extract::{Path, State};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use misaka_studio_core::settings::MiningMode;
+use misaka_studio_core::settings::{MiningMode, NodeNetwork};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+/// **The hosted pool (`misakascan.com/pool`, `contrib/minerpool/pool.py`) is testnet-11 only.**
+/// Its slots run `kaspad --testnet --netsuffix=11` and its free-prompt lane certifies testnet-11's
+/// `PALW-QWEN25-A16` (`graph-v5@512`) — a class that has no counterpart on testnet-12 at all (t12's
+/// genesis rows are the floor, the 8k row and the 2M row; nothing at 512). A Studio pointed at
+/// testnet-12 with a testnet-11 pool slot still configured — the shape a settings file migrated
+/// from testnet-11 keeps, since a pool slot was not among what the migration cleared — can enqueue
+/// a job all day: the gateway is unreachable (it was the slot's own testnet-11 producer, not
+/// running here), and even a reachable one would be adjudicated on a chain this Studio no longer
+/// follows. Field report, 2026-09-27: every job read "not mined — gave up" — this is why, and no
+/// amount of starting a local gateway fixes it. `background_available` refuses before the first
+/// attempt, once, rather than the queue's own retry-and-fail doing it minutes later, repeatedly.
+fn pool_supports(network: NodeNetwork) -> bool {
+    network == NodeNetwork::Testnet11
+}
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -41,12 +56,24 @@ pub struct MiningQueueView {
 async fn view(state: &AppState) -> MiningQueueView {
     let settings = state.settings.read().await.clone();
     let gateway_url = settings.node.palw_gateway_url.clone();
-    let (background_available, background_blocker) = match (&gateway_url, state.local_engine_for_loaded_model().await) {
-        (None, _) => {
-            (false, Some("no pool slot with a prompt-mining gateway is configured — join one from the Network tab".to_string()))
+    let (background_available, background_blocker) = if !pool_supports(settings.node.network) {
+        (
+            false,
+            Some(format!(
+                "the hosted pool this slot uses is testnet-11 only, and this Studio is on {} — its jobs cannot be mined here \
+                 whatever the gateway's state is. Wait for a pool that serves this network, or switch Network settings back to \
+                 testnet-11 to use this slot.",
+                settings.node.network.id()
+            )),
+        )
+    } else {
+        match (&gateway_url, state.local_engine_for_loaded_model().await) {
+            (None, _) => {
+                (false, Some("no pool slot with a prompt-mining gateway is configured — join one from the Network tab".to_string()))
+            }
+            (Some(_), Err(why)) => (false, Some(why)),
+            (Some(_), Ok(())) => (true, None),
         }
-        (Some(_), Err(why)) => (false, Some(why)),
-        (Some(_), Ok(())) => (true, None),
     };
     MiningQueueView {
         mode: settings.node.mining_mode,
@@ -77,6 +104,12 @@ async fn enqueue(State(state): State<Arc<AppState>>, Json(body): Json<EnqueueBod
         return Err(Error::bad_request("a prompt with no text is not a job"));
     }
     let settings = state.settings.read().await.clone();
+    if !pool_supports(settings.node.network) {
+        return Err(Error::bad_request(format!(
+            "the hosted pool this slot uses is testnet-11 only; this Studio is on {} — nothing enqueued here can be mined",
+            settings.node.network.id()
+        )));
+    }
     let Some(gateway_url) = settings.node.palw_gateway_url.clone() else {
         return Err(Error::bad_request("no prompt-mining gateway is configured — join a pool slot for prompt mining first"));
     };
