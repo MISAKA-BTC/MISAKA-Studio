@@ -1,8 +1,8 @@
 # MISAKA Studio
 
 A local LLM desktop app: search Hugging Face, download a model, load it, chat with it — and serve
-an OpenAI-compatible API on `localhost` while you do. Windows, macOS and Linux. Nothing you type
-leaves the machine.
+an OpenAI-compatible API on `localhost` while you do. Windows, macOS and Linux. Chat runs locally;
+optional prompt mining sends work to the configured mining service.
 
 What it has that other local-LLM apps do not: **every completion is recorded with the identity of
 what produced it** — the model's `h_M`, the runtime's `h_R` and determinism class, and commitments
@@ -25,21 +25,16 @@ applications use is the API this app uses, and it cannot rot without the app bre
 
 ## Status
 
-**v0.1 — working MVP.** Model management, the runtime, chat, the performance monitor and the API
-are implemented and tested. The llama.cpp backend has been run end to end against a real
-`llama-server` — load, streaming, token counts, runtime identity — and the desktop shell opens,
-spawns its runtime and takes it down again. The Network tab joins the MISAKA network: it has
-**mined real PALW blocks** — a Studio-supervised bonded producer on a locally minted
-`ConsensusV2` chain, with a second bonded node verifying and filing receipts (see
-*Joining the MISAKA network*). **On the public testnet (testnet-11, Relaunch 5f) the hosted-slot
-path runs end to end from the app**: join, take the faucet's grant, and the slot registers its own
-bond and produces — measured 2026-09-04, bond `56b6bfbd…` from a 12 tMSK grant the app requested,
-with no node on this machine. **Metal has run a model here** (2026-09-17, M4 Pro: 29/29 layers
-on `MTL0`, 1.06 GB of weights on the device, read from the engine's own log). Not yet done: MLX
-is wired but has never run on a Mac, no CUDA, Vulkan or ROCm machine has executed a model here
-(the installer's builds for them are chosen and unpacked by the same code, unit-tested against
-upstream's asset names), and a Studio-supervised node has produced on a local chain rather than
-on the public one (that path needs a `kaspad` built for the current release beside the app).
+**v0.1.2 — local desktop development build.** Model management, streaming chat, reasoning,
+image generation, coding-agent sessions, workspaces, Git and terminals are available. A new chat
+starts with a model selected; each chat retains its choice, including when loading fails, and
+shows an actionable error. Reasoning has a bounded budget, and a reply that reaches its ceiling
+without an answer is retried once with thinking disabled.
+
+The Network tab uses the node-free testnet-12 paths described below. Earlier supervised-node and
+hosted testnet-11 pool workflows have been removed. Public-network settlement depends on the
+fleet being able to retrieve the attempt evidence; the dated integration findings in `docs/`
+record the limitations observed during testing, rather than a guarantee of mining rewards.
 
 ## Quick start
 
@@ -224,75 +219,27 @@ that would use the card.
 
 ## Joining the MISAKA network
 
-The Network tab is the participation ladder, and every rung is the same node with more at stake —
-on this network there is no separate miner program: **the thing that runs the model is the thing
-that makes the block.**
+The Studio defaults to testnet-12 and reads public nodes over wRPC. It does not run `kaspad` or
+join a hosted pool. The Network tab exposes two local execution paths:
 
-* **Mining classes, as a list you can act on.** A block on MISAKA is won by verified LLM
-  inference in one of the chain-registered classes — on testnet-11 Relaunch 5f (2026-09-03):
-  `PALW-BASE-0` (the deterministic floor, 22‰ of the epoch's blocks, needs nothing),
-  `PALW-QWEN25-A16` (489‰, chain model id `Qwen/Qwen2.5-1.5B/graph-v5@512`, a 1.7 GiB W8A16
-  artifact), `QWEN36` (489‰, chain model id `Qwen3.6-35B-A3B/graph-v3`, a 34 GiB artifact). Both
-  model classes are downloadable and digest-pinned. The list is the top half of **Models → Discover**, above the free-text search,
-  because nobody guesses these repository names; each card shows its share, what installs, this
-  machine's readiness — including an honest "this machine cannot run this class" when the
-  artifact exceeds RAM — and, when a node is running, the class's **live on-chain status** from
-  the node's own `--palw-dump-classes` table. The artifact download reuses the model download
-  pipeline, verified against the chain-pinned SHA-256.
-* **What a Studio node mines today is the floor.** A producer started without a class named
-  mines `PALW-BASE-0` — no model file, and its per-class difficulty walks toward the model
-  classes' price at every epoch boundary (it starts hard after a relaunch: about one winning
-  draw in 12,700 on 5f's first day, easing ×4 per epoch). The dense class's artifact
-  (`qwen25-1.5b-a16.palwart`, 1.7 GiB, digest-pinned) is available in **Models → Discover**,
-  but **Network → Install the default class artifact on first run** is now off by default:
-  since Relaunch 5f the dense class's execution material (~750 MB per job) is above the network's
-  gossip cap, so its blocks do not cross the public links and holding the artifact only costs
-  bandwidth until that transport fix ships. It is a download and not a file in this repository
-  because GitHub refuses any file over 100 MB.
-* **Mine via pool — no node at all.** The Network tab can join a hosted producer slot
-  (`contrib/minerpool/`, deployed at `misakascan.com/pool`): joining creates a real
-  `kaspad --palw-produce` on the pool host, and funding the slot's address with 10 MSK is the
-  entire remaining setup — the slot registers its own bond and mines the floor class. Testnet
-  MSK comes from the **misakascan faucet** (`misakascan.com/faucet`): one 12 MSK grant per
-  address, requestable from the panel with a button; the chain's own bond minimum is far below
-  that (a floor claim reserves 38,540 sompi until it is Final), so one grant funds the slot. The trade
-  is stated in the panel, not buried: the slot's seed lives on the pool host (that is what "no
-  node" means), and a copy is written to this machine so the rewards stay recoverable without
-  the pool's cooperation. **A won block's reward is escrowed until its claim is Final** — a panel of
-  bonded seats licenses it and a challenge window passes (bind + receipt + challenge, ≈ 2,400 DAA);
-  a voided claim burns its reward instead of paying it. The panel says so beside the count.
-* **Your own node, your own key — no CLI.** Network → Producer: **Generate a key here** writes a
-  32-byte ML-DSA-87 seed (0600, under the Studio's data directory, never shown) and points the
-  producer at it. Start the node: with no pay address set it derives the key's own address and
-  prints it (`[palw] producer pay address …`) — the tab shows it with a faucet button (12 MSK,
-  once per address, enough for a bond). That first start is the **registration run**: once the
-  address holds funds it files the bond carrier, prints `registered bond <txid>:0`, and stops;
-  the tab offers to save that outpoint, and the next start is the **producing run** that mines
-  the floor under it. The seed file is the bond — back it up; the Studio never reads it again. This needs a `kaspad` the Studio can find: beside
-  `misaka-studiod`, on `PATH`, or named in **Network → Node configuration → kaspad path** — built
-  from the [misakas](https://github.com/MISAKA-BTC/misakas) repository at the chain's current
-  release (`cargo build --release -p kaspad`), or a release binary dropped in place. A node built
-  from another chain's genesis is refused at the handshake, not merely slow.
-* **Observer** — point the tab at any reachable node RPC and read the chain.
-* **Verifier** — run a full node; on this chain syncing *is* verifying, no bond required. With a
-  bonded key the same node takes panel duty and files receipts on producers' claims.
-* **Producer (miner)** — a bonded ML-DSA-87 key, a bond outpoint, a pay address. The Studio
-  launches and supervises the node (`--palw-produce --palw-panel …`), streams its
-  `[palw-producer]`/`[palw-panel]` lines into the activity feed, and — because a person putting
-  a bonded key on the line must be able to audit what ran — always displays the **exact command
-  line**, reproducible without the Studio. First run without a bond registers one
-  (`--palw-register-bond`); the printed outpoint goes into settings and then mines.
+* **Remote mining:** supervises `palw-remote-miner` and `palw-attempt-exec`, with the configured
+  bond key, checkpoint, class and public endpoints. The miner performs and signs work locally;
+  public nodes validate submitted blocks. Its verification labels and checkpoint requirements
+  remain visible before mining starts.
+* **Prompt mining:** supervises the local gateway and submitter. Background mode queues prompts
+  while a separate local engine answers chat. The queue reports why it is unavailable when the
+  gateway is stopped or no local chat engine can serve the selected model.
 
-The node is the [misakas](https://github.com/MISAKA-BTC/misakas) `kaspad`, driven over its JSON
-workflow-RPC (`--rpclisten-json`, loopback only), supervised as a child process the same way
-engines are, and stopped with SIGTERM first so RocksDB closes clean. `/api/v1/network` carries
-all of it, so any client — not just this UI — can see the ladder.
+Models → Discover lists the selected network's execution classes. testnet-12's genesis table
+contains the deterministic floor, `PALW-QWEN25-A16-8K` and `PALW-QWEN25-A16-2M`. Downloads are
+size- and SHA-256-pinned, and readiness includes the replay/attempt memory requirement. Published
+PALWART3 models that are not registered classes are listed separately: installing one does not
+make it eligible to mine on the network.
 
-This has been demonstrated end to end: a Studio-configured producer mined hundreds of accepted
-PALW-BASE-0 blocks on a locally minted testnet-11-preset chain (the same genesis ceremony that
-launched the public network), while an independent bonded seat filed 270 `Valid` receipts on its
-claims. What that run did and did not prove — and how to reproduce it — is recorded in
-[`docs/misaka-studio-palw-demo.md`](docs/misaka-studio-palw-demo.md).
+A submitted attempt's evidence must remain available to the Panel until settlement. See the
+[October 25 integration report](docs/feedback-t12-nodeless-mining-2026-10-25.md) and
+[October 26 evidence report](docs/feedback-t12-nodeless-evidence-2026-10-26.md) for the tested fleet
+revisions, dependencies and outstanding deployment requirements.
 
 ## Provenance — the part that is MISAKA's
 

@@ -12,7 +12,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use misaka_studio_core::palw;
 use misaka_studio_core::palw::{
-    PalwArtifactSource, PalwClassReadiness, PalwClassStatus, GENESIS_CLASSES, assess_classes, read_artifact_header,
+    PalwArtifactSource, PalwClassReadiness, PalwClassStatus, assess_classes, classes_for, read_artifact_header,
 };
 use misaka_studio_core::settings::NodeNetwork;
 use serde::{Deserialize, Serialize};
@@ -79,7 +79,8 @@ async fn overview(State(state): State<Arc<AppState>>) -> Result<Json<NetworkOver
     let settings = state.settings.read().await.clone();
     let public_nodes = crate::node::public_status(settings.node.network).await;
     let artifacts = artifact_scan(&state).await;
-    let classes = with_artifact_headers(assess_classes(&artifacts, state.hardware.total_memory));
+    let classes =
+        with_artifact_headers(assess_classes(state.settings.read().await.node.network, &artifacts, state.hardware.total_memory));
     Ok(Json(NetworkOverview { network: settings.node.network, public_nodes, classes }))
 }
 
@@ -98,7 +99,7 @@ fn with_artifact_headers(mut statuses: Vec<PalwClassStatus>) -> Vec<PalwClassSta
 
 async fn classes(State(state): State<Arc<AppState>>) -> Json<Vec<PalwClassStatus>> {
     let artifacts = artifact_scan(&state).await;
-    Json(with_artifact_headers(assess_classes(&artifacts, state.hardware.total_memory)))
+    Json(with_artifact_headers(assess_classes(state.settings.read().await.node.network, &artifacts, state.hardware.total_memory)))
 }
 
 /// Download a class artifact into the models directory, verified against the chain-pinned digest.
@@ -110,7 +111,7 @@ async fn download_artifact(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<crate::download::DownloadProgress>> {
-    let spec = GENESIS_CLASSES
+    let spec = classes_for(state.settings.read().await.node.network)
         .iter()
         .find(|class| class.name.eq_ignore_ascii_case(&name))
         .ok_or_else(|| Error::bad_request(format!("no PALW class named '{name}'")))?;
@@ -290,7 +291,6 @@ mod tests {
     }
 }
 
-
 /// `GET /api/v1/network/remote-miner` — the node-free miner: running or not, the command the settings would run, and what
 /// its event lines said.
 async fn remote_miner_view(State(state): State<Arc<AppState>>) -> Json<crate::remote_miner::RemoteMinerView> {
@@ -325,7 +325,6 @@ async fn remote_miner_stop(State(state): State<Arc<AppState>>) -> Result<Json<se
 async fn remote_miner_log(State(state): State<Arc<AppState>>, Query(query): Query<LogQuery>) -> Json<Vec<String>> {
     Json(state.remote_miner.recent_log(query.limit.min(600)))
 }
-
 
 /// `GET /api/v1/network/prompt-stack` — the node-free prompt-mining stack: the gateway and the rail, the commands the
 /// settings would run, the carriers the rail built and both logs.
@@ -369,7 +368,6 @@ async fn prompt_stack_stop(State(state): State<Arc<AppState>>) -> Result<Json<se
     }
     Ok(Json(serde_json::json!({ "stopped": true })))
 }
-
 
 /// One published PALWART3 model and whether all of it is on disk.
 #[derive(Serialize)]

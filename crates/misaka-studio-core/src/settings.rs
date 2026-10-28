@@ -573,9 +573,14 @@ impl Default for ContextSettings {
     }
 }
 
+pub const SETTINGS_SCHEMA: u32 = 1;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Missing in legacy files; an explicit network choice in current files is retained.
+    #[serde(default)]
+    pub schema: u32,
     /// Where GGUF files live. Movable, because models are the largest thing on most people's
     /// disks and the system drive is rarely where they want them.
     pub models_dir: PathBuf,
@@ -605,6 +610,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            schema: SETTINGS_SCHEMA,
             models_dir: default_models_dir(),
             load_on_start: None,
             server: ServerSettings::default(),
@@ -630,8 +636,10 @@ impl Settings {
         let path = path.as_ref();
         match std::fs::read_to_string(path) {
             Ok(text) => {
-                let mut settings: Settings = serde_json::from_str(&text)
-                    .map_err(|e| Error::Settings { path: path.display().to_string(), reason: format!("not valid settings JSON: {e}") })?;
+                let mut settings: Settings = serde_json::from_str(&text).map_err(|e| Error::Settings {
+                    path: path.display().to_string(),
+                    reason: format!("not valid settings JSON: {e}"),
+                })?;
                 settings.migrate_retired_network();
                 Ok(settings)
             }
@@ -640,13 +648,12 @@ impl Settings {
         }
     }
 
-    /// **testnet-11 is retired**: a file written while it was the live network moves to testnet-12, the network that
-    /// replaced it. A node started for testnet-11 would sync a chain nobody produces on; choosing testnet-11 again in the
-    /// UI after this is a deliberate act and is kept until the next load.
+    /// Migrate legacy defaults once; current files retain the network the user chose.
     fn migrate_retired_network(&mut self) {
-        if self.node.network == NodeNetwork::Testnet11 {
+        if self.schema < SETTINGS_SCHEMA && self.node.network == NodeNetwork::Testnet11 {
             self.node.network = NodeNetwork::Testnet12;
         }
+        self.schema = SETTINGS_SCHEMA;
     }
 
     /// Write atomically: temp file in the same directory, then rename over the target.
@@ -757,7 +764,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod network_migration_tests {
     use super::*;
@@ -767,12 +773,16 @@ mod network_migration_tests {
         let dir = std::env::temp_dir().join(format!("misaka-studio-migrate-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("settings.json");
-        let mut old = Settings::default();
+        let mut old = Settings { schema: 0, ..Default::default() };
         old.node.network = NodeNetwork::Testnet11;
         old.save(&path).unwrap();
         assert!(std::fs::read_to_string(&path).unwrap().contains("\"testnet11\""));
         assert_eq!(Settings::load(&path).unwrap().node.network, NodeNetwork::Testnet12);
         assert_eq!(Settings::default().node.network, NodeNetwork::Testnet12);
+        let mut chosen = Settings::default();
+        chosen.node.network = NodeNetwork::Testnet11;
+        chosen.save(&path).unwrap();
+        assert_eq!(Settings::load(&path).unwrap().node.network, NodeNetwork::Testnet11);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

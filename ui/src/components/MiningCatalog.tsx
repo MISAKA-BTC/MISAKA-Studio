@@ -26,7 +26,7 @@ import { ClassContext } from './ContextBadge'
  * The class the runtime installs on first run — `palw::DEFAULT_CLASS`, repeated here only to put
  * a badge on it. The install itself is the runtime's decision and does not consult this.
  */
-const DEFAULT_CLASS = 'PALW-QWEN25-A16'
+const isDefaultClass = (name: string) => ['PALW-QWEN25-A16-8K', 'PALW-QWEN25-A16'].includes(name)
 
 /** `https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct`, honouring an `HF_ENDPOINT` mirror. */
 function repoUrl(endpoint: string | undefined, repo: string): string {
@@ -127,7 +127,7 @@ export function InstalledMiningArtifacts() {
               <div className="flex flex-wrap items-center gap-2">
                 <h4 className="mono text-sm font-semibold">{cls.spec.name}</h4>
                 <FinalWorkShare spec={cls.spec} rows={nodeRows} />
-                {cls.spec.name === DEFAULT_CLASS && <span className="badge bg-arc-600 text-white">default class</span>}
+                {isDefaultClass(cls.spec.name) && <span className="badge bg-arc-600 text-white">default class</span>}
                 <ClassContext registered={cls.spec.context_tokens} header={cls.artifact_header} />
                 {readiness.state === 'artifact_present' ? (
                   <span className="badge bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">on disk</span>
@@ -147,7 +147,7 @@ export function InstalledMiningArtifacts() {
               <p className="mt-1.5 text-[0.7rem] text-ink-500 dark:text-ink-400">
                 {readiness.state !== 'artifact_present'
                   ? 'A truncated download or a different conversion. Delete it and install again; the node would refuse this file at startup.'
-                  : cls.spec.name === DEFAULT_CLASS
+                  : isDefaultClass(cls.spec.name)
                     ? 'The default class: starting the node as a producer mines this without any further configuration. The node verifies the registered root at startup — a file that does not match is refused there, not here.'
                     : 'Name this path as the class artifact in Network settings to mine this class instead. The node verifies the registered root at startup — a file that does not match is refused there, not here.'}
               </p>
@@ -256,7 +256,7 @@ function MiningRow({ cls, nodeRows, onInstall }: { cls: PalwClassStatus; nodeRow
       <div className="flex flex-wrap items-center gap-2">
         <h4 className="mono text-sm font-semibold">{spec.name}</h4>
         <FinalWorkShare spec={spec} rows={nodeRows} />
-        {spec.name === DEFAULT_CLASS && <span className="badge bg-arc-600 text-white">default · installed on first run</span>}
+        {isDefaultClass(spec.name) && <span className="badge bg-arc-600 text-white">default · installed on first run</span>}
         {spec.is_base && <span className="badge bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300">floor · residual cadence, unpaid</span>}
         <ClassContext registered={spec.context_tokens} header={cls.artifact_header} />
         {badge}

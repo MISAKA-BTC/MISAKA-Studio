@@ -78,12 +78,8 @@ pub struct SeedOutcome {
     pub detail: String,
 }
 
-
-
 pub fn router() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/seed-readiness", get(seed_readiness))
-        .route("/seed", post(seed))
+    Router::new().route("/seed-readiness", get(seed_readiness)).route("/seed", post(seed))
 }
 
 /// Who pays a seed and what it can spend: the Studio's own key, read through the public node.
@@ -221,8 +217,8 @@ pub async fn seed(State(state): State<Arc<AppState>>, Json(request): Json<SeedRe
         (settings.node.misaka_cli_path.clone(), crate::node::borsh_endpoint(&settings.node), settings.node.network.id())
     };
     let binary = crate::node::resolve_misaka_cli(cli_path.as_ref());
-    let key_path = state.settings.read().await.node.producer_key_path.clone().filter(|k| k.is_file()).ok_or_else(|| Error::BadRequest {
-        message: "this Studio has no key file, so it cannot sign. Mint or name one in Network and key.".into(),
+    let key_path = state.settings.read().await.node.producer_key_path.clone().filter(|k| k.is_file()).ok_or_else(|| {
+        Error::BadRequest { message: "this Studio has no key file, so it cannot sign. Mint or name one in Network and key.".into() }
     })?;
 
     let mut command = tokio::process::Command::new(&binary);
@@ -333,7 +329,7 @@ async fn market_is_open(
 /// A reader that assumed either one silently returns nothing against the other, and "nothing"
 /// here reads as "no market" or "no transaction" — both wrong, both quiet. So the whole output is
 /// tried first, then each line.
-fn field(stdout: &str, name: &str) -> Option<serde_json::Value> {
+pub(crate) fn field(stdout: &str, name: &str) -> Option<serde_json::Value> {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim())
         && let Some(found) = v.get(name)
     {

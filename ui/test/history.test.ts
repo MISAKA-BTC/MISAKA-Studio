@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { hasRepeatedTail, historyForModel, loops, trimRepeatedTail } from '../src/lib/history.ts'
+import { hasRepeatedTail, historyForModel, loops, trimRepeatedTail, withRetryHint } from '../src/lib/history.ts'
 import type { ChatMessage } from '../src/lib/types.ts'
 
 let n = 0
@@ -94,8 +94,44 @@ test('a long answer that loops only at its end keeps its answer', () => {
   assert.ok(sent[1]!.content.includes('OP・OQ = 1'))
 })
 
+/** The exact shape `crate::repetition::loops` on the runtime now stops a reply at: three back-to-
+ *  back copies of a short phrase, with no preamble, because the stream was cut the moment a third
+ *  copy landed rather than left to run to the token ceiling. Still recognised as a loop here — the
+ *  detector is the same rule on both sides — and short enough after trimming to one copy that it
+ *  carries nothing worth sending back as context. */
+test('a reply the runtime already cut short for repeating leaves nothing worth sending either', () => {
+  const phrase = 'テスト用の文章です'
+  const messages = [msg('user', '同じ答えを繰り返して'), msg('assistant', phrase.repeat(3)), msg('user', 'next')]
+  const sent = historyForModel(messages)
+  assert.deepEqual(sent.map((m) => m.role), ['user', 'user'], JSON.stringify(sent))
+})
+
 test('a reply that is only a loop leaves nothing worth sending', () => {
   const messages = [msg('user', 'Q'), msg('assistant', `${LOOP_BLOCK.slice(0, 30)}`.repeat(12)), msg('user', 'Q again differently')]
   const sent = historyForModel(messages)
   assert.deepEqual(sent.map((m) => m.role), ['user', 'user'], JSON.stringify(sent))
+})
+
+// A retry after a repetition stop on a greedy backend (2026-09-27): pressing Regenerate resent the
+// identical prompt and, deterministically, produced the identical loop, stopped at the identical
+// line. withRetryHint changes the actual input bytes enough that the same walk does not retrace.
+test('a retry hint rides on the question itself, not as a turn of its own', () => {
+  const history = [
+    { role: 'system' as const, content: '日本語で答えてください。' },
+    { role: 'user' as const, content: QUESTION },
+  ]
+  const withHint = withRetryHint(history, '（ヒント）')
+  assert.equal(withHint.length, 2, 'no new turn — the question turn is rewritten in place')
+  assert.equal(withHint[0]!.content, '日本語で答えてください。', 'the system turn is untouched')
+  assert.equal(withHint[1]!.content, `${QUESTION}\n\n（ヒント）`)
+  assert.equal(withHint[1]!.role, 'user')
+})
+
+test('a retry hint is left off when there is no trailing user turn to fold it onto', () => {
+  assert.deepEqual(withRetryHint([], 'hint'), [])
+  const midContinuation = [
+    { role: 'user' as const, content: QUESTION },
+    { role: 'assistant' as const, content: 'partial answer' },
+  ]
+  assert.deepEqual(withRetryHint(midContinuation, 'hint'), midContinuation)
 })

@@ -16,7 +16,7 @@ import { joinContinuation } from '../lib/continuation'
 import { splitThinking } from '../lib/reasoning'
 import { withReasoningRecovery } from '../lib/reasoningRecovery'
 import { defaultModelId } from '../lib/modelSelection'
-import { hasRepeatedTail, historyForModel, trimRepeatedTail } from '../lib/history'
+import { hasRepeatedTail, historyForModel, trimRepeatedTail, withRetryHint } from '../lib/history'
 import { useUi } from './ui'
 import type {
   ApprovalPolicy,
@@ -134,7 +134,7 @@ type StudioState = {
   /** Queue a prompt for background mining and tie the job to the message that carries it. A no-op
    *  unless the runtime's queue is in background mode and this conversation has mining on. */
   enqueueMining: (conversationId: string, messageId: string, prompt: string) => Promise<void>
-  regenerate: () => Promise<void>
+  regenerate: (hint?: boolean) => Promise<void>
   continueGeneration: () => Promise<void>
   editMessage: (messageId: string, content: string) => Promise<void>
   /** Pinned notes on the active conversation: standing facts the context manager keeps. */
@@ -648,7 +648,7 @@ export const useStudio = create<StudioState>()(
         }
       },
 
-      regenerate: async () => {
+      regenerate: async (hint = false) => {
         const conversationId = get().activeConversationId
         if (!conversationId) return
         const conversation = get().conversations.find((c) => c.id === conversationId)
@@ -660,7 +660,7 @@ export const useStudio = create<StudioState>()(
         while (messages.length > 0 && messages[messages.length - 1]?.role === 'assistant') messages.pop()
         if (messages.length === 0) return
         set((s) => ({ conversations: s.conversations.map((c) => (c.id === conversationId ? { ...c, messages } : c)) }))
-        await runGeneration(set, get, conversationId)
+        await runGeneration(set, get, conversationId, hint ? { hint: '（同じ説明を繰り返さず、要点を絞って最初から最後まで一度で解答してください）' } : {})
       },
 
       continueGeneration: async () => {
@@ -822,7 +822,7 @@ export async function streamReply(options: {
   // load behind.
   const repetitionNoteFor = (lane: string | undefined) =>
     lane === 'gateway' || lane === 'misaka'
-      ? '同じ文章の反復を検出したため、この表示を停止しました。この経路（マイニング用の整数ランタイム）は決定論的で、同じ質問には同じ答えが返ります。質問を言い換えるか、Settings → Backend で別のエンジンを選んでください。'
+      ? '同じ文章の反復を検出したため、この表示を停止しました。この経路（マイニング用の整数ランタイム）は決定論的で、同じ質問には同じ答えが返ります。「要点を絞って再生成」で質問に短い指示を添えてやり直すか、別のモデルを選んでください。'
       : '同じ文章の反復を検出したため、この表示を停止しました。再生成すると別の回答を試せます。'
 
   const controller = new AbortController()
@@ -896,6 +896,7 @@ export async function streamReply(options: {
       } else if (event.type === 'error') {
         streamError = event.message
       } else {
+        if (event.finishReason === 'repetition') stoppedForRepetition = true
         const elapsed = performance.now() - startedAt
         // The runtime's token counts, the window's clock. Neither knows both halves: the engine
         // counts tokens, and only the client knows when the user's request started.
@@ -948,7 +949,7 @@ async function runGeneration(
   set: Setter,
   get: Getter,
   conversationId: string,
-  options: { targetAssistantId?: string; prompt?: string; thinking?: boolean } = {},
+  options: { targetAssistantId?: string; prompt?: string; thinking?: boolean; hint?: string } = {},
 ) {
   const state = get()
   const conversation = state.conversations.find((c) => c.id === conversationId)
@@ -963,7 +964,8 @@ async function runGeneration(
   const systemPrompt = state.settings?.generation.system_prompt?.trim()
   // Not every turn in the window is context: failed, looping and superseded replies stay visible
   // but are not sent back — see `lib/history`.
-  const history = historyForModel(conversation.messages)
+  const baseHistory = historyForModel(conversation.messages)
+  const history = options.hint ? withRetryHint(baseHistory, options.hint) : baseHistory
   const continuation = options.prompt ? [{ role: 'user' as const, content: options.prompt }] : []
   const messages = systemPrompt ? [{ role: 'system' as const, content: systemPrompt }, ...history, ...continuation] : [...history, ...continuation]
 

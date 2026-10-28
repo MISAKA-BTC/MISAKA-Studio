@@ -258,12 +258,20 @@ impl AppState {
                 return;
             }
 
-            let spec = misaka_studio_core::palw::default_class();
+            let spec = misaka_studio_core::palw::default_class_for(settings.node.network);
             let misaka_studio_core::palw::PalwArtifactSource::Download { filename, repo_path, sha256, size_bytes, hf_repo, .. } =
                 &spec.artifact
             else {
                 // A class with no published artifact cannot be preinstalled, and inventing a
-                // conversion the user did not ask for is not the fallback.
+                // conversion the user did not ask for is not the fallback. Said, not swallowed:
+                // testnet-12's default is such a class, and a setting that is on and does nothing
+                // is the question this line answers.
+                if let misaka_studio_core::palw::PalwArtifactSource::ConvertLocally { convert_command, .. } = &spec.artifact {
+                    tracing::info!(
+                        "{} publishes no download, so there is nothing to install on first run; convert it with `{convert_command}` and put the file in the models directory",
+                        spec.name
+                    );
+                }
                 return;
             };
 
@@ -837,17 +845,20 @@ impl AppState {
             let mut text = String::new();
             let mut first_token: Option<Duration> = None;
             let mut usage = Usage::default();
+            let mut stopped_for_repetition = false;
 
             while let Some(event) = match pending_first.take() {
                 Some(e) => Some(e),
                 None => inner.next().await,
             } {
+                let mut is_delta = false;
                 match &event {
                     Ok(StreamEvent::Delta(delta)) => {
                         if first_token.is_none() {
                             first_token = Some(started.elapsed());
                         }
                         text.push_str(delta);
+                        is_delta = true;
                     }
                     // **Reasoning is streamed and never committed.** `text` — what the output
                     // commitment and the inference hash are derived from — is the answer alone, so a
@@ -866,6 +877,32 @@ impl AppState {
                 if tx.send(event).await.is_err() {
                     break; // client hung up
                 }
+                // **Caught while it is still streaming, not after.** A backend with no anti-
+                // repetition mechanism and no `stop` support (the misaka gateway/serve backends —
+                // see `crate::repetition`) runs a loop all the way to `max_tokens`; this ends it as
+                // soon as the same rule `ui/src/lib/history.ts` uses to keep a finished loop out of
+                // future context can already see one. Dropping `inner` below cancels the backend's
+                // stream — the engine stops computing a reply nobody will read. Checked before
+                // `event` moved into `tx.send` above, not after — `event` cannot be read back.
+                if is_delta && crate::repetition::loops(&text) {
+                    stopped_for_repetition = true;
+                    // No backend `Done` arrives on this path, so `usage` is still its default;
+                    // an estimate is what a person reading "N tokens" wants, not a billed figure —
+                    // nothing here is priced or committed (see `crate::repetition`'s module doc).
+                    let completion_tokens = crate::context::tokens::estimate_tokens(&text);
+                    usage = Usage { prompt_tokens: 0, completion_tokens, total_tokens: completion_tokens };
+                    let synthetic = StreamEvent::Done { usage, finish_reason: "repetition".to_string() };
+                    let _ = tx.send(Ok(synthetic)).await;
+                    break;
+                }
+            }
+            drop(inner); // after the loop, always: cancels the backend's stream on every exit path
+            if stopped_for_repetition {
+                tracing::info!(
+                    model = %state.model.id,
+                    chars = text.chars().count(),
+                    "stopped a streaming reply for repetition instead of running to max_tokens"
+                );
             }
 
             let duration_ms = started.elapsed().as_millis() as u64;
@@ -1177,9 +1214,7 @@ pub fn build_backend_kind(kind: BackendKind, settings: &Settings, hardware: &Har
         // The integer runtime, driven through the same child-engine supervisor as the others. It
         // refuses rather than substituting when its server is missing: a record naming MISAKA must
         // come from the MISAKA runtime.
-        BackendKind::Gateway => Arc::new(crate::backend::gateway::GatewayBackend::new(
-            crate::fp_stack::gateway_url(&settings.node),
-        )),
+        BackendKind::Gateway => Arc::new(crate::backend::gateway::GatewayBackend::new(crate::fp_stack::gateway_url(&settings.node))),
         BackendKind::Misaka => Arc::new(MisakaBackend::new(
             settings.backend.misaka_serve_path.clone(),
             settings.backend.misaka_tokenizer_path.clone(),

@@ -374,5 +374,3 @@ function ClassCard({
     </div>
   )
 }
-
-

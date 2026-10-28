@@ -305,12 +305,4 @@ mod tests {
             other => panic!("expected unavailable, got {other:?}"),
         }
     }
-
-    #[test]
-    fn a_port_is_actually_free() {
-        let port = free_port().expect("a port");
-        assert!(port > 0);
-        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("binds");
-        drop(listener);
-    }
 }

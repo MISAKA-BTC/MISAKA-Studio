@@ -268,7 +268,9 @@ pub async fn preflight(settings: &NodeSettings, data_dir: &Path) -> Preflight {
     let skew = daas.iter().max().zip(daas.iter().min()).map(|(a, b)| a - b).unwrap_or(0);
     let quorum = answered.len() >= 2 && on_network && skew <= MAX_DAA_SKEW;
     if json_urls.is_empty() {
-        problems.push("the configured remote.rpc has no JSON twin; the Studio cannot read those nodes — the miner checks them itself".into());
+        problems.push(
+            "the configured remote.rpc has no JSON twin; the Studio cannot read those nodes — the miner checks them itself".into(),
+        );
     } else if answered.len() < 2 {
         problems.push(format!("{} of {} nodes answered; the miner needs two", answered.len(), json_urls.len()));
     }
@@ -588,10 +590,7 @@ mod tests {
         assert!(bin.ends_with("palw-remote-miner"));
         let line = args.join(" ");
         assert!(line.contains("--network testnet-12"), "{line}");
-        assert!(
-            line.contains("--rpc wss://wallet.misakascan.com/t12/wrpc/borsh,wss://llm.misakascan.com/t12/wrpc/borsh"),
-            "{line}"
-        );
+        assert!(line.contains("--rpc wss://wallet.misakascan.com/t12/wrpc/borsh,wss://llm.misakascan.com/t12/wrpc/borsh"), "{line}");
         let floor = GENESIS_CLASSES.iter().find(|c| c.is_base).unwrap();
         assert!(line.contains(&format!("--class {}", floor.class_id_hex)));
         assert!(line.contains(&format!("--artifact-root {}", floor.artifact_root_hex)));

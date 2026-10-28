@@ -43,7 +43,9 @@ async fn view(state: &AppState) -> MiningQueueView {
     let gateway_url = Some(crate::fp_stack::gateway_url(&settings.node));
     let stack_running = state.prompt_stack.view(&settings.node, &state.data_dir, None).await.gateway.running;
     let (background_available, background_blocker) = match (stack_running, state.local_engine_for_loaded_model().await) {
-        (false, _) => (false, Some("prompt mining is not running — start it in the Network tab (Prompt mining — no node)".to_string())),
+        (false, _) => {
+            (false, Some("prompt mining is not running — start it in the Network tab (Prompt mining — no node)".to_string()))
+        }
         (true, Err(why)) => (false, Some(why)),
         (true, Ok(())) => (true, None),
     };

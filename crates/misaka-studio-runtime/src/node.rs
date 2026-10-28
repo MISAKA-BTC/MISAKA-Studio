@@ -194,7 +194,9 @@ pub async fn spendable_sompi(network: NodeNetwork, address: &str) -> Result<u64>
     for entry in utxos.get("entries").and_then(Value::as_array).into_iter().flatten() {
         let utxo = entry.get("utxoEntry").unwrap_or(entry);
         let coinbase = utxo.get("isCoinbase").and_then(Value::as_bool).unwrap_or(false);
-        if !coinbase || number(utxo.get("blockDaaScore")).saturating_add(misaka_studio_core::palw::COINBASE_MATURITY_DAA) <= virtual_daa {
+        if !coinbase
+            || number(utxo.get("blockDaaScore")).saturating_add(misaka_studio_core::palw::COINBASE_MATURITY_DAA) <= virtual_daa
+        {
             total = total.saturating_add(number(utxo.get("amount")));
         }
     }
@@ -240,7 +242,6 @@ pub(crate) fn heartbeat_stand_down_secs(sink_algo_id: u8) -> Option<u64> {
         _ => None,
     }
 }
-
 
 #[cfg(test)]
 mod tests {

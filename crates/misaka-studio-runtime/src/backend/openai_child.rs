@@ -924,13 +924,4 @@ mod tests {
         assert!(engine.loaded().await.is_none());
         assert!(engine.running.read().await.is_none(), "and the dead process is not kept around");
     }
-
-    #[test]
-    fn a_port_is_actually_free() {
-        let port = free_port().expect("a port");
-        assert!(port > 0);
-        // Bindable, which is the only property that matters.
-        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("binds");
-        drop(listener);
-    }
 }

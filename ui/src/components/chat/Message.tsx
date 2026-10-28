@@ -25,7 +25,7 @@ export type TranscriptActions = {
   startEdit: (id: string) => void
   cancelEdit: () => void
   saveEdit: (id: string, content: string) => void
-  regenerate: () => void
+  regenerate: (hint?: boolean) => void
   continueReply: () => void
 }
 
@@ -244,9 +244,9 @@ function AssistantMessage({ message, agent, last, generating, live, showAvatar, 
               <button
                 type="button"
                 className="-my-0.5 shrink-0 rounded-md border border-red-300 px-2 py-0.5 font-medium hover:bg-red-100 dark:border-red-800 dark:hover:bg-red-950/60"
-                onClick={actions.regenerate}
+                onClick={() => actions.regenerate(message.context?.backend === 'gateway' || message.context?.backend === 'misaka')}
               >
-                Retry
+                {message.context?.backend === 'gateway' || message.context?.backend === 'misaka' ? '要点を絞って再生成' : 'Retry'}
               </button>
             )}
           </div>
@@ -255,7 +255,7 @@ function AssistantMessage({ message, agent, last, generating, live, showAvatar, 
         {!streaming && (
           <ActionRow align="start" visible={last}>
             {answer && <CopyButton text={answer} label="Copy reply" className="icon-btn" />}
-            {canAct && <ActionButton icon="refresh" label="Regenerate" onClick={actions.regenerate} />}
+            {canAct && <ActionButton icon="refresh" label="Regenerate" onClick={() => actions.regenerate(message.context?.backend === 'gateway' || message.context?.backend === 'misaka')} />}
             {canAct && cut && !agent && (
               <ActionButton icon="arrowRight" label="Continue the cut-off reply" onClick={actions.continueReply}>
                 {answer.trim() ? 'Continue' : '回答を生成'}

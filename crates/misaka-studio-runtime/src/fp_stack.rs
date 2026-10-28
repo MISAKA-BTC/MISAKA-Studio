@@ -48,7 +48,11 @@ pub fn public_evidence_provider(network: NodeNetwork) -> Option<&'static str> {
 /// Where the chat and the mining queue reach the gateway: `node.palw_gateway_url` when set, else the gateway this Studio
 /// runs itself, at its listen address.
 pub fn gateway_url(settings: &NodeSettings) -> String {
-    settings.palw_gateway_url.clone().filter(|u| !u.trim().is_empty()).unwrap_or_else(|| format!("http://{}", settings.free_prompt.listen))
+    settings
+        .palw_gateway_url
+        .clone()
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| format!("http://{}", settings.free_prompt.listen))
 }
 
 /// Every path the stack runs on, resolved once from the settings.
@@ -117,7 +121,9 @@ pub fn identity_command(settings: &NodeSettings, p: &StackPaths) -> Result<Vec<S
 }
 
 /// The gateway's command line and the environment its worker reads.
-pub fn gateway_command(settings: &NodeSettings, p: &StackPaths) -> Result<(Vec<String>, Vec<(String, String)>)> {
+pub type GatewayCommand = (Vec<String>, Vec<(String, String)>);
+
+pub fn gateway_command(settings: &NodeSettings, p: &StackPaths) -> Result<GatewayCommand> {
     let artifact = need(&p.artifact, "the class artifact is missing — download qwen25-1.5b-a16-8k.palwart (Models → Discover)")?;
     let tokenizer = need(&p.tokenizer, "the class tokenizer is missing — it downloads beside the artifact")?;
     let rpc = need(&p.rpc, "this network publishes no public wRPC — set node.misaka_rpc")?;
@@ -150,8 +156,14 @@ pub fn gateway_command(settings: &NodeSettings, p: &StackPaths) -> Result<(Vec<S
 pub fn rail_command(settings: &NodeSettings, p: &StackPaths) -> Result<Vec<String>> {
     let key = need(&p.key, "a bond key is required — mint one here or set node.producer_key_path (`misaka key gen`)")?;
     let rpc = need(&p.rpc, "this network publishes no public wRPC — set node.misaka_rpc")?;
-    let mut args =
-        vec!["--watch".into(), p.outbox.display().to_string(), "--bond-key-seed".into(), key.display().to_string(), "--rpc".into(), rpc.clone()];
+    let mut args = vec![
+        "--watch".into(),
+        p.outbox.display().to_string(),
+        "--bond-key-seed".into(),
+        key.display().to_string(),
+        "--rpc".into(),
+        rpc.clone(),
+    ];
     if let Some(bond) = settings.free_prompt.bond.as_deref().filter(|b| !b.trim().is_empty()) {
         args.extend(["--bond".into(), bond.trim().into()]);
     }
@@ -231,7 +243,16 @@ pub async fn preflight(settings: &NodeSettings, data_dir: &Path, default_artifac
             p.evidence_provider.as_deref().unwrap_or("(none)")
         ));
     }
-    StackPreflight { paths: p, binaries, artifact_present, tokenizer_present, key_present, public_node, evidence_provider_reachable, problems }
+    StackPreflight {
+        paths: p,
+        binaries,
+        artifact_present,
+        tokenizer_present,
+        key_present,
+        public_node,
+        evidence_provider_reachable,
+        problems,
+    }
 }
 
 struct Child {
@@ -306,9 +327,11 @@ impl FreePromptStack {
         }
         // The identity names the class, bond and operator the gateway is accountable to; read fresh at every start so a new
         // bond or key cannot leave a stale one behind.
-        let out = tokio::process::Command::new(&p.rail).args(&identity_args).output().await.map_err(|e| Error::Node {
-            message: format!("could not run {}: {e}", p.rail.display()),
-        })?;
+        let out = tokio::process::Command::new(&p.rail)
+            .args(&identity_args)
+            .output()
+            .await
+            .map_err(|e| Error::Node { message: format!("could not run {}: {e}", p.rail.display()) })?;
         if !out.status.success() {
             return Err(Error::Node {
                 message: format!("the rail could not read the identity: {}", String::from_utf8_lossy(&out.stderr).trim()),
@@ -358,7 +381,9 @@ impl FreePromptStack {
         match guard.as_mut() {
             Some(c) => match c.child.try_wait() {
                 Ok(None) => ProcessView { running: true, exited: None, command_line: Some(c.command_line.clone()) },
-                Ok(Some(status)) => ProcessView { running: false, exited: Some(status.to_string()), command_line: Some(c.command_line.clone()) },
+                Ok(Some(status)) => {
+                    ProcessView { running: false, exited: Some(status.to_string()), command_line: Some(c.command_line.clone()) }
+                }
                 Err(e) => ProcessView { running: false, exited: Some(e.to_string()), command_line: Some(c.command_line.clone()) },
             },
             None => ProcessView { running: false, exited: None, command_line: None },
@@ -374,7 +399,8 @@ impl FreePromptStack {
         .map_err(|e| e.to_string());
         let (gateway_log, rail_log, carriers) = {
             let l = self.logs.lock().expect("log lock");
-            let tail = |q: &VecDeque<String>| q.iter().rev().take(80).cloned().collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>();
+            let tail =
+                |q: &VecDeque<String>| q.iter().rev().take(80).cloned().collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>();
             (tail(&l.gateway), tail(&l.rail), l.carriers.iter().cloned().collect())
         };
         StackView {
@@ -435,7 +461,8 @@ mod tests {
     use super::*;
 
     fn ready() -> NodeSettings {
-        let mut s = NodeSettings { network: NodeNetwork::Testnet12, producer_key_path: Some("/keys/bond.seed".into()), ..Default::default() };
+        let mut s =
+            NodeSettings { network: NodeNetwork::Testnet12, producer_key_path: Some("/keys/bond.seed".into()), ..Default::default() };
         s.free_prompt.accept_unverified = true;
         s
     }

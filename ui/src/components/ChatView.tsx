@@ -181,7 +181,7 @@ export function ChatView() {
         }
         void studio.editMessage(id, content)
       },
-      regenerate: () => {
+      regenerate: (hint = false) => {
         const { conversation: thread, generating: busy } = latest.current
         if (!thread || busy) return
         if (busyElsewhere(thread.id)) return toast(elsewhere)
@@ -193,7 +193,7 @@ export function ChatView() {
           if (original) void rerunAgent(thread, index, original.content)
           return
         }
-        void useStudio.getState().regenerate()
+        void useStudio.getState().regenerate(hint)
       },
       continueReply: () => {
         const { conversation: thread, generating: busy } = latest.current
