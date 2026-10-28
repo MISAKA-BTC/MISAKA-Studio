@@ -53,22 +53,15 @@ pub struct GatewayFacts {
 
 pub struct GatewayBackend {
     url: String,
-    /// A pool slot's token, when the gateway is reached through the pool that hosts it.
-    ///
-    /// Sent as a header, never in the URL: a pool gateway sits behind an HTTPS proxy, and a secret
-    /// in a query string is a secret in every access log between here and the slot. A gateway on
-    /// this machine needs none — which is why this is an option rather than a requirement.
-    token: Option<String>,
     http: reqwest::Client,
     loaded: RwLock<Option<LoadedModel>>,
     facts: RwLock<Option<GatewayFacts>>,
 }
 
 impl GatewayBackend {
-    pub fn new(url: String, token: Option<String>) -> Self {
+    pub fn new(url: String) -> Self {
         GatewayBackend {
             url: url.trim_end_matches('/').to_string(),
-            token: token.filter(|t| !t.is_empty()),
             // No overall timeout: one free-prompt inference is a whole model over a real prompt and
             // legitimately runs for minutes. The connect timeout still makes a dead gateway quick.
             http: reqwest::Client::builder().connect_timeout(Duration::from_secs(5)).build().expect("http client builds"),
@@ -82,10 +75,7 @@ impl GatewayBackend {
     }
 
     async fn health(&self) -> std::result::Result<GatewayFacts, String> {
-        let mut request = self.http.get(format!("{}/health", self.url)).timeout(Duration::from_secs(10));
-        if let Some(token) = &self.token {
-            request = request.header("x-pool-token", token);
-        }
+        let request = self.http.get(format!("{}/health", self.url)).timeout(Duration::from_secs(10));
         let response = request.send().await.map_err(|e| format!("{}: {e}", self.url))?;
         if !response.status().is_success() {
             return Err(format!("{} answered {}", self.url, response.status()));
@@ -241,9 +231,8 @@ impl InferenceBackend for GatewayBackend {
             let messages: Vec<serde_json::Value> =
                 request.messages.iter().map(|m| serde_json::json!({ "role": m.role, "content": m.content })).collect();
             let http = self.http.clone();
-            let token = self.token.clone();
             let send = move |ceiling: u64| {
-                let (http, token, url, messages) = (http.clone(), token.clone(), url.clone(), messages.clone());
+                let (http, url, messages) = (http.clone(), url.clone(), messages.clone());
                 async move {
                     let body = serde_json::json!({
                         "model": "misaka-palw-fp-v3",
@@ -251,10 +240,7 @@ impl InferenceBackend for GatewayBackend {
                         "max_tokens": ceiling,
                         "stream": true,
                     });
-                    let mut request = http.post(&url).json(&body);
-                    if let Some(token) = &token {
-                        request = request.header("x-pool-token", token);
-                    }
+                    let request = http.post(&url).json(&body);
                     let response = request.send().await.map_err(|e| Error::Engine {
                         backend: NAME,
                         message: format!("the gateway did not accept the request: {e}"),

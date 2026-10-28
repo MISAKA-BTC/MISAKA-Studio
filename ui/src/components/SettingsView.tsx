@@ -8,13 +8,33 @@
 // an API key is refused by the runtime (it would be an open inference endpoint), and keeping
 // transcripts is off by default and says exactly what it does before it is turned on.
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api } from '../lib/api'
 import { bytes } from '../lib/format'
 import type { BackendInfo, Settings } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { Field, Icon, Section, Toggle } from './common'
 import { EnginePanel } from './EnginePanel'
+
+const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+
+/** `draft` moved from `from` onto `to`: a field the person has not touched follows `to`, a field
+ *  they edited keeps their edit. Two levels deep, which is where every setting lives. */
+function rebase(draft: Settings, from: Settings, to: Settings): Settings {
+  const out: Record<string, unknown> = { ...draft }
+  const d = draft as unknown as Record<string, unknown>
+  const f = from as unknown as Record<string, unknown>
+  for (const [key, next] of Object.entries(to as unknown as Record<string, unknown>)) {
+    if (same(d[key], f[key])) out[key] = next
+    else if (isRecord(d[key]) && isRecord(f[key]) && isRecord(next)) {
+      const inner: Record<string, unknown> = { ...(d[key] as Record<string, unknown>) }
+      for (const [k, v] of Object.entries(next)) if (same((d[key] as Record<string, unknown>)[k], (f[key] as Record<string, unknown>)[k])) inner[k] = v
+      out[key] = inner
+    }
+  }
+  return out as unknown as Settings
+}
 
 export function SettingsView() {
   const settings = useStudio((s) => s.settings)
@@ -24,7 +44,15 @@ export function SettingsView() {
   const [draft, setDraft] = useState<Settings | null>(settings)
   const [backends, setBackends] = useState<BackendInfo[]>([])
 
-  useEffect(() => setDraft(settings), [settings])
+  // Settings also change from outside this page — the theme from the sidebar or the palette, the
+  // mining mode from its switch. Replacing the draft with them threw away whatever was being typed
+  // here; rebasing keeps the edits and takes everything else from the saved settings.
+  const base = useRef(settings)
+  useEffect(() => {
+    const from = base.current
+    base.current = settings
+    setDraft((current) => (current && from && settings ? rebase(current, from, settings) : settings))
+  }, [settings])
   useEffect(() => {
     api.backends().then(setBackends).catch(() => setBackends([]))
   }, [])

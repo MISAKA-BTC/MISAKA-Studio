@@ -158,4 +158,64 @@
   .mono {
     font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
   }
+
+  /* --- The Cursor-style shell's shared pieces (components/ui.tsx draws them) --- */
+
+  /* A square, quiet icon button: toolbars, the sidebar header, message actions. */
+  .icon-btn {
+    @apply inline-flex size-7 shrink-0 items-center justify-center rounded-md text-ink-500 transition-colors
+      hover:bg-ink-100 hover:text-ink-800 disabled:pointer-events-none disabled:opacity-40
+      dark:text-ink-400 dark:hover:bg-ink-800 dark:hover:text-ink-100;
+  }
+
+  /* A compact labelled control in a toolbar: the model picker, the mining chip, the workspace. */
+  /* Grouped, like the buttons above: `@apply` composes utilities, not classes from this layer. */
+  .chip,
+  .chip-outline {
+    @apply inline-flex h-7 max-w-full items-center gap-1.5 rounded-md px-2 text-xs font-medium text-ink-600 transition-colors
+      hover:bg-ink-100 hover:text-ink-900 disabled:pointer-events-none disabled:opacity-50
+      dark:text-ink-300 dark:hover:bg-ink-800 dark:hover:text-ink-50;
+  }
+  .chip-outline {
+    @apply border border-ink-200 dark:border-ink-700;
+  }
+
+  .kbd {
+    @apply inline-flex h-[1.15rem] min-w-[1.15rem] items-center justify-center rounded border border-ink-200 bg-ink-50 px-1
+      font-sans text-[0.65rem] font-medium leading-none text-ink-500
+      dark:border-ink-700 dark:bg-ink-800 dark:text-ink-400;
+  }
+
+  /* Popovers and menus. `.menu` is the panel; items highlight on hover and on keyboard focus. */
+  .menu {
+    @apply min-w-52 rounded-xl border border-ink-200 bg-white p-1 text-sm text-ink-800 shadow-xl shadow-ink-950/10
+      dark:border-ink-700 dark:bg-ink-850 dark:text-ink-100 dark:shadow-black/40;
+  }
+  .menu-item {
+    @apply flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[0.8rem] text-ink-700 outline-none
+      hover:bg-ink-100 focus-visible:bg-ink-100 disabled:pointer-events-none disabled:opacity-40
+      data-[active=true]:bg-ink-100
+      dark:text-ink-200 dark:hover:bg-ink-800 dark:focus-visible:bg-ink-800 dark:data-[active=true]:bg-ink-800;
+  }
+  .menu-label {
+    @apply px-2.5 pb-1 pt-2 text-[0.65rem] font-semibold uppercase tracking-wide text-ink-400 dark:text-ink-500;
+  }
+  .menu-sep {
+    @apply my-1 h-px bg-ink-200 dark:bg-ink-700;
+  }
+
+  .pop-in {
+    animation: pop-in 120ms ease-out;
+  }
+}
+
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(-2px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }

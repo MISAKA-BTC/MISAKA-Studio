@@ -20,6 +20,7 @@ misaka-studio-core.workspace = true
 
 anyhow.workspace = true
 axum.workspace = true
+base64.workspace = true
 bytes.workspace = true
 clap.workspace = true
 futures-util.workspace = true
@@ -44,6 +45,17 @@ tar = "0.4.46"
 flate2 = "1.1.10"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+# The coding agent's workspace API (src/workspace.rs): ripgrep's own walker, so .gitignore, .ignore
+# and the global excludes mean what they mean to `rg` and `git`; its regex engine for search; and
+# globset for the search's file filter.
+ignore = "0.4"
+regex = "1"
+globset = "0.4"
+
+# `exec` puts each command in its own session and kills the whole process group on a timeout —
+# `setsid` and `killpg`, which std does not expose. Already in the lockfile through tokio.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

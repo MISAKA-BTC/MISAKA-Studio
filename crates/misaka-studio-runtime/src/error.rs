@@ -40,6 +40,12 @@ pub enum Error {
     #[error("{message}")]
     BadRequest { message: String },
 
+    /// The request is well-formed and will not be served to whoever sent it — the workspace API
+    /// refusing a foreign origin, a non-loopback Host, or a runtime bound to the network. A 403
+    /// rather than a 400 because no change to the body makes it acceptable; the caller is wrong.
+    #[error("{message}")]
+    Forbidden { message: String },
+
     #[error("{path}: {source}")]
     Io {
         path: String,
@@ -77,6 +83,7 @@ impl Error {
             Error::NoModelLoaded | Error::BackendUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Error::ModelNotFound { .. } => StatusCode::NOT_FOUND,
             Error::BadRequest { .. } => StatusCode::BAD_REQUEST,
+            Error::Forbidden { .. } => StatusCode::FORBIDDEN,
             Error::Catalog { .. } => StatusCode::BAD_GATEWAY,
             Error::Node { .. } => StatusCode::BAD_GATEWAY,
             Error::Cancelled => StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
@@ -88,6 +95,7 @@ impl Error {
     pub fn openai_type(&self) -> &'static str {
         match self {
             Error::BadRequest { .. } => "invalid_request_error",
+            Error::Forbidden { .. } => "permission_error",
             Error::ModelNotFound { .. } => "model_not_found",
             Error::NoModelLoaded | Error::BackendUnavailable { .. } => "service_unavailable",
             _ => "server_error",
@@ -118,6 +126,7 @@ impl IntoResponse for Error {
                 code: match &self {
                     Error::ModelNotFound { .. } => Some("model_not_found".into()),
                     Error::NoModelLoaded => Some("no_model_loaded".into()),
+                    Error::Forbidden { .. } => Some("forbidden".into()),
                     _ => None,
                 },
             },
@@ -137,6 +146,8 @@ mod tests {
         assert_eq!(Error::NoModelLoaded.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(Error::ModelNotFound { id: "x".into() }.status(), StatusCode::NOT_FOUND);
         assert_eq!(Error::bad_request("nope").status(), StatusCode::BAD_REQUEST);
+        assert_eq!(Error::Forbidden { message: "no".into() }.status(), StatusCode::FORBIDDEN);
+        assert_eq!(Error::Forbidden { message: "no".into() }.openai_type(), "permission_error");
     }
 
     #[test]

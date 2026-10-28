@@ -7,8 +7,8 @@
 //!    line, which becomes the curve's reserve and is locked for good (ADR-0090).
 //!
 //! Neither is something this app can do on the user's behalf by pretending. Registration is a
-//! node's act (`kaspad --palw-register-class`, needing an active bond, its key and a funded fee
-//! outpoint) and seeding spends a hundred thousand MSK. So what this module does is the honest
+//! bonded act the CLI files without a node (`misaka model add --export-bundle`, sign, submit through the public wRPC) and
+//! seeding spends a hundred thousand MSK. So what this module does is the honest
 //! half: it verifies the artifact the user actually has, reports the class the chain would
 //! adjudicate it as, and — for the seed — states the floor, the balance, and the difference,
 //! refusing rather than building a transaction that cannot pay.
@@ -44,7 +44,7 @@ pub const SEED_MIN_SOMPI: u64 = 100_000 * 100_000_000;
 pub struct SeedReadiness {
     /// The line the market would be keyed by. For a class's founding line this is the class id.
     pub line_id: Option<String>,
-    /// The address the seed would be paid from — the pool slot's, when one is joined.
+    /// The address the seed would be paid from — the Studio's own key's.
     pub from_address: Option<String>,
     /// What that address can spend right now, as the chain's own settlement rule allows.
     pub spendable_sompi: Option<u64>,
@@ -78,117 +78,19 @@ pub struct SeedOutcome {
     pub detail: String,
 }
 
-/// What registering this machine's artifact as a class needs, and which of it is in hand.
-///
-/// Registration is `kaspad --palw-register-class` — a node's act, not this app's — so the answer
-/// is a checklist rather than a promise. Each `false` here is a thing the node would refuse on at
-/// startup, named before the run instead of after it.
-#[derive(Debug, Serialize)]
-pub struct RegistrationReadiness {
-    /// The converted artifact this node would register. Registration is of a FILE.
-    pub artifact: Option<String>,
-    /// An active bond — registration is a bonded act, and the bond signs it.
-    pub bond: Option<String>,
-    /// The outpoint that funds the carrier the registration rides in.
-    pub fee_outpoint: Option<String>,
-    /// The producer key. Present as a path only; the file is the node's to open.
-    pub has_key: bool,
-    /// True once every prerequisite above is in hand.
-    pub can_register: bool,
-    /// Present when `can_register` is false: what is missing, in one sentence.
-    pub blocked_because: Option<String>,
-    /// True while a registration is armed for the next node start.
-    pub armed: bool,
-    /// The command line this would run, so a person can read it — or run it themselves.
-    pub command: Vec<String>,
-}
 
-/// Arm a class registration. The model id is optional and usually empty.
-#[derive(Debug, Deserialize, Default)]
-pub struct RegisterRequest {
-    /// e.g. `Qwen/Qwen2.5-Coder-1.5B-Instruct`. Needed only when the artifact's converted shape
-    /// matches more than one class this build knows.
-    #[serde(default)]
-    pub model_id: Option<String>,
-}
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/seed-readiness", get(seed_readiness))
         .route("/seed", post(seed))
-        .route("/registration", get(registration))
-        .route("/register-class", post(register_class))
 }
 
-/// `GET /api/v1/network/model-market/registration`
-pub async fn registration(State(state): State<Arc<AppState>>) -> Result<Json<RegistrationReadiness>> {
-    let settings = state.settings.read().await.clone();
-    let node = &settings.node;
-    let artifact = node.class_artifact.clone().map(|p| p.display().to_string());
-    let missing = if artifact.is_none() {
-        Some(
-            "no class artifact is configured, and a registration registers a file. Convert a model \
-             to a `.palwart` and point node.class_artifact at it.",
-        )
-    } else if node.producer_bond.is_none() {
-        Some(
-            "registering is a bonded act and this node has no bond. Start as a producer once with no \
-             bond set — that run registers one — then come back.",
-        )
-    } else if node.fee_outpoint.is_none() {
-        Some(
-            "no fee outpoint funds the carrier the registration rides in. The bond registration run \
-             prints one (usually the bond carrier's change, `<txid>:1`).",
-        )
-    } else if node.producer_key_path.is_none() {
-        Some("no producer key is set, and the bond signs the registration with it.")
-    } else {
-        None
-    };
-
-    // Built from the same function the node is actually launched with, so what is shown and what
-    // would run cannot drift apart.
-    let mut armed_settings = node.clone();
-    armed_settings.role = misaka_studio_core::settings::NetworkRole::Producer;
-    // The armed value when one is armed, so the line shown is the line that would run. A preview
-    // that drops the model id is a preview of a different command, and the id is exactly the part
-    // a person added by hand because the artifact alone was ambiguous.
-    armed_settings.register_class = Some(node.register_class.clone().unwrap_or_default());
-    let command = crate::node::NodeManager::build_args(&armed_settings, crate::node::default_json_rpc_port(node.network))
-        .unwrap_or_else(|_| Vec::new());
-
-    Ok(Json(RegistrationReadiness {
-        artifact,
-        bond: node.producer_bond.clone(),
-        fee_outpoint: node.fee_outpoint.clone(),
-        has_key: node.producer_key_path.is_some(),
-        can_register: missing.is_none(),
-        blocked_because: missing.map(str::to_string),
-        armed: node.register_class.is_some(),
-        command,
-    }))
-}
-
-/// `POST /api/v1/network/model-market/register-class`
-///
-/// Arms the registration; the next producer start files it and disarms. Deliberately not a
-/// "register now" that restarts the node behind the user's back — a running node holds the
-/// appdir, and stopping it is a decision with its own consequences.
-pub async fn register_class(
-    State(state): State<Arc<AppState>>,
-    body: Option<Json<RegisterRequest>>,
-) -> Result<Json<RegistrationReadiness>> {
-    let ready = registration(State(state.clone())).await?.0;
-    if !ready.can_register {
-        return Err(Error::BadRequest {
-            message: ready.blocked_because.unwrap_or_else(|| "this node cannot register a class right now.".into()),
-        });
-    }
-    let model_id = body.and_then(|Json(b)| b.model_id).unwrap_or_default();
-    let mut next = state.settings.read().await.clone();
-    next.node.register_class = Some(model_id);
-    state.apply_settings(next).await?;
-    registration(State(state)).await
+/// Who pays a seed and what it can spend: the Studio's own key, read through the public node.
+struct SeedFunding {
+    address: String,
+    line_id: Option<String>,
+    spendable_sompi: Option<u64>,
 }
 
 /// `GET /api/v1/network/model-market/seed-readiness`
@@ -196,51 +98,55 @@ pub async fn register_class(
 /// Answers the question the button needs answered before it is drawn: may this person open a
 /// market, and if not, by how much are they short?
 pub async fn seed_readiness(State(state): State<Arc<AppState>>) -> Result<Json<SeedReadiness>> {
-    let slot = crate::api::pool::joined_slot(&state).await;
-    let Some(slot) = slot else {
-        return Ok(Json(SeedReadiness {
-            line_id: None,
-            from_address: None,
-            spendable_sompi: None,
-            seed_min_sompi: SEED_MIN_SOMPI,
-            short_by_sompi: None,
-            can_seed: false,
-            blocked_because: Some(
-                "no pool slot is joined, so this app holds no key that could pay a seed. Join for \
-                 prompt mining on the Network tab, or seed from a node you run yourself."
-                    .into(),
-            ),
-            already_seeded: None,
-        }));
+    let not_ready = |why: String| SeedReadiness {
+        line_id: None,
+        from_address: None,
+        spendable_sompi: None,
+        seed_min_sompi: SEED_MIN_SOMPI,
+        short_by_sompi: None,
+        can_seed: false,
+        blocked_because: Some(why),
+        already_seeded: None,
+    };
+    let node = state.settings.read().await.node.clone();
+    // **The Studio's own key pays the seed** — the key the node-free miner's bond is registered under (Network and key).
+    let Some(key) = node.producer_key_path.clone().filter(|k| k.is_file()) else {
+        return Ok(Json(not_ready(
+            "this Studio has no key file, so nothing here could pay a seed. Mint or name one in Network and key.".into(),
+        )));
+    };
+    let address = match crate::node::key_address(&node, &key).await {
+        Ok(a) => a,
+        Err(e) => return Ok(Json(not_ready(format!("the key's address could not be derived: {e}")))),
+    };
+    let funding = SeedFunding {
+        // The line a seed would open: the founding line of the class this Studio mines, keyed by its class id.
+        line_id: Some(misaka_studio_core::palw::default_class().class_id_hex.to_string()),
+        spendable_sompi: crate::node::spendable_sompi(node.network, &address).await.ok(),
+        address,
     };
 
     // Asked of the chain through the same CLI that would sign, so the button and the transaction
     // read one source. A line already seeded cannot be seeded again, and finding that out from a
     // rejected transaction is finding it out too late.
-    let opened = match &slot.line_id {
+    let opened = match &funding.line_id {
         Some(line) => {
             let (cli_path, rpc, network) = {
                 let settings = state.settings.read().await;
-                (settings.node.misaka_cli_path.clone(), settings.node.misaka_rpc.clone(), settings.node.network.id())
+                (settings.node.misaka_cli_path.clone(), crate::node::borsh_endpoint(&settings.node), settings.node.network.id())
             };
             market_is_open(&state, line, cli_path.as_ref(), rpc.as_ref(), network).await
         }
         None => None,
     };
 
-    let spendable = slot.spendable_sompi;
+    let spendable = funding.spendable_sompi;
     let short = spendable.map(|s| SEED_MIN_SOMPI.saturating_sub(s));
     let enough = short == Some(0);
     let blocked = if opened == Some(true) {
         Some("this line's market is already open — a line is seeded once, by design.".to_string())
-    } else if slot.line_id.is_none() {
-        Some(
-            "this slot mines the floor, which has no model line to seed. A market is opened on a \
-             model class's line; join for prompt mining, or name the line from a node you run."
-                .to_string(),
-        )
     } else if spendable.is_none() {
-        Some("the pool could not be asked what this address can spend, so the floor cannot be checked.".to_string())
+        Some("the public node could not be asked what this address can spend, so the floor cannot be checked.".to_string())
     } else if !enough {
         Some(format!(
             "the seed floor is {} MSK and this address can spend {} MSK — short by {} MSK. The seed \
@@ -254,8 +160,8 @@ pub async fn seed_readiness(State(state): State<Arc<AppState>>) -> Result<Json<S
     };
 
     Ok(Json(SeedReadiness {
-        line_id: slot.line_id,
-        from_address: Some(slot.address),
+        line_id: funding.line_id,
+        from_address: Some(funding.address),
         spendable_sompi: spendable,
         seed_min_sompi: SEED_MIN_SOMPI,
         short_by_sompi: short,
@@ -307,18 +213,16 @@ pub async fn seed(State(state): State<Arc<AppState>>, Json(request): Json<SeedRe
     // `misaka palw model-seed` already builds the ModelSeed object, binds it to a carrier it
     // funds from the key's own UTXOs, and signs with ML-DSA-87 — and it is the code the chain's
     // own tests cover. A second spelling of an irreversible transaction is a second thing that
-    // can be wrong about it, so this resolves that binary, hands it the slot's key, and repeats
+    // can be wrong about it, so this resolves that binary, hands it the Studio's key, and repeats
     // what it said. `--output json` rather than the human line: a txid scraped out of prose is a
     // txid that changes when someone improves the wording.
     let (cli_path, rpc, network) = {
         let settings = state.settings.read().await;
-        (settings.node.misaka_cli_path.clone(), settings.node.misaka_rpc.clone(), settings.node.network.id())
+        (settings.node.misaka_cli_path.clone(), crate::node::borsh_endpoint(&settings.node), settings.node.network.id())
     };
-    let binary = crate::node::NodeManager::resolve_misaka_cli(cli_path.as_ref());
-    let key_path = crate::api::pool::slot_seed_path(&state).await.ok_or_else(|| Error::BadRequest {
-        message: "this app holds no key file for the joined slot, so it cannot sign. The pool writes one \
-                  when you join; if it is gone, seed from a node you run yourself."
-            .into(),
+    let binary = crate::node::resolve_misaka_cli(cli_path.as_ref());
+    let key_path = state.settings.read().await.node.producer_key_path.clone().filter(|k| k.is_file()).ok_or_else(|| Error::BadRequest {
+        message: "this Studio has no key file, so it cannot sign. Mint or name one in Network and key.".into(),
     })?;
 
     let mut command = tokio::process::Command::new(&binary);
@@ -395,7 +299,7 @@ pub async fn seed(State(state): State<Arc<AppState>>, Json(request): Json<SeedRe
 /// chain's answer and signing for another.
 fn cli(state: &AppState, cli_path: Option<&std::path::PathBuf>, rpc: Option<&String>, network: &str) -> tokio::process::Command {
     let _ = state;
-    let mut command = tokio::process::Command::new(crate::node::NodeManager::resolve_misaka_cli(cli_path));
+    let mut command = tokio::process::Command::new(crate::node::resolve_misaka_cli(cli_path));
     command.arg("--network").arg(network).arg("--output").arg("json");
     if let Some(rpc) = rpc {
         command.arg("--rpc").arg(rpc);

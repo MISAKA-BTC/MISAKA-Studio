@@ -208,7 +208,9 @@ async fn main() -> anyhow::Result<()> {
     let parent_gone = args.exit_on_stdin_close.then(watch_stdin_eof);
     let shutdown_state = state.clone();
 
-    axum::serve(listener, app)
+    // With each connection's peer address, which the workspace API's guard checks: its routes
+    // answer this machine only, whatever `server.host` has been changed to since the bind.
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(async move {
             let signals = async {
                 // Both signals, because a desktop shell stopping its sidecar sends SIGTERM and a

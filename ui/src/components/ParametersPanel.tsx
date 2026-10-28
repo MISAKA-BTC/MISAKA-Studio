@@ -7,16 +7,20 @@
 // the panel says so.
 
 import { useEffect, useState } from 'react'
+import { api } from '../lib/api'
 import { tokens } from '../lib/format'
 import type { Settings } from '../lib/types'
 import { useStudio } from '../store/studio'
-import { Slider } from './common'
+import { useUi } from '../store/ui'
+import { Slider, Toggle } from './common'
 
 export function ParametersPanel() {
   const settings = useStudio((s) => s.settings)
   const saveSettings = useStudio((s) => s.saveSettings)
   const runtime = useStudio((s) => s.runtime)
   const models = useStudio((s) => s.models)
+  const thinking = useUi((s) => s.thinking)
+  const setThinking = useUi((s) => s.setThinking)
   const [draft, setDraft] = useState<Settings | null>(settings)
 
   useEffect(() => setDraft(settings), [settings])
@@ -33,8 +37,18 @@ export function ParametersPanel() {
 
   // Saved on release rather than on every drag: a PUT per slider pixel would rewrite the settings
   // file a hundred times a second.
+  //
+  // Only `generation` is this panel's, so only `generation` is written — onto the runtime's current
+  // settings, not the window's copy. That copy can be behind (the mining mode is switched through
+  // its own endpoint), and writing it back whole would switch the chat's engine, unloading the
+  // model, for a nudge of the temperature slider.
   const commit = () => {
-    if (draft && settings && JSON.stringify(draft.generation) !== JSON.stringify(settings.generation)) void saveSettings(draft)
+    if (!draft || !settings || JSON.stringify(draft.generation) === JSON.stringify(settings.generation)) return
+    const generation = draft.generation
+    void api
+      .settings()
+      .catch(() => settings)
+      .then((current) => saveSettings({ ...current, generation }))
   }
 
   return (
@@ -118,6 +132,19 @@ export function ParametersPanel() {
           </span>
         </label>
       </div>
+
+      {/* Not a setting the runtime stores: it rides on each request, so it is the window's own and
+          applies from the next message on. */}
+      <Toggle
+        label="Thinking"
+        checked={thinking}
+        onChange={setThinking}
+        hint={
+          thinking
+            ? 'Reasoning models think before they answer. Turn off to send thinking: false — a faster, shorter reply. Models that do not reason ignore it.'
+            : 'Off: each request sends thinking: false, asking reasoning models to answer without thinking first. Models that do not reason ignore it.'
+        }
+      />
     </div>
   )
 }

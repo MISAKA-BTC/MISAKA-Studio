@@ -159,6 +159,45 @@ impl Default for BackendSettings {
     }
 }
 
+/// Which engine runs image generation. A separate seam from [`BackendKind`]: a diffusion
+/// model is not a chat model, so it is not a value this enum's chat-shaped trait could carry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageBackendKind {
+    /// No image backend configured.
+    #[default]
+    None,
+    /// The `diffusers` sidecar (`sidecars/diffusion/server.py`), driven as a child process —
+    /// the same shape as `llama-server`/`mlx_lm.server` for chat.
+    Diffusion,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImageBackendSettings {
+    pub kind: ImageBackendKind,
+    /// The Python interpreter to run the sidecar with. `None` looks for `python3` on PATH.
+    pub python_path: Option<PathBuf>,
+    /// Path to `sidecars/diffusion/server.py`. `None` looks beside the Studio's own executable.
+    pub diffusion_server_path: Option<PathBuf>,
+    /// Device string passed to the sidecar's `/load` (`cuda`, `mps`, `cpu`).
+    pub device: Option<String>,
+    /// Seconds to wait for the sidecar to answer its health check.
+    pub startup_timeout_secs: u64,
+}
+
+impl Default for ImageBackendSettings {
+    fn default() -> Self {
+        ImageBackendSettings {
+            kind: ImageBackendKind::None,
+            python_path: None,
+            diffusion_server_path: None,
+            device: None,
+            startup_timeout_secs: 120,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerSettings {
@@ -214,13 +253,15 @@ impl Default for HuggingFaceSettings {
 
 /// Which MISAKA network a supervised or attached node is on.
 ///
-/// `Testnet11` is the live public network; `Devnet` and `Simnet` are the local, permissionless
-/// presets — the ones a sandboxed machine (or anyone who just wants to see PALW produce blocks)
+/// `Testnet12` is the live public network (genesis `a27f8f44…`, launched 2026-09-25); `Testnet11` is
+/// the retired one, kept so a settings file written before the move still loads. `Devnet` and `Simnet`
+/// are the local, permissionless presets — the ones a sandboxed machine (or anyone who just wants to see PALW produce blocks)
 /// can run without reaching the internet at all.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeNetwork {
     #[default]
+    Testnet12,
     Testnet11,
     Devnet,
     Simnet,
@@ -234,6 +275,7 @@ impl NodeNetwork {
     /// CLI's own `getServerInfo` check can only catch it if the two names came from one place.
     pub fn id(self) -> &'static str {
         match self {
+            NodeNetwork::Testnet12 => "testnet-12",
             NodeNetwork::Testnet11 => "testnet-11",
             NodeNetwork::Devnet => "devnet",
             NodeNetwork::Simnet => "simnet",
@@ -241,23 +283,12 @@ impl NodeNetwork {
     }
 }
 
-/// How this machine participates in the MISAKA network.
+/// The MISAKA network this Studio mines on — **without a node here**.
 ///
-/// The ladder is honest about what each rung requires. Observing needs a reachable node's RPC.
-/// Verifying needs a full node — syncing and re-deriving claims is what a node does by being a
-/// node. Producing additionally needs a bonded seat on-chain and, for a model class, that class's
-/// artifact on disk; the Studio can launch the node and check the prerequisites, but a bond is an
-/// on-chain fact it cannot conjure.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NetworkRole {
-    #[default]
-    Observer,
-    Verifier,
-    Producer,
-}
-
-/// The MISAKA node this Studio watches or supervises.
+/// The Studio runs no `kaspad`. It reads the chain through the network's public wRPC nodes and mines over the RFC-0009
+/// node-free path: free-prompt mining through a gateway and rail pointed at those nodes, and ordinary attempts through
+/// `palw-remote-miner` ([`RemoteMinerSettings`]). A file written by an older Studio that still carries node fields loads
+/// fine: unknown fields are ignored.
 ///
 /// Every field's default is the type's own — `None`, empty, off. `install_default_class_artifact`
 /// used to be the exception (on, so a fresh install could mine a model class) and its `Default`
@@ -267,16 +298,8 @@ pub enum NetworkRole {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NodeSettings {
-    /// Path to the `kaspad` binary (the misakas node keeps upstream's binary name). `None` means
-    /// look beside the Studio's executable and on PATH, same as the engine resolution.
-    pub kaspad_path: Option<PathBuf>,
-    /// The node wRPC **Borsh** endpoint (`host:port`) the `misaka` CLI should talk to.
-    ///
-    /// Separate from `rpc_url` because they are different protocols on different ports: the
-    /// Studio watches the node over wRPC-JSON, and the CLI speaks Borsh. `None` lets the CLI
-    /// resolve it the way it always does — `~/.misaka/<network>/endpoints.json`, which a node
-    /// writes when it starts, then the network default. Set it when the node is somebody
-    /// else's, which is the case for a Studio that only joined a pool.
+    /// The wRPC **Borsh** endpoint the `misaka` CLI, the gateway and the rail talk to. `None` uses the network's first
+    /// published public node (testnet-12: `wss://wallet.misakascan.com/t12/wrpc/borsh`).
     pub misaka_rpc: Option<String>,
     /// Path to the `misaka` CLI. `None` looks beside the Studio's executable and on PATH.
     ///
@@ -285,45 +308,11 @@ pub struct NodeSettings {
     /// that can be wrong about an irreversible transaction, and it is the one the chain's own
     /// tests cover.
     pub misaka_cli_path: Option<PathBuf>,
-    /// Attach to an already-running node's wRPC endpoint instead of launching one. Takes
-    /// precedence over launching: two nodes sharing one appdir is a corrupted database.
-    pub rpc_url: Option<String>,
     pub network: NodeNetwork,
-    pub role: NetworkRole,
-    /// Coinbase payout address for producing. `None` = the producer key's own address, which the
-    /// node derives and prints at start (`[palw] producer pay address …`); set it only to send
-    /// rewards elsewhere. An address, not a key — the Studio never holds wallet key material.
-    pub mining_address: Option<String>,
-    /// Path to the producer's 32-byte ML-DSA-87 seed file — `POST /api/v1/network/producer-key`
-    /// writes one (0600) under the data directory, or bring your own (`misaka key gen`). A path
-    /// the node reads — the Studio passes it on the command line and never opens the file after
-    /// writing it.
+    /// Path to the bond's 32-byte ML-DSA-87 seed file — `POST /api/v1/network/producer-key` writes one (0600) under the
+    /// data directory, or bring your own (`misaka key gen`). The Studio passes the path to the rail and the remote miner
+    /// and never opens the file after writing it.
     pub producer_key_path: Option<PathBuf>,
-    /// The bond outpoint (`<txid>:<index>`) printed once by the registration run. Absent means
-    /// the next producer start registers a bond instead of mining with one.
-    pub producer_bond: Option<String>,
-    /// The fee outpoint that funds the panel submitter (usually the bond carrier's change,
-    /// `<txid>:1`). Absent runs the panel receipts-only, which the node states at startup.
-    pub fee_outpoint: Option<String>,
-    /// Class id to produce in (128 hex). Absent mines the floor — BASE-0, no artifact.
-    pub producer_class: Option<String>,
-    /// The class artifact file, for a model class.
-    pub class_artifact: Option<PathBuf>,
-    /// **Armed once**: the next producer start files ONE `ClassRegistered` for `class_artifact`
-    /// and this clears itself.
-    ///
-    /// The value is the model id (`Qwen/Qwen2.5-Coder-1.5B-Instruct`) and may be empty, which
-    /// lets the node infer it — needed only when a converted shape matches more than one class
-    /// this build knows, because sibling models convert to the same shape and the file alone
-    /// cannot say which one it is.
-    ///
-    /// Arm-once rather than a standing setting, because the flag submits a transaction: left on,
-    /// every restart would file another registration for a class the chain already holds.
-    pub register_class: Option<String>,
-    /// The node's data directory. `None` uses the node's own default.
-    pub appdir: Option<PathBuf>,
-    /// Extra arguments appended verbatim to the node's command line.
-    pub extra_args: Vec<String>,
     /// Fetch the default class's artifact (`palw::DEFAULT_CLASS`) on first run, so a machine that
     /// just downloaded the Studio can mine a model class without hunting for a file.
     ///
@@ -334,20 +323,117 @@ pub struct NodeSettings {
     /// Rewards today come from the floor; the artifact is a click away in Models → Discover when
     /// the transport fix lands.
     pub install_default_class_artifact: bool,
-    /// Base URL of a miner pool (`…/pool`), for mining without running a node here. The pool
-    /// hosts the producer; joining it needs nothing but funding the slot it hands back.
-    pub pool_url: Option<String>,
-    /// The slot this Studio joined, if any — the pool's identifier for "your producer".
-    pub pool_slot_id: Option<String>,
-    /// The bearer that lets this Studio read its slot's status. Not a wallet key.
-    pub pool_slot_token: Option<String>,
-    /// Base URL of a free-prompt gateway (`misaka-palw-gateway`), the endpoint that turns one
-    /// prompt into one inference carrying its own commitment (ADR-0044). `None` uses the local
-    /// default; a pool-hosted gateway is the same field with someone else's host in it, which is
-    /// what "mine with a prompt and no node here" means.
+    /// Base URL of the free-prompt gateway (`misaka-palw-gateway`), the endpoint that turns one prompt into one inference
+    /// carrying its own commitment (ADR-0044). `None` uses the local default — the gateway this Studio runs itself
+    /// ([`FreePromptStackSettings::listen`]). Mining is this machine's: no hosted slot holds the key (RFC-0009).
     pub palw_gateway_url: Option<String>,
     /// Where a chat's mining happens relative to the chat itself — see [`MiningMode`].
     pub mining_mode: MiningMode,
+    /// **Mining with no node here** (RFC-0009 stage A): `palw-remote-miner` reads the chain through public wRPC nodes and
+    /// runs `palw-attempt-exec` on this machine. See [`RemoteMinerSettings`].
+    pub remote: RemoteMinerSettings,
+    /// **Prompt mining with no node here**: the gateway and the rail, pointed at the network's public wRPC. See
+    /// [`FreePromptStackSettings`].
+    pub free_prompt: FreePromptStackSettings,
+}
+
+/// The free-prompt stack the Studio runs on this machine — `misaka-palw-gateway` (its worker runs the model; it holds no
+/// key) and `misaka-palw-fp-rail --watch` (signs each committed job with the bond key and relays it) — both reading and
+/// writing the chain through a public node. This is what lets a prompt be mined without a node.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FreePromptStackSettings {
+    /// `misaka-palw-gateway`. `None` looks beside the Studio's executable and on PATH.
+    pub gateway_path: Option<PathBuf>,
+    /// `misaka-palw-fp-rail`. `None` looks beside the Studio's executable and on PATH.
+    pub rail_path: Option<PathBuf>,
+    /// The family worker (`palw-a16-fp-worker`). `None` looks beside the Studio's executable and on PATH.
+    pub worker_path: Option<PathBuf>,
+    /// Where the gateway listens; `node.palw_gateway_url` reaches it. Loopback by default — the gateway takes prompts.
+    pub listen: String,
+    /// The class artifact the worker runs. `None` uses the default class's file in the models directory.
+    pub artifact: Option<PathBuf>,
+    /// The tokenizer. `None` uses the class's tokenizer file beside the artifact.
+    pub tokenizer: Option<PathBuf>,
+    /// The executor bond (`<txid>:<index>`). `None` lets the rail find the bond registered to the key.
+    pub bond: Option<String>,
+    /// Where the gateway publishes each job's evidence. `None` uses the network's published provider.
+    pub evidence_provider: Option<String>,
+    /// The user's consent to sign on a public node's word (`UNVERIFIED_REMOTE`): the rail's signing gate refuses
+    /// otherwise, because a node that is not yours is not a verified view.
+    pub accept_unverified: bool,
+}
+
+impl Default for FreePromptStackSettings {
+    fn default() -> Self {
+        Self {
+            gateway_path: None,
+            rail_path: None,
+            worker_path: None,
+            listen: "127.0.0.1:8790".into(),
+            artifact: None,
+            tokenizer: None,
+            bond: None,
+            evidence_provider: None,
+            accept_unverified: false,
+        }
+    }
+}
+
+/// The node-free miner: `palw-remote-miner` against at least two public wRPC nodes, with the official executor.
+///
+/// Every value here is something the miner is told, never something the Studio decides for the user: the checkpoint is
+/// the trust root the nodes are held to, and the unverified-state consent is the user's, by name.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RemoteMinerSettings {
+    /// `palw-remote-miner`. `None` looks beside the Studio's executable and on PATH.
+    pub remote_miner_path: Option<PathBuf>,
+    /// `palw-attempt-exec`, the official executor. `None` looks beside the Studio's executable and on PATH.
+    pub attempt_exec_path: Option<PathBuf>,
+    /// The wRPC Borsh endpoints. Empty uses the network's published list (testnet-12: the two misakascan hosts).
+    pub rpc: Vec<String>,
+    /// The registered bond outpoint (`<txid>:<index>`).
+    pub bond: Option<String>,
+    /// Class id (128 hex). `None` mines the floor.
+    pub class: Option<String>,
+    /// The artifact file, for a model class (the floor needs none).
+    pub artifact: Option<PathBuf>,
+    /// The reward address. `None` is refused: the miner pays only where it is told.
+    pub pay_address: Option<String>,
+    /// The bond's ML-DSA-87 seed. `None` uses `node.producer_key_path`.
+    pub key_path: Option<PathBuf>,
+    /// The trust root, `<daa>:<block hash>`. The Studio can suggest one read from two nodes; the user confirms it.
+    pub checkpoint: Option<String>,
+    /// Where the miner keeps its journal and every captured material. `None` uses `<data dir>/remote-miner/<network>`.
+    pub state_dir: Option<PathBuf>,
+    /// Verify the header chain from the checkpoint (L1) and the state proofs (L3). On by default.
+    pub verify_headers: bool,
+    /// The user's consent to mine on a view that is not fully verified, by its label
+    /// (`HEADER_VERIFIED_FORK_CHOICE_UNVERIFIED` or `UNVERIFIED_REMOTE`). `None`: the miner stops at its signing gate.
+    pub accept_unverified: Option<String>,
+    /// Seconds between steps. `None` keeps the miner's default.
+    pub poll_secs: Option<u64>,
+}
+
+impl Default for RemoteMinerSettings {
+    fn default() -> Self {
+        Self {
+            remote_miner_path: None,
+            attempt_exec_path: None,
+            rpc: Vec::new(),
+            bond: None,
+            class: None,
+            artifact: None,
+            pay_address: None,
+            key_path: None,
+            checkpoint: None,
+            state_dir: None,
+            verify_headers: true,
+            accept_unverified: None,
+            poll_secs: None,
+        }
+    }
 }
 
 /// **Whether the Chat tab waits for the lane, or the lane runs behind it.**
@@ -507,6 +593,7 @@ pub struct Settings {
     pub load_on_start: Option<String>,
     pub server: ServerSettings,
     pub backend: BackendSettings,
+    pub image_backend: ImageBackendSettings,
     pub node: NodeSettings,
     pub generation: GenerationDefaults,
     pub context: ContextSettings,
@@ -522,6 +609,7 @@ impl Default for Settings {
             load_on_start: None,
             server: ServerSettings::default(),
             backend: BackendSettings::default(),
+            image_backend: ImageBackendSettings::default(),
             node: NodeSettings::default(),
             generation: GenerationDefaults::default(),
             context: ContextSettings::default(),
@@ -541,10 +629,23 @@ impl Settings {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         match std::fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str(&text)
-                .map_err(|e| Error::Settings { path: path.display().to_string(), reason: format!("not valid settings JSON: {e}") }),
+            Ok(text) => {
+                let mut settings: Settings = serde_json::from_str(&text)
+                    .map_err(|e| Error::Settings { path: path.display().to_string(), reason: format!("not valid settings JSON: {e}") })?;
+                settings.migrate_retired_network();
+                Ok(settings)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
             Err(e) => Err(Error::io(path.display(), e)),
+        }
+    }
+
+    /// **testnet-11 is retired**: a file written while it was the live network moves to testnet-12, the network that
+    /// replaced it. A node started for testnet-11 would sync a chain nobody produces on; choosing testnet-11 again in the
+    /// UI after this is a deliberate act and is kept until the next load.
+    fn migrate_retired_network(&mut self) {
+        if self.node.network == NodeNetwork::Testnet11 {
+            self.node.network = NodeNetwork::Testnet12;
         }
     }
 
@@ -653,5 +754,25 @@ mod tests {
             .filter(|n| n.ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "left {leftovers:?}");
+    }
+}
+
+
+#[cfg(test)]
+mod network_migration_tests {
+    use super::*;
+
+    #[test]
+    fn a_settings_file_written_for_testnet_11_loads_as_testnet_12() {
+        let dir = std::env::temp_dir().join(format!("misaka-studio-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let mut old = Settings::default();
+        old.node.network = NodeNetwork::Testnet11;
+        old.save(&path).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"testnet11\""));
+        assert_eq!(Settings::load(&path).unwrap().node.network, NodeNetwork::Testnet12);
+        assert_eq!(Settings::default().node.network, NodeNetwork::Testnet12);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

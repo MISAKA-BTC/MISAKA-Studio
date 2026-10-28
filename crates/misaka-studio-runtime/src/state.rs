@@ -6,11 +6,15 @@
 //! needs to see "23 of 33 layers offloaded, VRAM was the limit" rather than a spinner.
 
 use crate::backend::devices::{EngineDevice, Offload, OffloadEvidence, first_gpu};
+use crate::backend::diffusion::DiffusionBackend;
 use crate::backend::llamacpp::{LlamaCppBackend, accelerator_tag};
 use crate::backend::misaka::MisakaBackend;
 use crate::backend::mlx::MlxBackend;
-use crate::backend::mock::MockBackend;
-use crate::backend::{ChatMessage, GenerationRequest, LoadRequest, LoadedModel, SharedBackend, StreamEvent, Usage};
+use crate::backend::mock::{MockBackend, NoneImageBackend};
+use crate::backend::{
+    ChatMessage, GenerationRequest, ImageDtype, ImageLoadRequest, LoadRequest, LoadedImageModel, LoadedModel, SharedBackend,
+    SharedImageBackend, StreamEvent, Txt2ImgRequest, Usage,
+};
 use crate::catalog::Catalog;
 use crate::context::tokens::TokenCounter;
 use crate::context::{ContextPlan, ContextReport, PlanInputs, SuppliedMemory};
@@ -22,13 +26,14 @@ use crate::{Error, Result};
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use misaka_studio_core::HardwareSnapshot;
+use misaka_studio_core::image_model::LocalImageModel;
 use misaka_studio_core::model::LocalModel;
 use misaka_studio_core::palw;
 use misaka_studio_core::provenance::{
     InferenceInputs, InferenceRecord, ModelIdentity, RuntimeIdentity, SamplingCommitment, canonical_prompt_bytes,
     canonical_raw_prompt_bytes,
 };
-use misaka_studio_core::settings::{BackendKind, GpuLayers, Settings};
+use misaka_studio_core::settings::{BackendKind, GpuLayers, ImageBackendKind, Settings};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -46,6 +51,25 @@ pub struct LoadedState {
     pub backend: String,
     /// A sentence for the user when the offload that happened is not the one that was asked for.
     pub offload_note: Option<String>,
+}
+
+/// An image model that is loaded — the seam's counterpart to [`LoadedState`], stripped down to
+/// what a diffusion model actually has: no context size, no GPU-layer offload, no provenance
+/// commitment (image generation is not wired into the provenance/PALW machinery this build's
+/// chat path carries).
+#[derive(Clone)]
+pub struct LoadedImageState {
+    pub model: LocalImageModel,
+    pub loaded: LoadedImageModel,
+}
+
+/// What the UI shows about the current image-generation runtime.
+#[derive(Clone, Debug, Serialize)]
+pub struct ImageRuntimeStatus {
+    pub backend: String,
+    pub backend_available: bool,
+    pub model_id: Option<String>,
+    pub load_ms: Option<u64>,
 }
 
 /// What the UI shows about the current runtime.
@@ -75,7 +99,10 @@ pub struct AppState {
     pub store: Arc<ModelStore>,
     pub downloads: Arc<DownloadManager>,
     pub metrics: Arc<MetricsHub>,
-    pub node: Arc<crate::node::NodeManager>,
+    /// The node-free miner (RFC-0009 stage A). See `crate::remote_miner`.
+    pub remote_miner: Arc<crate::remote_miner::RemoteMinerManager>,
+    /// The node-free prompt-mining stack (gateway + rail). See `crate::fp_stack`.
+    pub prompt_stack: Arc<crate::fp_stack::FreePromptStack>,
     pub records: RwLock<Arc<RecordStore>>,
     /// Prompts waiting to be — or already — mined behind the chat. See `crate::mining_queue`.
     pub mining: Arc<crate::mining_queue::MiningQueue>,
@@ -92,6 +119,10 @@ pub struct AppState {
     catalog: RwLock<Arc<Catalog>>,
     backend: RwLock<SharedBackend>,
     loaded: RwLock<Option<LoadedState>>,
+    image_backend: RwLock<SharedImageBackend>,
+    image_loaded: RwLock<Option<LoadedImageState>>,
+    /// One image load at a time, same reason as [`Self::load_lock`].
+    image_load_lock: tokio::sync::Mutex<()>,
 }
 
 impl AppState {
@@ -112,9 +143,9 @@ impl AppState {
         }
         let catalog = Arc::new(Catalog::new(settings.huggingface.endpoint.clone(), settings.huggingface.token.clone()));
         let backend = build_backend(&settings, &hardware);
+        let image_backend = build_image_backend(&settings);
         let metrics = MetricsHub::new(&hardware);
 
-        let node = Arc::new(crate::node::NodeManager::with_journal(Some(data_dir.join("produced-blocks.jsonl"))));
         let mining = crate::mining_queue::MiningQueue::open(data_dir.join("mining-queue.json")).await;
         let engines = Arc::new(crate::engines::EngineInstaller::new(data_dir.join("engines").join("llama.cpp")));
         let app = Arc::new(AppState {
@@ -125,7 +156,8 @@ impl AppState {
             store,
             downloads: Arc::new(DownloadManager::new()),
             metrics,
-            node,
+            remote_miner: Arc::new(crate::remote_miner::RemoteMinerManager::new()),
+            prompt_stack: Arc::new(crate::fp_stack::FreePromptStack::new()),
             records: RwLock::new(records),
             mining,
             load_lock: tokio::sync::Mutex::new(()),
@@ -135,6 +167,9 @@ impl AppState {
             catalog: RwLock::new(catalog),
             backend: RwLock::new(backend),
             loaded: RwLock::new(None),
+            image_backend: RwLock::new(image_backend),
+            image_loaded: RwLock::new(None),
+            image_load_lock: tokio::sync::Mutex::new(()),
         });
         // The queue's worker lives as long as the app: prompts queued in an earlier run are still
         // owed a claim, and the person may have closed the window on them on purpose.
@@ -160,7 +195,7 @@ impl AppState {
             match serve {
                 Some(path) if path.is_file() => Ok(()),
                 Some(path) => Err(format!("the local integer runtime is not at {}", path.display())),
-                None => Err("the local integer runtime (misaka-palw-serve) is not installed; the chat can only be answered by the pool's gateway".to_string()),
+                None => Err("the local integer runtime (misaka-palw-serve) is not installed; the chat can only be answered by the prompt-mining gateway".to_string()),
             }
         } else {
             let backend = build_backend_kind(BackendKind::Auto, &settings, &self.hardware);
@@ -282,6 +317,72 @@ impl AppState {
         self.loaded.read().await.clone()
     }
 
+    pub async fn image_backend(&self) -> SharedImageBackend {
+        self.image_backend.read().await.clone()
+    }
+
+    pub async fn image_loaded(&self) -> Option<LoadedImageState> {
+        self.image_loaded.read().await.clone()
+    }
+
+    /// Load an image model into the configured image backend. Mirrors [`Self::load_model`]'s
+    /// shape without its GPU-offload/provenance machinery, neither of which a diffusion sidecar
+    /// carries: one load at a time, and loading replaces whatever was loaded.
+    pub async fn load_image_model(&self, id: &str, dtype: ImageDtype) -> Result<ImageRuntimeStatus> {
+        let _permit = self.image_load_lock.lock().await;
+        let model = self.store.require_image(id).await?;
+        let backend = self.image_backend().await;
+
+        let availability = backend.availability().await;
+        if let crate::backend::Availability::Unavailable { reason, remedy } = availability {
+            return Err(Error::BackendUnavailable { backend: backend.name().to_string(), reason, remedy });
+        }
+
+        let settings = self.settings.read().await.clone();
+        let loaded = backend
+            .load(ImageLoadRequest {
+                model_id: model.id.clone(),
+                model_path: model.path.clone(),
+                dtype,
+                device: settings.image_backend.device.clone(),
+            })
+            .await?;
+        let backend_name = backend.name().to_string();
+        *self.image_loaded.write().await = Some(LoadedImageState { model, loaded: loaded.clone() });
+        Ok(ImageRuntimeStatus {
+            backend: backend_name,
+            backend_available: true,
+            model_id: Some(loaded.model_id),
+            load_ms: Some(loaded.load_ms),
+        })
+    }
+
+    pub async fn unload_image_model(&self) -> Result<()> {
+        let _permit = self.image_load_lock.lock().await;
+        self.image_backend().await.unload().await?;
+        *self.image_loaded.write().await = None;
+        Ok(())
+    }
+
+    pub async fn generate_image(&self, request: Txt2ImgRequest) -> Result<Vec<crate::backend::GeneratedImage>> {
+        if self.image_loaded().await.is_none() {
+            return Err(Error::NoModelLoaded);
+        }
+        self.image_backend().await.generate(request).await
+    }
+
+    /// The image backends this build knows, with their availability — `/api/v1/images/runtime/backends`.
+    pub async fn image_backend_status(&self) -> Vec<(String, bool, crate::backend::Availability)> {
+        let selected = self.image_backend().await;
+        let mut out = Vec::new();
+        for kind in [ImageBackendKind::Diffusion, ImageBackendKind::None] {
+            let settings = self.settings.read().await.clone();
+            let probe = build_image_backend_kind(kind, &settings);
+            out.push((probe.name().to_string(), probe.name() == selected.name(), probe.availability().await));
+        }
+        out
+    }
+
     /// Apply new settings: persist them, then rebuild whatever they changed.
     ///
     /// Changing the backend or the model directory unloads the current model. That is the honest
@@ -292,19 +393,20 @@ impl AppState {
         let old = self.settings.read().await.clone();
         new.save(&self.settings_path)?;
 
-        // A gateway engine IS its address and its token: `GatewayBackend::new` copies both at
-        // construction and never reads settings again. Joining a new pool slot (or forgetting one)
-        // rewrites exactly those two fields while the kind stays `Gateway`, so without this the
-        // engine kept answering — and mining — for the slot the person had just left, with that
-        // slot's token, while every status panel named the new one.
+        // A gateway engine IS its address: `GatewayBackend::new` copies it at construction and never reads settings again,
+        // so a changed gateway URL with the kind still `Gateway` must rebuild the engine, or it keeps answering — and
+        // mining — at the old address.
         let backend_changed = new.backend.kind != old.backend.kind
             || new.backend.llama_server_path != old.backend.llama_server_path
             || new.backend.mlx_server_path != old.backend.mlx_server_path
             || new.node.palw_gateway_url != old.node.palw_gateway_url
-            || new.node.pool_slot_token != old.node.pool_slot_token
             // Background mining moves the chat off the gateway and onto the local runtime (when
             // it is installed); the engine has to follow the switch, in both directions.
             || new.node.mining_mode != old.node.mining_mode;
+        let image_backend_changed = new.image_backend.kind != old.image_backend.kind
+            || new.image_backend.python_path != old.image_backend.python_path
+            || new.image_backend.diffusion_server_path != old.image_backend.diffusion_server_path
+            || new.image_backend.device != old.image_backend.device;
         let models_dir_changed = new.models_dir != old.models_dir;
         let hub_changed = new.huggingface.endpoint != old.huggingface.endpoint || new.huggingface.token != old.huggingface.token;
         let recording_changed = new.provenance.record_inferences != old.provenance.record_inferences
@@ -318,6 +420,10 @@ impl AppState {
         if backend_changed {
             self.unload().await?;
             *self.backend.write().await = build_backend(&new, &self.hardware);
+        }
+        if image_backend_changed {
+            self.unload_image_model().await?;
+            *self.image_backend.write().await = build_image_backend(&new);
         }
         if models_dir_changed {
             self.store.set_roots(vec![new.models_dir.clone()]).await?;
@@ -571,6 +677,19 @@ impl AppState {
         stop: Vec<String>,
         pinned: Vec<String>,
     ) -> Result<(Option<ContextReport>, BoxStream<'static, Result<StreamEvent>>)> {
+        self.generate_with(messages, prompt, params, stop, GenerateOptions { pinned, ..Default::default() }).await
+    }
+
+    /// [`Self::generate_managed`], with every per-request option — see [`GenerateOptions`].
+    pub async fn generate_with(
+        self: &Arc<Self>,
+        messages: Vec<ChatMessage>,
+        prompt: Option<String>,
+        params: SamplingCommitment,
+        stop: Vec<String>,
+        options: GenerateOptions,
+    ) -> Result<(Option<ContextReport>, BoxStream<'static, Result<StreamEvent>>)> {
+        let GenerateOptions { pinned, disable_thinking } = options;
         let state = self.loaded().await.ok_or(Error::NoModelLoaded)?;
         let backend = self.backend().await;
         // An engine that died between two messages is found out here, not by the connection
@@ -629,11 +748,19 @@ impl AppState {
             params,
             stop: stop.clone(),
             prompt_tokens: exact_tokens,
-            disable_thinking: false,
+            // Not part of `params`, so not in the record: it changes how the template renders the
+            // turn (Qwen3 opens an empty think block), which the prompt commitment — over the
+            // messages — does not see. See `GenerateOptions::disable_thinking`.
+            disable_thinking,
         };
         let is_chat = request.prompt.is_none();
 
         self.metrics.generation_started();
+        // The clock starts as the request goes out — before the refusal check below takes the first
+        // event, which would otherwise already be in hand when timing began, and every record would
+        // say the first token arrived in 0 ms.
+        let started = Instant::now();
+        let started_at_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
         let inner = match backend.generate(request).await {
             Ok(stream) => stream,
             Err(e) => {
@@ -682,7 +809,7 @@ impl AppState {
                                     params,
                                     stop: stop.clone(),
                                     prompt_tokens: None,
-                                    disable_thinking: false,
+                                    disable_thinking,
                                 };
                                 match backend.generate(retry).await {
                                     Ok(mut s2) => {
@@ -703,8 +830,6 @@ impl AppState {
         };
 
         let app = self.clone();
-        let started = Instant::now();
-        let started_at_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
 
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         tokio::spawn(async move {
@@ -723,6 +848,17 @@ impl AppState {
                             first_token = Some(started.elapsed());
                         }
                         text.push_str(delta);
+                    }
+                    // **Reasoning is streamed and never committed.** `text` — what the output
+                    // commitment and the inference hash are derived from — is the answer alone, so a
+                    // record means the same thing whether or not the engine split the thinking out.
+                    // It does count as the first token: it is the first thing decoded and the first
+                    // thing the person sees, and the engine's usage counts its tokens too, which keeps
+                    // tokens/sec measured over the same tokens as the time it is divided by.
+                    Ok(StreamEvent::Reasoning(_)) => {
+                        if first_token.is_none() {
+                            first_token = Some(started.elapsed());
+                        }
                     }
                     Ok(StreamEvent::Done { usage: u, .. }) => usage = *u,
                     Err(_) => {}
@@ -972,6 +1108,19 @@ impl AppState {
     }
 }
 
+/// Per-request choices for [`AppState::generate_with`] that are neither sampling parameters nor
+/// the conversation itself.
+#[derive(Clone, Debug, Default)]
+pub struct GenerateOptions {
+    /// The conversation's pinned notes, kept ahead of history by the context manager.
+    pub pinned: Vec<String>,
+    /// Ask a reasoning model to answer without thinking first — see
+    /// [`GenerationRequest::disable_thinking`]. Engines whose templates do not read the flag ignore
+    /// it. It is not committed to: the record's sampling commitment is a fixed format shared with
+    /// the chain's derivations, and this changes the rendered prompt, not the sampling.
+    pub disable_thinking: bool,
+}
+
 /// How long a request waits for a tokenizer that is still loading before it is counted with the
 /// estimate instead.
 const TOKENIZER_WAIT: Duration = Duration::from_secs(3);
@@ -994,6 +1143,25 @@ pub fn build_backend(settings: &Settings, hardware: &HardwareSnapshot) -> Shared
     build_backend_kind(settings.backend.kind, settings, hardware)
 }
 
+/// Build the image backend a settings value asks for. No `Auto`: unlike chat, there is no
+/// platform-independent default to fall back to, so `None` (nothing configured) is this seam's
+/// own default and it stays that until a person opts in.
+pub fn build_image_backend(settings: &Settings) -> SharedImageBackend {
+    build_image_backend_kind(settings.image_backend.kind, settings)
+}
+
+pub fn build_image_backend_kind(kind: ImageBackendKind, settings: &Settings) -> SharedImageBackend {
+    match kind {
+        ImageBackendKind::None => Arc::new(NoneImageBackend),
+        ImageBackendKind::Diffusion => Arc::new(DiffusionBackend::new(
+            settings.image_backend.python_path.clone(),
+            settings.image_backend.diffusion_server_path.clone(),
+            settings.image_backend.device.clone(),
+            Duration::from_secs(settings.image_backend.startup_timeout_secs),
+        )),
+    }
+}
+
 /// Build one particular engine, from the same settings.
 ///
 /// Split out because the engine is not only a preference: a `.palwart` can be run by the integer
@@ -1010,10 +1178,7 @@ pub fn build_backend_kind(kind: BackendKind, settings: &Settings, hardware: &Har
         // refuses rather than substituting when its server is missing: a record naming MISAKA must
         // come from the MISAKA runtime.
         BackendKind::Gateway => Arc::new(crate::backend::gateway::GatewayBackend::new(
-            settings.node.palw_gateway_url.clone().unwrap_or_else(|| "http://127.0.0.1:8790".to_string()),
-            // A pool-hosted gateway is the slot's, and the slot's token is what says so — the same
-            // token the Network tab already holds. There is one slot, not one per feature.
-            settings.node.pool_slot_token.clone(),
+            crate::fp_stack::gateway_url(&settings.node),
         )),
         BackendKind::Misaka => Arc::new(MisakaBackend::new(
             settings.backend.misaka_serve_path.clone(),

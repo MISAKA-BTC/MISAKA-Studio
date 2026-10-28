@@ -318,7 +318,7 @@ impl ChildEngine {
         let base = self.base_url().await?;
         let chat = request.prompt.is_none();
         let url = if chat { format!("{base}/v1/chat/completions") } else { format!("{base}/v1/completions") };
-        let body = request_body(&request, chat);
+        let body = request_body(&request, chat, self.config.name);
         let http = self.http.clone();
         let backend = self.config.name;
         let running = self.running.clone();
@@ -482,7 +482,7 @@ fn free_port() -> Result<u16> {
     Ok(port)
 }
 
-fn request_body(request: &GenerationRequest, chat: bool) -> serde_json::Value {
+fn request_body(request: &GenerationRequest, chat: bool, backend: &str) -> serde_json::Value {
     let p = &request.params;
     let mut body = serde_json::json!({
         "model": request.model,
@@ -506,6 +506,16 @@ fn request_body(request: &GenerationRequest, chat: bool) -> serde_json::Value {
     }
     if chat {
         body["messages"] = serde_json::json!(request.messages);
+        // max_tokens includes thinking. Without a separate budget a thinking model can spend
+        // all 2048 tokens on reasoning and return no answer, even with a 64K context. Reserve
+        // half for the answer; llama.cpp closes the thinking section when this budget expires.
+        // This is a llama.cpp extension, not a parameter for MLX or raw completions.
+        if backend == "llamacpp" {
+            body["reasoning_budget_tokens"] = serde_json::json!(if request.disable_thinking { 0 } else { p.max_tokens / 2 });
+            body["reasoning_budget_message"] = serde_json::json!(
+                "\nThinking time is over. Give a concise final answer in the user's language now. If the answer is uncertain, say so rather than guessing.\n"
+            );
+        }
     } else {
         body["prompt"] = serde_json::json!(request.prompt.clone().unwrap_or_default());
     }
@@ -571,6 +581,8 @@ fn parse_version(text: &str) -> (Option<String>, Option<u64>) {
 pub(crate) struct SseParser {
     buffer: Vec<u8>,
     chat: bool,
+    /// Characters generated — answer and reasoning both, since both were decoded — for the usage
+    /// estimate when the engine reports none.
     text_len: u64,
     usage: Option<Usage>,
     finish_reason: Option<String>,
@@ -622,6 +634,20 @@ impl SseParser {
             let Some(choice) = json.get("choices").and_then(|c| c.get(0)) else { continue };
             if let Some(reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
                 self.finish_reason = Some(reason.to_string());
+            }
+            // A thinking model's reasoning, ahead of any content in the same chunk because that is
+            // the order it was generated in. `reasoning_content` is llama.cpp's and DeepSeek's
+            // name; `reasoning` is vLLM's and OpenRouter's. A server that sends both sends the same
+            // text twice, so the first one with text is taken (some send the other as `null`).
+            if self.chat
+                && let Some(reasoning) = choice.get("delta").and_then(|delta| {
+                    ["reasoning_content", "reasoning"]
+                        .iter()
+                        .find_map(|key| delta.get(*key).and_then(|v| v.as_str()).filter(|t| !t.is_empty()))
+                })
+            {
+                self.text_len += reasoning.chars().count() as u64;
+                events.push(StreamEvent::Reasoning(reasoning.to_string()));
             }
             let text = if self.chat {
                 choice.get("delta").and_then(|d| d.get("content")).and_then(|v| v.as_str())
@@ -732,6 +758,63 @@ mod tests {
         }
     }
 
+    /// What `llama-server` (build 10330, `--reasoning-format auto`) streams for a Qwen3 turn: the
+    /// thinking as `reasoning_content` deltas, then the answer as `content`. Before this the parser
+    /// read only `content`, and the chat sat blank for as long as the model thought.
+    #[test]
+    fn reasoning_deltas_are_their_own_events_in_the_order_they_came() {
+        let mut parser = SseParser::new(true);
+        let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null}}]}\n\n\
+                   data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Okay, the user\"}}]}\n\n\
+                   data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" wants a greeting.\"}}]}\n\n\
+                   data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n\
+                   data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"!\",\"reasoning_content\":null}}]}\n\n\
+                   data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                   data: [DONE]\n\n";
+        let mut events = Vec::new();
+        // Split mid-field, as the network does.
+        for chunk in sse.as_bytes().chunks(11) {
+            events.extend(parser.push(chunk));
+        }
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::Reasoning("Okay, the user".into()),
+                StreamEvent::Reasoning(" wants a greeting.".into()),
+                StreamEvent::Delta("Hello".into()),
+                StreamEvent::Delta("!".into()),
+            ]
+        );
+        match parser.finish(3) {
+            StreamEvent::Done { usage, finish_reason } => {
+                assert_eq!(finish_reason, "stop");
+                // No usage from the engine: the estimate counts the thinking too — it was decoded.
+                assert_eq!(usage.completion_tokens, (14 + 18 + 5 + 1_u64).div_ceil(4));
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    /// `reasoning` is the same field under vLLM's and OpenRouter's name; a chunk carrying both
+    /// (or one of them `null`) is one piece of reasoning, and thinking and answer in one chunk
+    /// come out thinking first.
+    #[test]
+    fn the_reasoning_alias_is_read_once() {
+        let mut parser = SseParser::new(true);
+        let events = parser.push(b"data: {\"choices\":[{\"delta\":{\"reasoning\":\"hmm\"}}]}\n");
+        assert_eq!(events, vec![StreamEvent::Reasoning("hmm".into())]);
+        let events = parser.push(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"a\",\"reasoning\":\"a\"}}]}\n");
+        assert_eq!(events, vec![StreamEvent::Reasoning("a".into())]);
+        let events = parser.push(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":null,\"reasoning\":\"b\"}}]}\n");
+        assert_eq!(events, vec![StreamEvent::Reasoning("b".into())]);
+        let events = parser.push(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"c\",\"content\":\"d\"}}]}\n");
+        assert_eq!(events, vec![StreamEvent::Reasoning("c".into()), StreamEvent::Delta("d".into())]);
+        assert!(
+            parser.push(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"\"}}]}\n").is_empty(),
+            "nothing is not an event"
+        );
+    }
+
     #[test]
     fn completions_read_the_text_field_not_the_delta() {
         let mut parser = SseParser::new(false);
@@ -758,13 +841,35 @@ mod tests {
             params: misaka_studio_core::provenance::SamplingCommitment { seed: Some(7), ..Default::default() },
             stop: vec!["</s>".into()],
         };
-        let body = request_body(&request, true);
+        let body = request_body(&request, true, "llamacpp");
         assert_eq!(body["seed"], 7);
         assert_eq!(body["top_k"], 40);
         assert_eq!(body["stop"][0], "</s>");
         assert!(body["messages"].is_array());
         assert!(body.get("prompt").is_none(), "a chat request must not also send a raw prompt");
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false, "thinking off when asked");
+        assert_eq!(body["reasoning_budget_tokens"], 0);
+    }
+
+    #[test]
+    fn thinking_leaves_room_for_an_answer_only_on_llamacpp_chat() {
+        let mut request = GenerationRequest {
+            prompt_tokens: None,
+            disable_thinking: false,
+            model: "m".into(),
+            messages: vec![super::super::ChatMessage::new("user", "hi")],
+            prompt: None,
+            params: Default::default(),
+            stop: Vec::new(),
+        };
+        for ceiling in [1, 64, 2048, 8192] {
+            request.params.max_tokens = ceiling;
+            let body = request_body(&request, true, "llamacpp");
+            assert_eq!(body["max_tokens"], ceiling);
+            assert_eq!(body["reasoning_budget_tokens"], ceiling / 2);
+        }
+        assert!(request_body(&request, true, "mlx").get("reasoning_budget_tokens").is_none());
+        assert!(request_body(&request, false, "llamacpp").get("reasoning_budget_tokens").is_none());
     }
 
     /// An error's reason lives in its source chain, and a chain that repeats itself is noise.

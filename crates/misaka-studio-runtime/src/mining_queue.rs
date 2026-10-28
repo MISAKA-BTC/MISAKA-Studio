@@ -308,14 +308,14 @@ impl MiningQueue {
                         j.attempts += 1;
                     })
                     .await;
-                let (url, token) = {
+                let url = {
                     let settings = state.settings.read().await;
                     // The slot the person holds NOW. A job queued under a slot they have since
                     // left is still theirs; the new slot's bond carries it.
                     let url = settings.node.palw_gateway_url.clone().unwrap_or_else(|| job.gateway_url.clone());
-                    (url.trim_end_matches('/').to_string(), settings.node.pool_slot_token.clone())
+                    url.trim_end_matches('/').to_string()
                 };
-                match run_job(&job, &url, token.as_deref()).await {
+                match run_job(&job, &url).await {
                     Ok(done) => {
                         tracing::info!(job = %job.id, claim = ?done.claim_id, "free-prompt job committed from the queue");
                         queue
@@ -415,7 +415,7 @@ enum Outcome {
 
 /// One request to the slot's gateway, non-streaming: the queue wants the job block at the end,
 /// not the tokens as they come. Mirrors the chat engine's request so the lane sees one shape.
-async fn run_job(job: &MiningJob, url: &str, token: Option<&str>) -> std::result::Result<Done, Outcome> {
+async fn run_job(job: &MiningJob, url: &str) -> std::result::Result<Done, Outcome> {
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(JOB_TIMEOUT)
@@ -432,10 +432,7 @@ async fn run_job(job: &MiningJob, url: &str, token: Option<&str>) -> std::result
             "max_tokens": ceiling,
             "stream": false,
         });
-        let mut request = http.post(format!("{url}/v1/chat/completions")).json(&body);
-        if let Some(token) = token {
-            request = request.header("x-pool-token", token);
-        }
+        let request = http.post(format!("{url}/v1/chat/completions")).json(&body);
         let response = request.send().await.map_err(|e| Outcome::Transient(format!("the gateway did not accept the request: {e}")))?;
         let status = response.status();
         let text = response.text().await.map_err(|e| Outcome::Transient(format!("the gateway's answer was cut off: {e}")))?;
@@ -632,7 +629,7 @@ mod tests {
             "not_committed_because": "the public-job budget for this window is spent",
         }))
         .await;
-        match run_job(&job, &refused, None).await {
+        match run_job(&job, &refused).await {
             Err(Outcome::Refused(why)) => {
                 assert!(why.contains("not committed") && why.contains("public-job budget"), "{why}")
             }
@@ -647,12 +644,12 @@ mod tests {
             "not_committed_because": null,
         }))
         .await;
-        let done = run_job(&job, &committed, None).await.ok().expect("a committed answer is done");
+        let done = run_job(&job, &committed).await.ok().expect("a committed answer is done");
         assert_eq!(done.claim_id.as_deref(), Some("2e2c"));
 
         // A gateway older than the verdict says nothing about it and is taken at its job block.
         let older = fake_gateway(serde_json::json!({ "fp_job_id": "fp-job-3", "fp_claim_id": "3f3d" })).await;
-        let done = run_job(&job, &older, None).await.ok().expect("a job block without a verdict is done");
+        let done = run_job(&job, &older).await.ok().expect("a job block without a verdict is done");
         assert_eq!(done.claim_id.as_deref(), Some("3f3d"));
     }
 }

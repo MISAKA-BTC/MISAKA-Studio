@@ -17,7 +17,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../lib/api'
 import { bytes } from '../lib/format'
-import type { NodeClassRow, PalwArtifactHeader, PalwClassStatus } from '../lib/types'
+import type { NodeClassRow, PalwArtifactHeader, PalwClassStatus, PublishedPalwartView } from '../lib/types'
 import { useStudio } from '../store/studio'
 import { CopyButton, Icon, Spinner } from './common'
 import { ClassContext } from './ContextBadge'
@@ -77,7 +77,8 @@ function FinalWorkShare({ spec, rows }: { spec: PalwClassStatus['spec']; rows: N
  */
 export function useClassStatuses(): { classes: PalwClassStatus[] | null; nodeRows: NodeClassRow[]; error: string | null } {
   const [classes, setClasses] = useState<PalwClassStatus[] | null>(null)
-  const [nodeRows, setNodeRows] = useState<NodeClassRow[]>([])
+  // No node runs here, so no node class table: the rows stay empty and the built-in registry speaks.
+  const [nodeRows] = useState<NodeClassRow[]>([])
   const [error, setError] = useState<string | null>(null)
   const downloads = useStudio((s) => s.downloads)
   const settled = downloads.filter((d) => d.status === 'completed' || d.status === 'failed' || d.status === 'cancelled').length
@@ -88,12 +89,6 @@ export function useClassStatuses(): { classes: PalwClassStatus[] | null; nodeRow
       setError(null)
     } catch (e) {
       setError((e as Error).message)
-    }
-    try {
-      const overview = await api.network()
-      setNodeRows(overview.node.classes_from_node)
-    } catch {
-      setNodeRows([])
     }
   }, [])
 
@@ -183,7 +178,7 @@ export function MiningCatalog() {
     <section className="card p-4">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h3 className="text-sm font-semibold">Models you can mine with</h3>
-        <span className="text-[0.7rem] text-ink-500 dark:text-ink-400">testnet-11 genesis registry</span>
+        <span className="text-[0.7rem] text-ink-500 dark:text-ink-400">testnet-12 genesis registry</span>
       </div>
       <p className="mt-1 text-xs leading-relaxed text-ink-500 dark:text-ink-400">
         A block on the MISAKA network is won by verified inference in one of these chain-registered classes, and each one names
@@ -352,5 +347,83 @@ function MiningRow({ cls, nodeRows, onInstall }: { cls: PalwClassStatus; nodeRow
         </div>
       )}
     </div>
+  )
+}
+
+/**
+ * PALW models published as PALWART3 that the network has not registered. Installable and verifiable like a class artifact,
+ * and said plainly: until a registration is admitted, none of them mines.
+ */
+export function PublishedPalwModels() {
+  const [models, setModels] = useState<PublishedPalwartView[] | null>(null)
+  const toast = useStudio((s) => s.toast)
+  const setDownload = useStudio((s) => s.setDownload)
+
+  const refresh = useCallback(async () => {
+    try {
+      setModels(await api.publishedModels())
+    } catch {
+      setModels([])
+    }
+  }, [])
+  useEffect(() => {
+    void refresh()
+    const id = setInterval(() => void refresh(), 15_000)
+    return () => clearInterval(id)
+  }, [refresh])
+
+  const install = async (name: string) => {
+    try {
+      const progress = await api.downloadPublished(name)
+      progress.forEach((p) => setDownload(p))
+      toast('info', `Downloading ${name} — ${progress.length} files, each verified against its pinned SHA-256`)
+    } catch (e) {
+      toast('error', (e as Error).message)
+    }
+  }
+
+  if (!models || models.length === 0) return null
+  return (
+    <section className="card p-4">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <h3 className="text-sm font-semibold">Published PALW models</h3>
+        <span className="text-[0.7rem] text-ink-500 dark:text-ink-400">not registered on testnet-12</span>
+      </div>
+      <p className="mt-1 text-xs leading-relaxed text-ink-500 dark:text-ink-400">
+        Converted to PALW and published as a PALWART3 artifact (an index and its segments, side by side). They install and verify
+        like a class artifact, but the chain admits no claim over a model it has not registered: they mine nothing until someone
+        registers them (no node needed: <code>misaka model add --export-bundle</code>, sign, submit).
+      </p>
+      <div className="mt-3 space-y-2">
+        {models.map((m) => (
+          <div key={m.model.name} className="rounded-lg border border-ink-200 p-3 text-xs dark:border-ink-800">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="font-medium">{m.model.name}</span>
+              <span className="flex items-center gap-2">
+                <span className="badge bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300">not a class here — mines nothing</span>
+                {m.present ? (
+                  <span className="badge bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">installed</span>
+                ) : (
+                  <button type="button" className="btn-outline px-2 py-1 text-xs" onClick={() => void install(m.model.name)}>
+                    Install · {bytes(m.total_bytes)}
+                  </button>
+                )}
+              </span>
+            </div>
+            <p className="mt-1 text-ink-600 dark:text-ink-300">{m.model.description}</p>
+            <dl className="mt-2 grid gap-1 text-[0.7rem] text-ink-500 dark:text-ink-400">
+              <div>
+                {m.model.family} · {m.model.served_context.toLocaleString()} tokens · {m.model.license} · {1 + m.model.segments.length} files
+              </div>
+              <div>Fit: {m.model.fit}</div>
+              <div className="mono break-all">
+                root {m.model.artifact_root_hex.slice(0, 16)}… · {m.model.hf_repo}@{m.model.revision.slice(0, 12)}
+              </div>
+              {m.present && <div className="mono break-all">verify: palwart verify {m.index_path}</div>}
+            </dl>
+          </div>
+        ))}
+      </div>
+    </section>
   )
 }

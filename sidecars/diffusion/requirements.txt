@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+pillow
+pydantic
+# Needed for real (non-mock) generation. Versions matter: a checkpoint's
+# `model_index.json` names a pipeline class that a given diffusers release may not
+# have yet. Qwen-Image and FLUX.2 support in particular should be verified against
+# the checkpoint's own model card before relying on it.
+diffusers
+transformers
+accelerate
+torch

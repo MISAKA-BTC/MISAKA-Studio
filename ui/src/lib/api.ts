@@ -10,13 +10,15 @@ import type {
   CatalogEntry,
   CatalogRepo,
   DownloadProgress,
+  ImageBackendInfo,
+  ImageGenerateRequest,
+  ImageGenerateResponse,
+  ImageModelView,
+  ImageRuntimeStatus,
   InferenceRecord,
   ModelView,
   NetworkOverview,
-  NodeView,
   PalwClassStatus,
-  PoolStatus,
-  ProducedBlock,
   PromptMiningRun,
   PromptMiningStatus,
   MiningJob,
@@ -28,10 +30,26 @@ import type {
   SystemInfo,
   SeedReadiness,
   SeedOutcome,
-  RegistrationReadiness,
   EnginesView,
   InstallStatus,
   ContextReport,
+  CheckpointSuggestion,
+  RemoteMinerPreflight,
+  RemoteMinerView,
+  PromptStackPreflight,
+  PromptStackView,
+  PublishedPalwartView,
+  BrowseView,
+  WorkspaceInfo,
+  WorkspaceTree,
+  WorkspaceFile,
+  WorkspaceSearch,
+  WorkspaceWrite,
+  WorkspaceEdit,
+  WorkspaceExec,
+  GitStatus,
+  GitDiff,
+  ExecStreamEvent,
 } from './types'
 
 /**
@@ -121,27 +139,10 @@ export const api = {
   saveSettings: (settings: Settings) => request<Settings>('/api/v1/settings', { method: 'PUT', body: JSON.stringify(settings) }),
 
   network: () => request<NetworkOverview>('/api/v1/network'),
-  producedBlocks: () => request<{ blocks: ProducedBlock[] }>('/api/v1/network/blocks'),
-  pool: () => request<PoolStatus>('/api/v1/network/pool'),
-  poolJoin: (url?: string | null, mode?: 'floor' | 'fp') =>
-    request<Record<string, unknown>>('/api/v1/network/pool/join', {
-      method: 'POST',
-      body: JSON.stringify({ url: url ?? null, mode: mode ?? 'floor' }),
-    }),
-  poolFpEnable: () => request<Record<string, unknown>>('/api/v1/network/pool/fp/enable', { method: 'POST' }),
-  poolLeave: () => request<Record<string, unknown>>('/api/v1/network/pool/leave', { method: 'POST' }),
-  poolFaucet: () => request<Record<string, unknown>>('/api/v1/network/pool/faucet', { method: 'POST' }),
-  faucetFor: (address: string) => request<Record<string, unknown>>('/api/v1/network/faucet', { method: 'POST', body: JSON.stringify({ address }) }),
   producerKey: () => request<{ producer_key_path: string; next: string }>('/api/v1/network/producer-key', { method: 'POST' }),
 
   // ADR-0087/0090 — adding a model, and opening its market. Two separate acts on the chain, so
   // two separate calls here.
-  classRegistration: () => request<RegistrationReadiness>('/api/v1/network/model-market/registration'),
-  registerClass: (modelId?: string | null) =>
-    request<RegistrationReadiness>('/api/v1/network/model-market/register-class', {
-      method: 'POST',
-      body: JSON.stringify({ model_id: modelId ?? null }),
-    }),
   seedReadiness: () => request<SeedReadiness>('/api/v1/network/model-market/seed-readiness'),
   seedMarket: (lineId: string, msk: string, confirm: boolean) =>
     request<SeedOutcome>('/api/v1/network/model-market/seed', {
@@ -154,7 +155,7 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ prompt, max_tokens: maxTokens ?? null }),
     }),
-  // The mining queue: prompts mined behind the chat, on the pool slot's gateway.
+  // The mining queue: prompts mined behind the chat, on this Studio's own gateway.
   miningQueue: () => request<MiningQueueView>('/api/v1/network/mining-queue'),
   miningEnqueue: (prompt: string, conversationId: string | null, messageId: string | null) =>
     request<MiningJob>('/api/v1/network/mining-queue', {
@@ -168,18 +169,83 @@ export const api = {
   networkClasses: () => request<PalwClassStatus[]>('/api/v1/network/classes'),
   downloadClassArtifact: (name: string) =>
     request<DownloadProgress>(`/api/v1/network/classes/${encodeURIComponent(name)}/download`, { method: 'POST' }),
-  startNode: (role?: 'observer' | 'verifier' | 'producer') =>
-    request<NodeView>('/api/v1/network/node/start', { method: 'POST', body: JSON.stringify({ role: role ?? null }) }),
-  stopNode: () => request<{ stopped: boolean }>('/api/v1/network/node/stop', { method: 'POST' }),
-  resetNode: () => request<NodeView>('/api/v1/network/node/reset', { method: 'POST' }),
-  nodeLog: (limit = 200) => request<string[]>(`/api/v1/network/node/log?limit=${limit}`),
+  publishedModels: () => request<PublishedPalwartView[]>('/api/v1/network/published'),
+  downloadPublished: (name: string) =>
+    request<DownloadProgress[]>(`/api/v1/network/published/${encodeURIComponent(name)}/download`, { method: 'POST' }),
+  promptStack: () => request<PromptStackView>('/api/v1/network/prompt-stack'),
+  promptStackPreflight: () => request<PromptStackPreflight>('/api/v1/network/prompt-stack/preflight'),
+  startPromptStack: () => request<PromptStackView>('/api/v1/network/prompt-stack/start', { method: 'POST' }),
+  stopPromptStack: () => request<{ stopped: boolean }>('/api/v1/network/prompt-stack/stop', { method: 'POST' }),
+  remoteMiner: () => request<RemoteMinerView>('/api/v1/network/remote-miner'),
+  remoteMinerPreflight: () => request<RemoteMinerPreflight>('/api/v1/network/remote-miner/preflight'),
+  remoteMinerCheckpoint: () => request<CheckpointSuggestion>('/api/v1/network/remote-miner/checkpoint'),
+  startRemoteMiner: () => request<RemoteMinerView>('/api/v1/network/remote-miner/start', { method: 'POST' }),
+  stopRemoteMiner: () => request<{ stopped: boolean }>('/api/v1/network/remote-miner/stop', { method: 'POST' }),
+  remoteMinerLog: (limit = 200) => request<string[]>(`/api/v1/network/remote-miner/log?limit=${limit}`),
 
   records: (limit = 50) => request<InferenceRecord[]>(`/api/v1/records?limit=${limit}`),
+
+  // Image generation: a diffusion sidecar, driven the same way llama.cpp/MLX are for chat — see
+  // `crates/misaka-studio-runtime/src/backend/diffusion.rs`.
+  imageModels: () => request<ImageModelView[]>('/api/v1/images/models'),
+  refreshImageModels: () => request<ImageModelView[]>('/api/v1/images/models/refresh', { method: 'POST' }),
+  loadImageModel: (id: string, dtype?: 'fp16' | 'bf16' | 'fp32') =>
+    request<ImageRuntimeStatus>(`/api/v1/images/models/${encodeURIComponent(id)}/load`, {
+      method: 'POST',
+      body: JSON.stringify({ dtype: dtype ?? null }),
+    }),
+  unloadImageModel: () => request<ImageRuntimeStatus>('/api/v1/images/models/unload', { method: 'POST' }),
+  imageRuntime: () => request<ImageRuntimeStatus>('/api/v1/images/runtime'),
+  imageBackends: () => request<ImageBackendInfo[]>('/api/v1/images/runtime/backends'),
+  generateImage: (body: ImageGenerateRequest) =>
+    request<ImageGenerateResponse>('/api/v1/images/generate', { method: 'POST', body: JSON.stringify(body) }),
+
+  // The coding agent's workspace: a folder the person chose, read and changed through the runtime
+  // because a browser window cannot touch the disk. Every path but `root` is relative to it, and
+  // the runtime refuses anything that resolves outside it. Loopback-only: see `api/workspace.rs`.
+  workspace: {
+    browse: (path?: string | null, hidden = false) =>
+      request<BrowseView>(`/api/v1/workspace/browse?${new URLSearchParams({ ...(path ? { path } : {}), ...(hidden ? { hidden: 'true' } : {}) })}`),
+    open: (root: string) => request<WorkspaceInfo>('/api/v1/workspace/open', { method: 'POST', body: JSON.stringify({ root }) }),
+    tree: (root: string, path = '.', depth?: number, limit?: number) =>
+      request<WorkspaceTree>('/api/v1/workspace/tree', { method: 'POST', body: JSON.stringify({ root, path, depth, limit }) }),
+    files: (root: string, query: string, limit?: number) =>
+      request<{ paths: string[] }>('/api/v1/workspace/files', { method: 'POST', body: JSON.stringify({ root, query, limit }) }),
+    read: (root: string, path: string, range: { start_line?: number; end_line?: number; max_bytes?: number } = {}) =>
+      request<WorkspaceFile>('/api/v1/workspace/read', { method: 'POST', body: JSON.stringify({ root, path, ...range }) }),
+    search: (
+      root: string,
+      pattern: string,
+      options: { path?: string; glob?: string; regex?: boolean; case_insensitive?: boolean; max_results?: number } = {},
+    ) => request<WorkspaceSearch>('/api/v1/workspace/search', { method: 'POST', body: JSON.stringify({ root, pattern, ...options }) }),
+    write: (root: string, path: string, content: string) =>
+      request<WorkspaceWrite>('/api/v1/workspace/write', { method: 'POST', body: JSON.stringify({ root, path, content }) }),
+    edit: (root: string, path: string, oldString: string, newString: string, replaceAll = false) =>
+      request<WorkspaceEdit>('/api/v1/workspace/edit', {
+        method: 'POST',
+        body: JSON.stringify({ root, path, old_string: oldString, new_string: newString, replace_all: replaceAll }),
+      }),
+    remove: (root: string, path: string) =>
+      request<{ removed: string }>('/api/v1/workspace/remove', { method: 'POST', body: JSON.stringify({ root, path }) }),
+    exec: (root: string, command: string, timeoutSecs?: number, signal?: AbortSignal) =>
+      request<WorkspaceExec>('/api/v1/workspace/exec', {
+        method: 'POST',
+        body: JSON.stringify({ root, command, timeout_secs: timeoutSecs }),
+        signal,
+      }),
+    /** `git status` with line counts, or `is_git: false`. Never runs a shell: git is invoked directly. */
+    gitStatus: (root: string) => request<GitStatus>('/api/v1/workspace/git/status', { method: 'POST', body: JSON.stringify({ root }) }),
+    /** The unified diff of the working tree against HEAD — for one path, or the whole tree. */
+    gitDiff: (root: string, path?: string | null) =>
+      request<GitDiff>('/api/v1/workspace/git/diff', { method: 'POST', body: JSON.stringify({ root, path: path ?? null }) }),
+  },
 }
 
 /** One event from a streamed completion. */
 export type ChatStreamEvent =
   | { type: 'delta'; text: string }
+  /** A thinking model's reasoning, which a recent llama.cpp streams apart from the answer. */
+  | { type: 'reasoning'; text: string }
   | { type: 'done'; finishReason: string; usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } }
   | { type: 'error'; message: string }
   | { type: 'context'; report: ContextReport }
@@ -194,8 +260,11 @@ export type ChatRequest = {
   repeat_penalty?: number
   max_tokens?: number
   seed?: number | null
-  /** The Studio's extension: the conversation's pinned notes. */
-  misaka?: { pinned: string[] }
+  /** Sequences that end the reply. The engine stops before them, so they are not in the text. */
+  stop?: string[]
+  /** The Studio's extension: the conversation's pinned notes, and `thinking: false` to ask a
+   *  reasoning model to answer without thinking first. */
+  misaka?: { pinned: string[]; thinking?: boolean }
 }
 
 /**
@@ -246,6 +315,8 @@ export async function* streamChat(request: ChatRequest, signal: AbortSignal): As
       // The opening chunk carries what the context manager sent the model.
       if (json.misaka?.context) yield { type: 'context', report: json.misaka.context as ContextReport }
       const choice = json.choices?.[0]
+      const reasoning = choice?.delta?.reasoning_content ?? choice?.delta?.reasoning
+      if (typeof reasoning === 'string' && reasoning.length > 0) yield { type: 'reasoning', text: reasoning }
       const text = choice?.delta?.content
       if (typeof text === 'string' && text.length > 0) yield { type: 'delta', text }
       if (choice?.finish_reason) {
@@ -254,6 +325,49 @@ export async function* streamChat(request: ChatRequest, signal: AbortSignal): As
           finishReason: String(choice.finish_reason),
           usage: json.usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
         }
+      }
+    }
+  }
+}
+
+/**
+ * Run a command in a workspace and yield its output as it is written.
+ *
+ * The terminal's transport. Aborting `signal` closes the connection, which the runtime takes as
+ * the signal to kill the command's whole process group — Ctrl+C, in effect.
+ */
+export async function* execStream(
+  root: string,
+  command: string,
+  signal: AbortSignal,
+  timeoutSecs?: number,
+): AsyncGenerator<ExecStreamEvent> {
+  const response = await fetch(`${API_BASE}/api/v1/workspace/exec/stream`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ root, command, timeout_secs: timeoutSecs }),
+    signal,
+  })
+  if (!response.ok) throw await parseError(response)
+  if (!response.body) throw new ApiError('the runtime returned no body', 500)
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    let newline: number
+    while ((newline = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, newline).trim()
+      buffer = buffer.slice(newline + 1)
+      if (!line.startsWith('data:')) continue
+      const payload = line.slice(5).trim()
+      if (!payload) continue
+      try {
+        yield JSON.parse(payload) as ExecStreamEvent
+      } catch {
+        /* a frame that is not JSON is not a reason to stop reading the command */
       }
     }
   }

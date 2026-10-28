@@ -31,6 +31,7 @@
 
 pub mod gguf;
 pub mod hardware;
+pub mod image_model;
 pub mod model;
 pub mod palw;
 pub mod provenance;

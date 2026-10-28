@@ -209,6 +209,13 @@ pub enum FitVerdict {
 
 impl FitVerdict {
     pub fn assess(req: &ModelRequirements, hardware: &HardwareSnapshot) -> Self {
+        Self::for_bytes(req.total_bytes, hardware)
+    }
+
+    /// The same judgment [`Self::assess`] makes, from a total byte count alone — so a memory
+    /// bill that isn't a [`ModelRequirements`] (an image model's, itemised differently) gets the
+    /// identical fit logic rather than a second copy of it.
+    pub fn for_bytes(total_bytes: u64, hardware: &HardwareSnapshot) -> Self {
         let gpu = hardware
             .accelerators
             .iter()
@@ -218,8 +225,8 @@ impl FitVerdict {
         let ram = crate::hardware::cpu_usable_memory(hardware.total_memory);
 
         if let Some((device, budget)) = gpu {
-            if req.total_bytes <= budget {
-                let headroom = budget - req.total_bytes;
+            if total_bytes <= budget {
+                let headroom = budget - total_bytes;
                 // Under 10 % of the budget left is where "it loaded" and "it is usable" start
                 // disagreeing, so it gets a different word.
                 return if headroom * 10 >= budget {
@@ -228,21 +235,21 @@ impl FitVerdict {
                     FitVerdict::Tight { device, headroom_bytes: headroom }
                 };
             }
-            if req.total_bytes <= ram {
-                return FitVerdict::PartialOffload { device, gpu_bytes: budget, needed_bytes: req.total_bytes };
+            if total_bytes <= ram {
+                return FitVerdict::PartialOffload { device, gpu_bytes: budget, needed_bytes: total_bytes };
             }
-            return FitVerdict::DoesNotFit { needed_bytes: req.total_bytes, available_bytes: ram.max(budget) };
+            return FitVerdict::DoesNotFit { needed_bytes: total_bytes, available_bytes: ram.max(budget) };
         }
 
-        if req.total_bytes <= ram {
-            let headroom = ram - req.total_bytes;
+        if total_bytes <= ram {
+            let headroom = ram - total_bytes;
             if headroom * 10 >= ram {
                 FitVerdict::Fits { device: "system memory".into(), headroom_bytes: headroom }
             } else {
                 FitVerdict::Tight { device: "system memory".into(), headroom_bytes: headroom }
             }
         } else {
-            FitVerdict::DoesNotFit { needed_bytes: req.total_bytes, available_bytes: ram }
+            FitVerdict::DoesNotFit { needed_bytes: total_bytes, available_bytes: ram }
         }
     }
 

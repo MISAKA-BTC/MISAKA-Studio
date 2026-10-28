@@ -1,8 +1,9 @@
 // **Adding a model to the chain, and opening its market** — the two acts, kept apart because the
 // chain keeps them apart.
 //
-// Registering a class is a node's act: it needs the converted artifact, an active bond, that
-// bond's key and a funded fee outpoint, and it files one `ClassRegistered`. Seeding the market is
+// Registering a class needs no node (RFC-0009): `misaka model add --export-bundle`, a detached signature, and a submit
+// through the public wRPC. It needs the converted artifact, an active bond and that bond's key, and files one
+// `ClassRegistered`. Seeding the market is
 // a spend: at least 100,000 MSK locked into the line's sink, forever, in exchange for nothing —
 // the seeder receives no position and never gets the money back.
 //
@@ -12,7 +13,7 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../lib/api'
-import type { RegistrationReadiness, SeedOutcome, SeedReadiness } from '../lib/types'
+import type { SeedOutcome, SeedReadiness } from '../lib/types'
 import { Section, Spinner } from './common'
 
 const SOMPI = 100_000_000
@@ -23,19 +24,17 @@ function msk(sompi: number | null): string {
 }
 
 export function ModelMarketPanel() {
-  const [registration, setRegistration] = useState<RegistrationReadiness | null>(null)
   const [seed, setSeed] = useState<SeedReadiness | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [outcome, setOutcome] = useState<SeedOutcome | null>(null)
-  const [modelId, setModelId] = useState('')
-  const [showCommand, setShowCommand] = useState(false)
 
   const refresh = useCallback(async () => {
-    // Independently: a node that cannot answer about registration should not blank the seed half.
-    const [r, s] = await Promise.allSettled([api.classRegistration(), api.seedReadiness()])
-    if (r.status === 'fulfilled') setRegistration(r.value)
-    if (s.status === 'fulfilled') setSeed(s.value)
+    try {
+      setSeed(await api.seedReadiness())
+    } catch {
+      // the seed half shows its spinner until the chain answers
+    }
   }, [])
 
   useEffect(() => {
@@ -43,18 +42,6 @@ export function ModelMarketPanel() {
     const timer = setInterval(() => void refresh(), 20_000)
     return () => clearInterval(timer)
   }, [refresh])
-
-  const arm = async () => {
-    setBusy('register')
-    setError(null)
-    try {
-      setRegistration(await api.registerClass(modelId.trim() || null))
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusy(null)
-    }
-  }
 
   // Two presses, and the first one is not a formality: the dry run comes back from the chain's own
   // code path with the amount it would lock, which is the last chance to read the number before it
@@ -84,66 +71,20 @@ export function ModelMarketPanel() {
         <div className="rounded-lg border border-ink-200 p-2 dark:border-ink-800">
           <div className="text-[0.7rem] font-medium">1 · Register the class</div>
           <div className="mt-0.5 text-[0.7rem] leading-relaxed text-ink-500 dark:text-ink-400">
-            Submits one <code>ClassRegistered</code> for this node&apos;s artifact, so the chain adjudicates your model and
-            blocks can be mined on it. A node&apos;s act, run once — it needs the artifact, an active bond, that bond&apos;s key
-            and a funded fee outpoint.
+            Files one <code>ClassRegistered</code> for your artifact, so the chain adjudicates your model and prompts can be
+            mined on it. No node: the CLI builds an unsigned bundle from the public wRPC, you sign it with your bond key, and
+            any public node relays it. It needs the artifact, an active bond and its key; the 1 BILI registration burn comes
+            from the bond, the carrier fee from your wallet.
           </div>
-
-          {registration === null ? (
-            <div className="mt-2"><Spinner /></div>
-          ) : (
-            <>
-              <dl className="mt-2 space-y-1 text-[0.7rem]">
-                <Row label="Artifact" value={registration.artifact} />
-                <Row label="Bond" value={registration.bond} />
-                <Row label="Fee outpoint" value={registration.fee_outpoint} />
-                <Row label="Producer key" value={registration.has_key ? 'set' : null} />
-              </dl>
-
-              {registration.blocked_because ? (
-                <p className="mt-2 rounded-md bg-amber-50 p-2 text-[0.7rem] leading-relaxed text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
-                  {registration.blocked_because}
-                </p>
-              ) : registration.armed ? (
-                <p className="mt-2 rounded-md bg-emerald-50 p-2 text-[0.7rem] leading-relaxed text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-200">
-                  Armed. The next producer start files the registration and disarms itself, so it cannot file twice.
-                </p>
-              ) : (
-                <div className="mt-2 space-y-1.5">
-                  <input
-                    className="w-full rounded-md border border-ink-200 bg-white px-2 py-1 text-[0.7rem] dark:border-ink-800 dark:bg-ink-950"
-                    placeholder="Model id — only if the shape matches more than one class"
-                    value={modelId}
-                    onChange={(e) => setModelId(e.target.value)}
-                  />
-                  <button
-                    className="rounded-md bg-ink-900 px-2 py-1 text-[0.7rem] font-medium text-white disabled:opacity-50 dark:bg-ink-100 dark:text-ink-900"
-                    disabled={busy !== null}
-                    onClick={() => void arm()}
-                  >
-                    {busy === 'register' ? 'Arming…' : 'Arm for the next start'}
-                  </button>
-                </div>
-              )}
-
-              {registration.command.length > 0 && (
-                <>
-                  <button
-                    className="mt-2 text-[0.65rem] text-ink-500 underline dark:text-ink-400"
-                    onClick={() => setShowCommand((v) => !v)}
-                  >
-                    {showCommand ? 'Hide' : 'Show'} the command this runs
-                  </button>
-                  {showCommand && (
-                    <pre className="mt-1 overflow-x-auto rounded-md bg-ink-50 p-2 text-[0.6rem] leading-relaxed dark:bg-ink-900/60">
-                      kaspad {registration.command.join(' ')}
-                    </pre>
-                  )}
-                </>
-              )}
-            </>
-          )}
+          <pre className="mt-2 overflow-x-auto rounded-md bg-ink-50 p-2 text-[0.6rem] leading-relaxed dark:bg-ink-900/60">
+{`misaka model add <artifact> --export-bundle bundle.json \\
+  --payer-address <addr> --rpc <public wRPC> --quote-rpc <other public wRPC>
+misaka model sign bundle.json --key-file <bond seed> \\
+  --expect-class <class> --expect-root <root> --expect-owner <bond>
+misaka model submit bundle.signed.json --relay <public wRPC>,<other public wRPC>`}
+          </pre>
         </div>
+
 
         {/* ---------- half two: the market ---------- */}
         <div className="rounded-lg border border-ink-200 p-2 dark:border-ink-800">

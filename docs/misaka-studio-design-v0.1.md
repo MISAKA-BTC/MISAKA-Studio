@@ -332,7 +332,10 @@ processes, not bundled. No closed-source application was used, copied, or revers
   is discoverable, and left out of the Settings dropdown so it cannot be selected into a dead end.
 * **Conversations live in the window's local storage**, not the runtime. Moving them behind the API
   would make history available to other clients and survive a browser profile reset.
-* **No embeddings endpoint** (`/v1/embeddings`), no tool calling, no MCP.
+* **No embeddings endpoint** (`/v1/embeddings`), no tool calling through the OpenAI API (`tools`,
+  `tool_calls`), no MCP. The window's coding agent does not need them: it speaks a text tool
+  protocol (Qwen3's XML function format) over plain chat completions and runs its tools through
+  `/api/v1/workspace/*` — see `ui/src/lib/agent/` and `crates/misaka-studio-runtime/src/workspace.rs`.
 * **One model at a time.** The backend holds a single engine; serving two models concurrently needs
   a pool, and the memory arithmetic to decide whether that is even possible.
 * **The public-testnet join is unexercised.** The producer flags the Studio builds are the join

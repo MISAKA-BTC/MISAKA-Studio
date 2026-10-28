@@ -9,127 +9,61 @@
 //   longer exists, so they go. The alternative — leaving them — produces a transcript the model
 //   never actually produced.
 // * **Stop keeps what was generated.** The user asked it to stop, not to undo.
+//
+// And one about layout: there is one composer, and it moves. An empty thread has it in the middle,
+// under the question of what to ask; a thread with history has it at the bottom. The draft lives in
+// `chat/composerStore`, per thread, so nothing typed is lost when it moves or when someone looks at
+// another thread and comes back.
 
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { duration } from '../lib/format'
-import type { ChatMessage, MessageMining } from '../lib/types'
-import { useStudio } from '../store/studio'
-import { CopyButton, EmptyState, Icon, Spinner } from './common'
-import { Markdown } from './Markdown'
-import { ContextLine, PinnedNotes, pinTextFromMessage } from './ContextPanel'
-import { useClassStatuses } from './MiningCatalog'
-import { ModelBar } from './ModelBar'
-import misakaPi from '../assets/misaka-pi.png'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent } from 'react'
+import { startAgentRun, stopAgentRun, useAgent } from '../lib/agent/run'
+import type { ChatMessage, Conversation } from '../lib/types'
+import { useStudio, type StreamingReply } from '../store/studio'
+import { useUi } from '../store/ui'
+import { Icon } from './common'
+import { useCodeWatchers } from './code/watchers'
+import { ChatHeader } from './chat/ChatHeader'
+import { Composer } from './chat/Composer'
+import { attachFiles, draftKey } from './chat/composerStore'
+import { EmptyHero } from './chat/EmptyHero'
+import { Message, type LiveStream, type TranscriptActions } from './chat/Message'
+import { ParametersDrawer } from './chat/ParametersDrawer'
+import { RightPanel } from './chat/RightPanel'
+
+const NO_MESSAGES: ChatMessage[] = []
+/** Closer to the bottom than this counts as "at the bottom": following the stream. */
+const FOLLOW_SLACK_PX = 80
 
 /**
- * What "no text yet" means, said out loud.
- *
- * On the free-prompt lane there is nothing to show until the run ENDS: the answer is one committed
- * execution, and the gateway hands back every token at once when it finishes — measured, all four
- * SSE frames arriving in the same tenth of a second after ten seconds of silence. At roughly a
- * token a second a full answer is minutes, so a bare "Thinking…" is indistinguishable from a hang,
- * and was reported as one.
- *
- * The elapsed count is the honest part: it says the wait is running, which a spinner alone does
- * not. llama.cpp streams, so there the wait is a second and this reads the same as before.
+ * Whether another thread holds the engine. There is one live overlay and one request in flight; a
+ * second request would take the overlay from the first, whose answer would then never be committed.
  */
-/**
- * **What became of this prompt on the chain** — under the message, always visible, never a toast.
- *
- * Background mining answers the chat here and mines the prompt behind it; the badge is the only
- * place the two halves meet. It says exactly what the runtime's queue says: queued, mining, a
- * committed claim (with its id), or the lane's own refusal — and, when there is one, the mined
- * answer, because that is the text misakascan will show and it need not match the chat's.
- */
-function MiningBadge({ mining }: { mining: MessageMining }) {
-  const [open, setOpen] = useState(false)
-  const tone =
-    mining.status === 'committed'
-      ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
-      : mining.status === 'refused' || mining.status === 'failed'
-        ? 'bg-red-50 text-red-700 dark:bg-red-950/40 dark:text-red-300'
-        : 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300'
-  const label =
-    mining.status === 'queued'
-      ? 'queued for mining'
-      : mining.status === 'running'
-        ? 'mining…'
-        : mining.status === 'committed'
-          ? `mined · claim ${mining.claimId ? mining.claimId.slice(0, 8) + '…' : 'committed'}`
-          : mining.status === 'refused'
-            ? 'not mined — the lane refused'
-            : 'not mined — gave up'
-  return (
-    <div className="mt-1.5 flex flex-col items-end gap-1 text-[0.7rem]">
-      <button
-        type="button"
-        className={`inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 ${tone}`}
-        onClick={() => setOpen((v) => !v)}
-        title={mining.error ?? (mining.answer ? 'Show the mined answer' : undefined)}
-      >
-        <span aria-hidden>⛏</span>
-        {label}
-      </button>
-      {open && (mining.error || mining.answer) && (
-        <div className="max-w-prose rounded-lg border border-ink-200 bg-white p-2 text-left text-xs text-ink-700 dark:border-ink-800 dark:bg-ink-900 dark:text-ink-300">
-          {mining.error ? (
-            <p className="whitespace-pre-wrap">{mining.error}</p>
-          ) : (
-            <>
-              <p className="mb-1 text-[0.65rem] uppercase tracking-wide text-ink-500 dark:text-ink-400">Mined answer — what the chain holds</p>
-              <p className="whitespace-pre-wrap">{mining.answer}</p>
-            </>
-          )}
-        </div>
-      )}
-    </div>
-  )
+function busyElsewhere(conversationId: string): boolean {
+  const streaming = useStudio.getState().streaming
+  const run = useAgent.getState().run
+  return (streaming !== null && streaming.conversationId !== conversationId) || (run !== null && run.conversationId !== conversationId)
 }
 
-function Waiting() {
-  const backend = useStudio((s) => s.runtime?.backend)
-  const [seconds, setSeconds] = useState(0)
-  useEffect(() => {
-    const timer = setInterval(() => setSeconds((n) => n + 1), 1000)
-    return () => clearInterval(timer)
-  }, [])
-  const mining = backend === 'gateway'
-  return (
-    <div className="flex items-start gap-2 py-1 text-sm text-ink-500 dark:text-ink-400">
-      <Spinner className="mt-0.5 size-3.5 shrink-0" />
-      <span>
-        {mining ? 'Mining your answer…' : 'Thinking…'}
-        {seconds >= 3 && <span className="tabular-nums"> {seconds}s</span>}
-        {mining && seconds >= 8 && (
-          <span className="block text-[0.7rem]">
-            This lane runs the whole job before any text exists — the answer and the claim behind it are one execution, at
-            about a token a second. Shorten it with <strong>max tokens</strong> under Parameters.
-          </span>
-        )}
-      </span>
-    </div>
-  )
+/** The index of the last message the person typed (not a tool result), or -1. */
+function lastTypedIndex(messages: ChatMessage[]): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m && m.role === 'user' && !m.toolResults) return i
+  }
+  return -1
+}
+
+function liveOf(stream: StreamingReply): LiveStream {
+  return { reasoning: stream.reasoning, startedAt: stream.startedAt, answerStartedAt: stream.answerStartedAt }
 }
 
 export function ChatView() {
-  const conversations = useStudio((s) => s.conversations)
-  const activeId = useStudio((s) => s.activeConversationId)
+  const conversation = useStudio((s) => s.conversations.find((c) => c.id === s.activeConversationId) ?? null)
   const streaming = useStudio((s) => s.streaming)
-  const send = useStudio((s) => s.send)
-  const stop = useStudio((s) => s.stop)
-  const regenerate = useStudio((s) => s.regenerate)
-  const continueGeneration = useStudio((s) => s.continueGeneration)
-  const editMessage = useStudio((s) => s.editMessage)
-  const runtime = useStudio((s) => s.runtime)
-  const models = useStudio((s) => s.models)
-  // Only consulted for the empty state, to tell "nothing installed" apart from "something
-  // installed that this window cannot load".
-  const { classes } = useClassStatuses()
-  const installedClass = (classes ?? []).find((cls) => cls.readiness.state === 'artifact_present')
+  const agentRun = useAgent((s) => s.run)
 
-  const conversation = conversations.find((c) => c.id === activeId) ?? null
-  const messages = conversation?.messages ?? []
-  const activeStream = streaming?.conversationId === conversation?.id ? streaming : null
+  const messages = conversation?.messages ?? NO_MESSAGES
+  const activeStream = conversation && streaming?.conversationId === conversation.id ? streaming : null
   // The pending reply is a render-only overlay. It joins the transcript exactly once, when the
   // request ends, and therefore can never leak an incomplete answer into the next model request.
   const visibleMessages = activeStream
@@ -137,273 +71,258 @@ export function ChatView() {
       ? messages.map((m) => (m.id === activeStream.assistantId ? { ...m, content: activeStream.content, streaming: true } : m))
       : [...messages, { id: activeStream.assistantId, role: 'assistant' as const, content: activeStream.content, streaming: true }]
     : messages
-  const generating = activeStream !== null
+  // A tool result is history the agent sends back to the model, not something the person wrote.
+  const rows = visibleMessages.filter((m) => m.role !== 'system' && !(m.role === 'user' && m.toolResults))
+  const agent = conversation?.mode === 'agent'
+  const generating = activeStream !== null || (conversation !== null && agentRun?.conversationId === conversation.id)
+  const empty = rows.length === 0
 
-  const [draft, setDraft] = useState('')
+  // A Code session's git status and panes follow what its agent and the window do.
+  useCodeWatchers(conversation)
+
   const [editingId, setEditingId] = useState<string | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const followRef = useRef(true)
+  const jumpUntil = useRef(0)
+  const [atBottom, setAtBottom] = useState(true)
+
+  // The latest of what the transcript's actions read — so the actions themselves never change and
+  // a memoised message is not redrawn for every token of the reply below it.
+  const latest = useRef({ conversation, generating })
+  latest.current = { conversation, generating }
+
+  // A thread opens at its end, following.
+  useLayoutEffect(() => {
+    followRef.current = true
+    setAtBottom(true)
+    setEditingId(null)
+  }, [conversation?.id])
 
   // Follow the stream only while the user is at the bottom.
   useLayoutEffect(() => {
     const element = scrollRef.current
     if (!element || !followRef.current) return
     element.scrollTop = element.scrollHeight
-  }, [messages, activeStream?.content])
+  }, [conversation?.id, messages, activeStream?.content, activeStream?.reasoning])
+
+  // Things that change height without changing the messages — a composer growing, a reply's final
+  // render with its math, a reasoning block folding — keep a following view at the bottom too.
+  useEffect(() => {
+    const element = scrollRef.current
+    if (!element) return
+    const observer = new ResizeObserver(() => {
+      if (followRef.current) element.scrollTop = element.scrollHeight
+    })
+    observer.observe(element)
+    if (element.firstElementChild) observer.observe(element.firstElementChild)
+    return () => observer.disconnect()
+  }, [conversation?.id, empty])
 
   const onScroll = () => {
     const element = scrollRef.current
     if (!element) return
-    followRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80
+    const near = element.scrollHeight - element.scrollTop - element.clientHeight < FOLLOW_SLACK_PX
+    setAtBottom(near)
+    // A smooth jump to the end passes through positions that are not the end; it still follows.
+    if (performance.now() < jumpUntil.current) {
+      followRef.current = true
+      return
+    }
+    followRef.current = near
   }
 
-  const submit = async () => {
-    const text = draft
-    setDraft('')
+  const jumpToBottom = () => {
+    const element = scrollRef.current
+    if (!element) return
     followRef.current = true
-    await send(text)
+    jumpUntil.current = performance.now() + 800
+    element.scrollTo({ top: element.scrollHeight, behavior: 'smooth' })
+  }
+
+  const follow = useCallback(() => {
+    followRef.current = true
+  }, [])
+
+  const actions = useMemo<TranscriptActions>(() => {
+    const toast = (text: string) => useStudio.getState().toast('info', text)
+    const elsewhere = 'Another thread is still answering. Stop it there, or wait, then try again.'
+
+    /** Agent threads re-run the agent: the message and everything after it go, and it runs again. */
+    const rerunAgent = async (thread: Conversation, index: number, text: string) => {
+      const original = thread.messages[index]
+      if (!original) return
+      if (useAgent.getState().run?.conversationId === thread.id) stopAgentRun()
+      useStudio.getState().updateConversation(thread.id, (c) => ({ messages: c.messages.slice(0, index), updatedAt: Date.now() }))
+      // The same words again (regenerate) were mined when they were first sent: the job carries
+      // over rather than the prompt being queued a second time. Edited words are a new prompt.
+      const same = text.trim() === original.content.trim() && original.mining
+      await startAgentRun(thread.id, text, original.attachments, same ? { mining: original.mining } : {})
+    }
+
+    return {
+      startEdit: (id) => setEditingId(id),
+      cancelEdit: () => {
+        setEditingId(null)
+        useUi.getState().focusComposer()
+      },
+      saveEdit: (id, content) => {
+        const thread = latest.current.conversation
+        if (!thread) return
+        if (busyElsewhere(thread.id)) return toast(elsewhere)
+        setEditingId(null)
+        useUi.getState().focusComposer()
+        followRef.current = true
+        const studio = useStudio.getState()
+        // Stop keeps what was generated — but an edit replaces it, so the reply in flight stops first.
+        if (studio.streaming?.conversationId === thread.id) studio.stop()
+        if (thread.mode === 'agent') {
+          void rerunAgent(thread, thread.messages.findIndex((m) => m.id === id), content.trim())
+          return
+        }
+        void studio.editMessage(id, content)
+      },
+      regenerate: () => {
+        const { conversation: thread, generating: busy } = latest.current
+        if (!thread || busy) return
+        if (busyElsewhere(thread.id)) return toast(elsewhere)
+        followRef.current = true
+        useUi.getState().focusComposer()
+        if (thread.mode === 'agent') {
+          const index = lastTypedIndex(thread.messages)
+          const original = thread.messages[index]
+          if (original) void rerunAgent(thread, index, original.content)
+          return
+        }
+        void useStudio.getState().regenerate()
+      },
+      continueReply: () => {
+        const { conversation: thread, generating: busy } = latest.current
+        if (!thread || busy || thread.mode === 'agent') return
+        if (busyElsewhere(thread.id)) return toast(elsewhere)
+        followRef.current = true
+        useUi.getState().focusComposer()
+        void useStudio.getState().continueGeneration()
+      },
+    }
+  }, [])
+
+  // ↑ in an empty composer: edit the last thing the person wrote.
+  const editLast = useCallback(() => {
+    const { conversation: thread, generating: busy } = latest.current
+    if (!thread || busy) return
+    const last = thread.messages[lastTypedIndex(thread.messages)]
+    if (!last) return
+    setEditingId(last.id)
+    requestAnimationFrame(() => document.getElementById(`message-${last.id}`)?.scrollIntoView({ block: 'nearest' }))
+  }, [])
+
+  // --- files dropped anywhere on the chat go to the composer --------------------------------------
+
+  const dragDepth = useRef(0)
+  const [dragging, setDragging] = useState(false)
+  const carriesFiles = (event: DragEvent) => Array.from(event.dataTransfer.types).includes('Files')
+  const dropHandlers = {
+    onDragEnter: (event: DragEvent) => {
+      if (!carriesFiles(event)) return
+      event.preventDefault()
+      dragDepth.current += 1
+      setDragging(true)
+    },
+    onDragOver: (event: DragEvent) => {
+      if (!carriesFiles(event)) return
+      event.preventDefault()
+      event.dataTransfer.dropEffect = 'copy'
+    },
+    onDragLeave: (event: DragEvent) => {
+      if (!carriesFiles(event)) return
+      dragDepth.current = Math.max(0, dragDepth.current - 1)
+      if (dragDepth.current === 0) setDragging(false)
+    },
+    onDrop: (event: DragEvent) => {
+      if (!carriesFiles(event)) return
+      event.preventDefault()
+      dragDepth.current = 0
+      setDragging(false)
+      const files = Array.from(event.dataTransfer.files)
+      if (files.length) void attachFiles(draftKey(conversation?.id), files)
+      useUi.getState().focusComposer()
+    },
   }
 
   return (
-    <div className="flex h-full min-w-0 flex-col">
-      <ModelBar />
-      <PinnedNotes />
+    <div className="relative flex h-full min-w-0 bg-ink-50 dark:bg-ink-950">
+      <div className="relative flex min-w-0 flex-1 flex-col" {...dropHandlers}>
+        <ChatHeader conversation={conversation} generating={generating} />
+        <ParametersDrawer />
 
-      <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
-        {visibleMessages.length === 0 ? (
-          <EmptyState icon="chat" title={runtime?.model_id ? `Chatting with ${runtime.model_id}` : 'No model loaded'}>
-            {models.length === 0 ? (
-              <>
-                No models are installed yet. Open <strong>Models → Discover</strong> to find one on Hugging Face — the list shows what
-                fits this machine before you download anything.
-                {/* Otherwise this reads as "nothing was installed" to someone who just watched
-                    1.7 GiB arrive. A class artifact is a real thing on disk; it is simply not a
-                    thing this window can load, and saying which is the difference between a
-                    confusing screen and an informative one. */}
-                {installedClass && (
-                  <>
-                    {' '}
-                    The <span className="mono">{installedClass.spec.name}</span> class artifact <em>is</em> installed — but it is
-                    not a chat model. It is what the <strong>node</strong> executes to produce blocks; this window drives the
-                    inference engine, which loads GGUF.
-                  </>
-                )}
-              </>
-            ) : runtime?.model_id ? (
-              <>Ask anything. Everything runs on this machine; nothing leaves it.</>
+        <div className="relative min-h-0 flex-1">
+          <div ref={scrollRef} onScroll={onScroll} className="h-full overflow-y-auto">
+            {empty ? (
+              <EmptyHero conversation={conversation}>
+                <Composer conversation={conversation} variant="hero" onSend={follow} />
+              </EmptyHero>
             ) : (
-              <>Pick a model above to load it, or just send a message — the runtime will load the first one for you.</>
+              <div className="mx-auto w-full max-w-[760px] px-4 pb-6 pt-6">
+                {rows.map((message, index) => {
+                  const previous = rows[index - 1]
+                  const reply = message.role !== 'user'
+                  const continuing = reply && previous !== undefined && previous.role !== 'user'
+                  return (
+                    // Every message reserves its action row below it, and that row is most of the gap.
+                    <div key={message.id} className={index === 0 ? '' : continuing ? 'mt-1' : 'mt-3'}>
+                      <Message
+                        message={message}
+                        agent={agent}
+                        last={index === rows.length - 1}
+                        generating={generating}
+                        editing={editingId === message.id}
+                        live={activeStream && message.id === activeStream.assistantId ? liveOf(activeStream) : null}
+                        showAvatar={reply && !continuing}
+                        actions={actions}
+                      />
+                    </div>
+                  )
+                })}
+              </div>
             )}
-          </EmptyState>
-        ) : (
-          <div className="mx-auto w-full max-w-3xl px-4 py-6">
-            {visibleMessages.map((message, index) => (
-              <Message
-                key={message.id}
-                message={message}
-                editing={editingId === message.id}
-                onEdit={() => setEditingId(message.id)}
-                onCancelEdit={() => setEditingId(null)}
-                onSaveEdit={async (content) => {
-                  setEditingId(null)
-                  followRef.current = true
-                  await editMessage(message.id, content)
-                }}
-                onRegenerate={
-                  message.role === 'assistant' && index === visibleMessages.length - 1 && !generating
-                    ? async () => {
-                        followRef.current = true
-                        await regenerate()
-                      }
-                    : undefined
-                }
-                onContinue={
-                  message.role === 'assistant' && index === visibleMessages.length - 1 && !generating && message.stats?.finishReason === 'length'
-                    ? async () => {
-                        followRef.current = true
-                        await continueGeneration()
-                      }
-                    : undefined
-                }
-              />
-            ))}
           </div>
-        )}
-      </div>
 
-      <div className="border-t border-ink-200 bg-ink-50/80 px-4 py-3 backdrop-blur dark:border-ink-800 dark:bg-ink-950/80">
-        <div className="mx-auto flex w-full max-w-3xl items-end gap-2">
-          <textarea
-            className="input max-h-52 min-h-[2.75rem] resize-y py-2.5"
-            rows={1}
-            placeholder={generating ? 'Generating…' : 'Send a message  (Enter to send, Shift+Enter for a new line)'}
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-                event.preventDefault()
-                if (!generating) void submit()
-              }
-            }}
-          />
-          {generating ? (
-            <button type="button" className="btn-outline h-11 px-4" onClick={stop} title="Stop generating">
-              <Icon name="stop" />
-              Stop
-            </button>
-          ) : (
-            <button type="button" className="btn-primary h-11 px-4" onClick={() => void submit()} disabled={!draft.trim()}>
-              <Icon name="send" />
-              Send
+          {!empty && (
+            <div className="pointer-events-none absolute inset-x-0 bottom-0 h-4 bg-linear-to-t from-ink-50 dark:from-ink-950" aria-hidden />
+          )}
+          {!empty && !atBottom && (
+            <button
+              type="button"
+              className="absolute bottom-3 left-1/2 z-10 inline-flex size-8 -translate-x-1/2 items-center justify-center rounded-full border border-ink-200 bg-white text-ink-600 shadow-md shadow-ink-950/10 transition-colors hover:text-ink-900 dark:border-ink-700 dark:bg-ink-850 dark:text-ink-300 dark:shadow-black/40 dark:hover:text-ink-50"
+              onClick={jumpToBottom}
+              aria-label="Jump to the latest message"
+              title="Jump to the latest message"
+            >
+              <Icon name="arrowDown" className="size-4" />
             </button>
           )}
         </div>
-      </div>
-    </div>
-  )
-}
 
-function Message({
-  message,
-  editing,
-  onEdit,
-  onCancelEdit,
-  onSaveEdit,
-  onRegenerate,
-  onContinue,
-}: {
-  message: ChatMessage
-  editing: boolean
-  onEdit: () => void
-  onCancelEdit: () => void
-  onSaveEdit: (content: string) => void
-  onRegenerate?: () => void
-  onContinue?: () => void
-}) {
-  const [draft, setDraft] = useState(message.content)
-  // A streamed assistant reply changes on every token. This draft only exists for the edit UI,
-  // so synchronising it while the message is merely being displayed creates a needless nested
-  // state update for every token (and could hit React's maximum-update-depth guard).
-  useEffect(() => {
-    if (editing) setDraft(message.content)
-  }, [message.content, editing])
-
-  const isUser = message.role === 'user'
-
-  return (
-    <div className={`group mb-6 flex gap-3 ${isUser ? 'justify-end' : ''}`}>
-      {!isUser && (
-        <img
-          src={misakaPi}
-          alt="MISAKA"
-          className="mt-1 size-9 shrink-0 rounded-lg bg-white object-contain p-0.5 shadow-sm dark:bg-ink-100"
-        />
-      )}
-
-      <div className={`min-w-0 ${isUser ? 'max-w-[85%]' : 'flex-1'}`}>
-        {editing ? (
-          <div className="card p-3">
-            <textarea className="input min-h-24 resize-y" value={draft} onChange={(event) => setDraft(event.target.value)} />
-            <div className="mt-2 flex justify-end gap-2">
-              <button type="button" className="btn-ghost" onClick={onCancelEdit}>
-                Cancel
-              </button>
-              <button type="button" className="btn-primary" onClick={() => onSaveEdit(draft)} disabled={!draft.trim()}>
-                Save and re-run
-              </button>
+        {!empty && (
+          <div className="shrink-0 px-4 pb-4 pt-1">
+            <div className="mx-auto w-full max-w-[760px]">
+              <Composer conversation={conversation} variant="dock" onSend={follow} onEditLast={editLast} />
             </div>
           </div>
-        ) : (
-          <div
-            className={
-              isUser
-                ? 'rounded-2xl rounded-br-md bg-arc-600 px-4 py-2.5 text-white'
-                : 'rounded-2xl rounded-bl-md bg-white px-4 py-3 shadow-sm dark:bg-ink-900'
-            }
-          >
-            {isUser ? (
-              <p className="whitespace-pre-wrap text-[0.94rem] leading-relaxed">{message.content}</p>
-            ) : message.content ? (
-              <Markdown streaming={message.streaming}>{message.content}</Markdown>
-            ) : message.streaming ? (
-              <Waiting />
-            ) : null}
-
-            {/* A reply that ran out of ceiling used to end mid-sentence and say nothing about it —
-                the reason was in a hover title. The lane decodes to its ceiling and the class's
-                context is fixed on chain, so this is the one number a person can actually act on. */}
-            {!isUser && !message.streaming && message.stats?.finishReason === 'length' && (
-              <div className="mt-2 rounded-lg bg-amber-50 p-2 text-xs text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
-                <p className="flex items-start gap-2">
-                <Icon name="stop" className="mt-0.5 size-3.5 shrink-0" />
-                <span>
-                  Cut at the {message.stats.completionTokens}-token ceiling — the model had not finished. This class's
-                  context is shared between the conversation and the reply, so a shorter chat leaves more of it for the
-                  answer.
-                </span>
-                </p>
-                {onContinue && (
-                  <button type="button" className="btn-outline mt-2 px-2 py-1 text-xs" onClick={onContinue}>
-                    続きを生成
-                  </button>
-                )}
-              </div>
-            )}
-
-            {!isUser && !message.streaming && message.context && <ContextLine report={message.context} />}
-
-            {message.error && (
-              <p className="mt-2 flex items-start gap-2 rounded-lg bg-red-50 p-2 text-xs text-red-700 dark:bg-red-950/40 dark:text-red-300">
-                <Icon name="warning" className="mt-0.5 size-3.5 shrink-0" />
-                {message.error}
-              </p>
-            )}
-          </div>
         )}
-        {!editing && isUser && message.mining && <MiningBadge mining={message.mining} />}
 
-        {!editing && (
-          <div className={`mt-1.5 flex items-center gap-1 text-xs text-ink-500 opacity-0 transition-opacity group-hover:opacity-100 dark:text-ink-400 ${isUser ? 'justify-end' : ''}`}>
-            {message.stats && (
-              <span className="mono mr-1 opacity-100" title={`${message.stats.completionTokens} tokens · ${message.stats.finishReason}`}>
-                {message.stats.tokensPerSecond.toFixed(1)} tok/s
-                {message.stats.timeToFirstTokenMs !== null && ` · first token ${duration(message.stats.timeToFirstTokenMs)}`}
-              </span>
-            )}
-            {message.content && <CopyButton text={message.content} label="Copy message" className="btn-ghost px-1.5 py-1" />}
-            {message.content && !message.streaming && <PinButton content={message.content} />}
-            {isUser && (
-              <button type="button" className="btn-ghost px-1.5 py-1" onClick={onEdit} title="Edit and re-run">
-                <Icon name="edit" className="size-3.5" />
-              </button>
-            )}
-            {onRegenerate && (
-              <button type="button" className="btn-ghost px-1.5 py-1" onClick={onRegenerate} title="Regenerate">
-                <Icon name="refresh" className="size-3.5" />
-              </button>
-            )}
+        {dragging && (
+          <div className="pointer-events-none absolute inset-2 z-40 flex items-center justify-center rounded-2xl border-2 border-dashed border-arc-500/60 bg-arc-500/5">
+            <div className="flex flex-col items-center gap-1.5 rounded-xl bg-white px-6 py-4 text-center shadow-lg dark:bg-ink-900">
+              <Icon name="upload" className="size-6 text-arc-600 dark:text-arc-400" />
+              <span className="text-sm font-medium">Drop to attach</span>
+              <span className="text-xs text-ink-500 dark:text-ink-400">Text files, up to 200 KB each — never mined</span>
+            </div>
           </div>
         )}
       </div>
-    </div>
-  )
-}
 
-/** Pin a message's text to the conversation. Trimmed; the pinned notes panel is where to edit it. */
-function PinButton({ content }: { content: string }) {
-  const addPin = useStudio((s) => s.addPin)
-  const toast = useStudio((s) => s.toast)
-  return (
-    <button
-      type="button"
-      className="btn-ghost px-1.5 py-1"
-      title="Pin to this conversation: kept in every request ahead of the history"
-      onClick={() => {
-        addPin(pinTextFromMessage(content))
-        toast('success', 'Pinned. Edit or remove it under Pinned notes.')
-      }}
-    >
-      <Icon name="pin" className="size-3.5" />
-    </button>
+      <RightPanel conversation={conversation} />
+    </div>
   )
 }

@@ -292,6 +292,8 @@ async fn generate(
         while let Some(event) = stream.next().await {
             match event.map_err(|e| e.to_string())? {
                 StreamEvent::Delta(d) => text.push_str(&d),
+                // Thinking was asked to be off; whatever a template does anyway is not the summary.
+                StreamEvent::Reasoning(_) => {}
                 StreamEvent::Done { .. } => break,
             }
         }

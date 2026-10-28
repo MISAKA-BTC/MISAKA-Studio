@@ -1,12 +1,10 @@
 //! `/api/v1/network` — participation in the MISAKA network, as an API.
 //!
-//! The shape mirrors the ladder: what the chain offers (`/classes` — the mining class list),
-//! what this machine is doing about it (`/` — role, node status, activity), and the two verbs
-//! that change that (`/node/start`, `/node/stop`). Everything a button does here is also a
-//! visible command line, because a person putting a bonded key on the line must be able to
-//! reproduce — and audit — what ran without this app.
+//! The Studio runs no node. What the chain offers (`/classes`), what its public nodes report (`/`), and the node-free
+//! miner (`/remote-miner/*`). Everything a button does here is also a visible command line, because a person putting a
+//! bonded key on the line must be able to reproduce — and audit — what ran without this app.
 
-use crate::node::NodeView;
+use crate::node::NodeStatus;
 use crate::state::AppState;
 use crate::{Error, Result};
 use axum::extract::{Path, Query, State};
@@ -14,9 +12,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use misaka_studio_core::palw;
 use misaka_studio_core::palw::{
-    PalwArtifactSource, PalwClassReadiness, PalwClassStatus, TESTNET11_CLASSES, assess_classes, read_artifact_header,
+    PalwArtifactSource, PalwClassReadiness, PalwClassStatus, GENESIS_CLASSES, assess_classes, read_artifact_header,
 };
-use misaka_studio_core::settings::{NetworkRole, NodeNetwork};
+use misaka_studio_core::settings::NodeNetwork;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -25,25 +23,28 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/", get(overview))
         .route("/classes", get(classes))
         .route("/classes/{name}/download", post(download_artifact))
-        .route("/node/start", post(start_node))
-        .route("/node/reset", post(reset_node))
-        .route("/node/stop", post(stop_node))
-        .route("/node/log", get(node_log))
-        .route("/blocks", get(produced_blocks))
+        .route("/published", get(published))
+        .route("/published/{name}/download", post(download_published))
+        .route("/prompt-stack", get(prompt_stack_view))
+        .route("/prompt-stack/preflight", get(prompt_stack_preflight))
+        .route("/prompt-stack/start", post(prompt_stack_start))
+        .route("/prompt-stack/stop", post(prompt_stack_stop))
+        .route("/remote-miner", get(remote_miner_view))
+        .route("/remote-miner/preflight", get(remote_miner_preflight))
+        .route("/remote-miner/checkpoint", get(remote_miner_checkpoint))
+        .route("/remote-miner/start", post(remote_miner_start))
+        .route("/remote-miner/stop", post(remote_miner_stop))
+        .route("/remote-miner/log", get(remote_miner_log))
         .route("/producer-key", post(producer_key))
-        .route("/faucet", post(super::pool::faucet_for_address))
 }
 
 /// The whole network picture in one response — what the UI's Network tab renders.
 #[derive(Serialize)]
 struct NetworkOverview {
-    role: NetworkRole,
     network: NodeNetwork,
-    node: NodeView,
+    /// The chain as each public node reports it — one node's word apiece (`UNVERIFIED_REMOTE_STATE`).
+    public_nodes: Vec<NodeStatus>,
     classes: Vec<PalwClassStatus>,
-    /// True when this build of the Studio found a node binary it could launch.
-    kaspad_found: bool,
-    kaspad_path: String,
 }
 
 /// Scan the models directory for PALW artifacts.
@@ -76,18 +77,10 @@ async fn artifact_scan(state: &AppState) -> Vec<(String, String, u64)> {
 
 async fn overview(State(state): State<Arc<AppState>>) -> Result<Json<NetworkOverview>> {
     let settings = state.settings.read().await.clone();
-    let node = state.node.view(&settings.node).await?;
+    let public_nodes = crate::node::public_status(settings.node.network).await;
     let artifacts = artifact_scan(&state).await;
     let classes = with_artifact_headers(assess_classes(&artifacts, state.hardware.total_memory));
-    let kaspad = crate::node::NodeManager::resolve_kaspad(settings.node.kaspad_path.as_ref());
-    Ok(Json(NetworkOverview {
-        role: settings.node.role,
-        network: settings.node.network,
-        node,
-        classes,
-        kaspad_found: kaspad.is_file(),
-        kaspad_path: kaspad.display().to_string(),
-    }))
+    Ok(Json(NetworkOverview { network: settings.node.network, public_nodes, classes }))
 }
 
 /// Read each present artifact's header (64 bytes apiece), so a class card can say what the file on
@@ -110,14 +103,14 @@ async fn classes(State(state): State<Arc<AppState>>) -> Json<Vec<PalwClassStatus
 
 /// Download a class artifact into the models directory, verified against the chain-pinned digest.
 ///
-/// Only the classes whose artifact is published as a file (QWEN36) can be downloaded; a
-/// convert-locally class answers 400 carrying the conversion command instead — an error that
-/// tells the user the actual next step.
+/// Only classes whose artifact is published as a file can be downloaded; a convert-locally
+/// class (QWEN36-2M until that file is published) answers 400 carrying the conversion command
+/// instead — an error that tells the user the actual next step.
 async fn download_artifact(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<crate::download::DownloadProgress>> {
-    let spec = TESTNET11_CLASSES
+    let spec = GENESIS_CLASSES
         .iter()
         .find(|class| class.name.eq_ignore_ascii_case(&name))
         .ok_or_else(|| Error::bad_request(format!("no PALW class named '{name}'")))?;
@@ -144,6 +137,27 @@ async fn download_artifact(
                     None,
                 )
                 .await?;
+            // The class's pinned tokenizer, beside the artifact: the free-prompt worker reads both, and a chat load is no
+            // longer the only thing that asks for it. Verified against its pinned digest like the artifact.
+            if let (Some(pin), Some(name)) = (spec.tokenizer, spec.tokenizer_filename()) {
+                let url = catalog.download_url(pin.hf_repo, "main", pin.repo_path);
+                if let Err(e) = state
+                    .downloads
+                    .fetch(
+                        format!("{}/{}", pin.hf_repo, name),
+                        pin.hf_repo.to_string(),
+                        name.clone(),
+                        format!("{} tokenizer", spec.name),
+                        url,
+                        settings.models_dir.join(&name),
+                        Some(pin.sha256.to_string()),
+                        Some(pin.size_bytes),
+                    )
+                    .await
+                {
+                    tracing::warn!(class = spec.name, "could not fetch the class tokenizer: {e}");
+                }
+            }
             Ok(Json(progress))
         }
         PalwArtifactSource::ConvertLocally { convert_command, source_repo, .. } => Err(Error::bad_request(format!(
@@ -156,74 +170,17 @@ async fn download_artifact(
     }
 }
 
-/// Restart the node after deleting a data directory that holds a different chain.
+/// The default class's artifact in the models directory, when it is there whole — what the free-prompt worker is given.
 ///
-/// A separate verb from `/node/start`, not a flag on it: this one destroys the local chain, and a
-/// caller cannot reach it by leaving a field unset. It refuses unless the node actually said the
-/// data was stale — so it cannot be used as a general "wipe my node" button, and a user who clicks
-/// it is answering the exact question the node asked.
-async fn reset_node(State(state): State<Arc<AppState>>) -> Result<Json<NodeView>> {
-    let settings = state.settings.read().await.clone();
-    let view = state.node.view(&settings.node).await?;
-    if !matches!(view.blocker, Some(crate::node::NodeBlocker::StaleChainData { .. })) {
-        return Err(Error::bad_request(
-            "this node did not report stale chain data — nothing here would delete a chain on a guess.              Start it normally and read what it says.",
-        ));
-    }
-    let mut node_settings = settings.node.clone();
-    if node_settings.class_artifact.is_none() {
-        node_settings.class_artifact = default_class_artifact(&settings.models_dir).await;
-    }
-    Ok(Json(state.node.start_accepting_data_loss(&node_settings).await?))
-}
-
-#[derive(Deserialize)]
-struct StartBody {
-    /// Override the configured role for this launch, e.g. start as verifier while producer
-    /// prerequisites are still being gathered.
-    #[serde(default)]
-    role: Option<NetworkRole>,
-}
-
-async fn start_node(State(state): State<Arc<AppState>>, body: Option<Json<StartBody>>) -> Result<Json<NodeView>> {
-    let settings = state.settings.read().await.clone();
-    let mut node_settings = settings.node.clone();
-    if let Some(Json(StartBody { role: Some(role) })) = body {
-        node_settings.role = role;
-    }
-    if node_settings.class_artifact.is_none() {
-        node_settings.class_artifact = default_class_artifact(&settings.models_dir).await;
-    }
-    // **Disarm before the node can succeed at it, not after.** A class registration is one
-    // transaction; the flag that files it must not survive into a second start. Written back
-    // ahead of the launch because a start that half-fails still ran the node, and a flag cleared
-    // only on the success path is a flag that files a second registration after a crash.
-    if crate::node::NodeManager::start_would_register_class(&node_settings) {
-        let mut next = settings.clone();
-        next.node.register_class = None;
-        state.apply_settings(next).await?;
-    }
-    Ok(Json(state.node.start(&node_settings).await?))
-}
-
-/// The default class's artifact, when this machine holds it.
-///
-/// Resolved at launch instead of being written into the settings file on first run, because it is
-/// a path *under the models directory*: pinning it once would keep naming the old directory the
-/// moment someone moves their models, and the node would then refuse to produce over a file that
-/// is sitting right where it should be. Left `None` when the file is absent or the wrong size, so
-/// an empty setting still means "mine the floor" rather than "fail to start".
-async fn default_class_artifact(models_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+/// Resolved at launch instead of being written into the settings file, because it is a path *under the models directory*:
+/// pinning it once would keep naming the old directory the moment someone moves their models. `None` when the file is
+/// absent or the wrong size.
+pub(crate) async fn default_class_artifact(models_dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let spec = misaka_studio_core::palw::default_class();
     let PalwArtifactSource::Download { filename, size_bytes, .. } = &spec.artifact else { return None };
     let path = models_dir.join(filename);
     let meta = tokio::fs::metadata(&path).await.ok()?;
     (meta.len() == *size_bytes).then_some(path)
-}
-
-async fn stop_node(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>> {
-    state.node.stop().await?;
-    Ok(Json(serde_json::json!({ "stopped": true })))
 }
 
 #[derive(Deserialize)]
@@ -234,21 +191,6 @@ struct LogQuery {
 
 fn default_log_limit() -> usize {
     200
-}
-
-async fn node_log(State(state): State<Arc<AppState>>, Query(query): Query<LogQuery>) -> Json<Vec<String>> {
-    Json(state.node.recent_log(query.limit.min(600)))
-}
-
-/// `GET /api/v1/network/blocks` — **the blocks this machine has produced**, newest first.
-///
-/// Its own route rather than a field on the overview: each row costs a `getBlock` against the
-/// node, and the overview is polled every few seconds by every open tab. The explorer card asks
-/// for this when it is looked at.
-pub async fn produced_blocks(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>> {
-    let settings = state.settings.read().await.node.clone();
-    let blocks = state.node.produced_blocks(&settings, 50).await;
-    Ok(Json(serde_json::json!({ "blocks": blocks })))
 }
 
 /// `POST /api/v1/network/producer-key` — mint the producer's ML-DSA-87 seed on this machine.
@@ -262,16 +204,11 @@ pub async fn produced_blocks(State(state): State<Arc<AppState>>) -> Result<Json<
 /// seed — a producer key that is replaced silently is a bond that can no longer sign.
 async fn producer_key(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>> {
     let settings = state.settings.read().await.clone();
-    // **Never mint a key while a node is running under the old one.** The seed IS the bond: a
-    // supervised producer signs its attempts with the key it started with, and a bond registered
-    // by that key cannot be signed for by any other. Minting here would leave the running node
-    // producing under a key the settings no longer name, and the failure surfaces much later as
-    // the node's own "the local signing key is not the one this bond registered" — which is
-    // exactly what a rehearsal hit on 2026-09-04 after its data directory was recreated under a
-    // still-running daemon.
-    if state.node.is_supervising().await {
+    // **Never mint a key while the node-free miner signs under the old one**: the seed IS the bond, and a running miner
+    // would keep signing under a key the settings no longer name.
+    if state.remote_miner.view(&settings.node, &state.data_dir).await.running {
         return Err(Error::bad_request(
-            "a node is running under the current producer key — stop it before minting another, or its bond becomes unsignable",
+            "the node-free miner is running under the current key — stop it before minting another, or its bond becomes unsignable",
         ));
     }
     let path = state.data_dir.join("producer.seed");
@@ -300,7 +237,7 @@ async fn producer_key(State(state): State<Arc<AppState>>) -> Result<Json<serde_j
     state.apply_settings(new).await?;
     Ok(Json(serde_json::json!({
         "producer_key_path": path.display().to_string(),
-        "next": "start the node as a producer: it registers a bond under this key and prints the address to fund",
+        "next": "register a bond under this key without a node (`misaka bond register-export / sign / submit`), then fund the key's address for carrier fees",
     })))
 }
 
@@ -323,8 +260,7 @@ mod tests {
         }
     }
 
-    /// An empty models directory must not produce a path. Handing the node an artifact flag
-    /// pointing at nothing would turn "mine the floor" into a node that refuses to start.
+    /// An empty models directory must not produce a path.
     #[tokio::test]
     async fn no_artifact_means_no_flag() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -352,4 +288,149 @@ mod tests {
 
         assert_eq!(default_class_artifact(dir.path()).await, Some(path));
     }
+}
+
+
+/// `GET /api/v1/network/remote-miner` — the node-free miner: running or not, the command the settings would run, and what
+/// its event lines said.
+async fn remote_miner_view(State(state): State<Arc<AppState>>) -> Json<crate::remote_miner::RemoteMinerView> {
+    let settings = state.settings.read().await.node.clone();
+    Json(state.remote_miner.view(&settings, &state.data_dir).await)
+}
+
+/// `GET /api/v1/network/remote-miner/preflight` — the published nodes read through their JSON twins, the binaries found or
+/// not, and every value the command still lacks. Local observations of remote nodes, not proofs.
+async fn remote_miner_preflight(State(state): State<Arc<AppState>>) -> Json<crate::remote_miner::Preflight> {
+    let settings = state.settings.read().await.node.clone();
+    Json(crate::remote_miner::preflight(&settings, &state.data_dir).await)
+}
+
+/// `GET /api/v1/network/remote-miner/checkpoint` — a checkpoint read from one node and confirmed by another. A suggestion:
+/// nothing is written; the user saves it into `node.remote.checkpoint` after comparing it.
+async fn remote_miner_checkpoint(State(state): State<Arc<AppState>>) -> Result<Json<crate::remote_miner::CheckpointSuggestion>> {
+    let settings = state.settings.read().await.node.clone();
+    Ok(Json(crate::remote_miner::suggest_checkpoint(&settings).await?))
+}
+
+async fn remote_miner_start(State(state): State<Arc<AppState>>) -> Result<Json<crate::remote_miner::RemoteMinerView>> {
+    let settings = state.settings.read().await.node.clone();
+    Ok(Json(state.remote_miner.start(&settings, &state.data_dir).await?))
+}
+
+async fn remote_miner_stop(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>> {
+    state.remote_miner.stop().await?;
+    Ok(Json(serde_json::json!({ "stopped": true })))
+}
+
+async fn remote_miner_log(State(state): State<Arc<AppState>>, Query(query): Query<LogQuery>) -> Json<Vec<String>> {
+    Json(state.remote_miner.recent_log(query.limit.min(600)))
+}
+
+
+/// `GET /api/v1/network/prompt-stack` — the node-free prompt-mining stack: the gateway and the rail, the commands the
+/// settings would run, the carriers the rail built and both logs.
+async fn prompt_stack_view(State(state): State<Arc<AppState>>) -> Json<crate::fp_stack::StackView> {
+    let settings = state.settings.read().await.clone();
+    let artifact = default_class_artifact(&settings.models_dir).await;
+    Json(state.prompt_stack.view(&settings.node, &state.data_dir, artifact).await)
+}
+
+/// `GET /api/v1/network/prompt-stack/preflight` — binaries, artifact, tokenizer, key, the public node and the evidence
+/// provider, each checked from here.
+async fn prompt_stack_preflight(State(state): State<Arc<AppState>>) -> Json<crate::fp_stack::StackPreflight> {
+    let settings = state.settings.read().await.clone();
+    let artifact = default_class_artifact(&settings.models_dir).await;
+    Json(crate::fp_stack::preflight(&settings.node, &state.data_dir, artifact).await)
+}
+
+async fn prompt_stack_start(State(state): State<Arc<AppState>>) -> Result<Json<crate::fp_stack::StackView>> {
+    let settings = state.settings.read().await.clone();
+    let artifact = default_class_artifact(&settings.models_dir).await;
+    let view = state.prompt_stack.start(&settings.node, &state.data_dir, artifact).await?;
+    // **The chat answers through the gateway it just started**: the answer IS the work. Pointed only when nothing else is
+    // configured, so a gateway the person chose by hand is never replaced behind their back.
+    if settings.node.palw_gateway_url.is_none() {
+        let mut next = settings.clone();
+        next.node.palw_gateway_url = Some(crate::fp_stack::gateway_url(&settings.node));
+        state.apply_settings(next).await?;
+    }
+    Ok(Json(view))
+}
+
+async fn prompt_stack_stop(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>> {
+    state.prompt_stack.stop().await?;
+    // Undo the pointing above: a chat sent to a stopped gateway is a chat that fails.
+    let settings = state.settings.read().await.clone();
+    let own = format!("http://{}", settings.node.free_prompt.listen);
+    if settings.node.palw_gateway_url.as_deref() == Some(own.as_str()) {
+        let mut next = settings.clone();
+        next.node.palw_gateway_url = None;
+        state.apply_settings(next).await?;
+    }
+    Ok(Json(serde_json::json!({ "stopped": true })))
+}
+
+
+/// One published PALWART3 model and whether all of it is on disk.
+#[derive(Serialize)]
+struct PublishedView {
+    model: &'static palw::PublishedPalwart,
+    present: bool,
+    /// Where the index lands; `palwart verify` reads its segments beside it.
+    index_path: String,
+    total_bytes: u64,
+    /// Always false today: none of these is a class of the live network, so none mines.
+    registered: bool,
+}
+
+/// `GET /api/v1/network/published` — PALW models published as PALWART3 that this network has not registered.
+async fn published(State(state): State<Arc<AppState>>) -> Json<Vec<PublishedView>> {
+    let dir = state.settings.read().await.models_dir.clone();
+    Json(
+        palw::PUBLISHED_PALWART3
+            .iter()
+            .map(|m| PublishedView {
+                model: m,
+                present: palw::published_present(m, &dir),
+                index_path: dir.join(m.index.filename()).display().to_string(),
+                total_bytes: m.total_bytes(),
+                registered: false,
+            })
+            .collect(),
+    )
+}
+
+/// `POST /api/v1/network/published/{name}/download` — fetch the index and every segment into the models directory, each
+/// pinned to the repository commit and verified against its SHA-256. Returns the index's progress; the segments appear
+/// in the download list beside it.
+async fn download_published(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<Vec<crate::download::DownloadProgress>>> {
+    let model = palw::PUBLISHED_PALWART3
+        .iter()
+        .find(|m| m.name.eq_ignore_ascii_case(&name))
+        .ok_or_else(|| Error::bad_request(format!("no published PALW model named '{name}'")))?;
+    let dir = state.settings.read().await.models_dir.clone();
+    let catalog = state.catalog().await;
+    let mut out = Vec::new();
+    for file in model.files() {
+        let url = catalog.download_url(model.hf_repo, model.revision, file.repo_path);
+        out.push(
+            state
+                .downloads
+                .fetch(
+                    format!("{}/{}", model.hf_repo, file.repo_path),
+                    model.hf_repo.to_string(),
+                    file.repo_path.to_string(),
+                    model.name.to_string(),
+                    url,
+                    dir.join(file.filename()),
+                    Some(file.sha256.to_string()),
+                    Some(file.size_bytes),
+                )
+                .await?,
+        );
+    }
+    Ok(Json(out))
 }

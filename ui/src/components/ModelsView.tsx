@@ -12,7 +12,7 @@ import type { CatalogEntry, CatalogRepo, DownloadProgress, HardwareSnapshot } fr
 import { useStudio } from '../store/studio'
 import { EmptyState, FitBadge, Icon, QuantBadge, Spinner } from './common'
 import { ContextBadge } from './ContextBadge'
-import { InstalledMiningArtifacts, MiningCatalog } from './MiningCatalog'
+import { InstalledMiningArtifacts, MiningCatalog, PublishedPalwModels } from './MiningCatalog'
 
 export function ModelsView() {
   const [tab, setTab] = useState<'installed' | 'discover'>('installed')
@@ -337,6 +337,7 @@ function DiscoverPanel() {
           "Misakachain/Qwen3.6-35B-A3B-PALW-runtime" into a search box — so a search-only Discover
           hid the only models on this page that can earn anything. */}
       <MiningCatalog />
+      <PublishedPalwModels />
 
       <h3 className="mt-6 text-sm font-semibold">Any other GGUF model</h3>
       <p className="mb-3 mt-1 text-xs text-ink-500 dark:text-ink-400">

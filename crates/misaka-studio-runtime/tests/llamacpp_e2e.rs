@@ -139,6 +139,7 @@ async fn a_real_engine_loads_streams_and_identifies_itself() {
     while let Some(event) = stream.next().await {
         match event.expect("no stream error") {
             StreamEvent::Delta(delta) => text.push_str(&delta),
+            StreamEvent::Reasoning(_) => {}
             StreamEvent::Done { usage, finish_reason } => done = Some((usage, finish_reason)),
         }
     }

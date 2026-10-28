@@ -15,6 +15,11 @@
 //! desktop app is friction with no threat model. Setting `server.api_key` turns on a bearer check
 //! over both surfaces — and binding to a non-loopback address without setting one is refused at
 //! startup rather than served insecurely.
+//!
+//! "Loopback" is not the whole threat model, though: every website the person has open can send
+//! requests to 127.0.0.1. So `/api/v1` answers only the Studio's own window (and origins listed in
+//! `server.cors_origins`), and checks the `Host` header against DNS rebinding — see [`guard`].
+//! `/v1` stays open, which is what an OpenAI-compatible local endpoint is for.
 
 use crate::state::AppState;
 use axum::extract::{Request, State};
@@ -27,20 +32,31 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 pub mod engines;
+pub mod guard;
+pub mod images;
 pub mod management;
 pub mod mining_queue;
 pub mod model_market;
 pub mod network;
 pub mod openai;
-pub mod pool;
 pub mod prompt_mining;
 pub mod ui;
+pub mod workspace;
 
 /// Build the whole application router.
 pub fn router(state: Arc<AppState>, ui_dir: Option<PathBuf>, cors_origins: Vec<String>) -> axum::Router {
     let api = axum::Router::new()
+        // `/v1` is open to any origin the CORS layer below allows — "any", by default: a page or an
+        // app on this machine calling the local model is what the OpenAI-compatible endpoint is for.
         .merge(openai::router())
-        .nest("/api/v1", management::router())
+        // `/api/v1` changes settings, starts downloads and engines and reads the record log, so it
+        // answers the Studio's own window and the origins listed in `server.cors_origins` only.
+        .nest("/api/v1", management::router().route_layer(axum::middleware::from_fn_with_state(state.clone(), guard::studio)))
+        // The coding agent's file and process API: the stricter guard, which no listing reaches.
+        .nest(
+            "/api/v1/workspace",
+            workspace::router().route_layer(axum::middleware::from_fn_with_state(state.clone(), guard::workspace)),
+        )
         .layer(axum::middleware::from_fn_with_state(state.clone(), authenticate))
         .layer(cors_layer(cors_origins))
         .with_state(state);
@@ -61,10 +77,13 @@ pub fn router(state: Arc<AppState>, ui_dir: Option<PathBuf>, cors_origins: Vec<S
 ///
 /// The UI is same-origin, so nothing needs this by default. It exists for the case the API is
 /// really for: a web page or another app on the same machine calling the local endpoint, which
-/// the browser blocks without it.
+/// the browser blocks without it. What it allows is what a browser lets a page *read*; whether
+/// `/api/v1` answers at all is the guard's decision ([`guard`]), which this layer cannot widen.
 fn cors_layer(origins: Vec<String>) -> CorsLayer {
     let layer = CorsLayer::new().allow_methods(Any).allow_headers(Any);
-    if origins.is_empty() {
+    // `"*"` in the list means any origin, as it does to the guard. tower-http refuses a wildcard
+    // inside a list — it panics building the layer — so it is answered here instead.
+    if origins.is_empty() || origins.iter().any(|o| o.trim() == "*") {
         return layer.allow_origin(Any);
     }
     let parsed: Vec<_> = origins.iter().filter_map(|o| o.parse::<header::HeaderValue>().ok()).collect();

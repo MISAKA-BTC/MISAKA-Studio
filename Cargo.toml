@@ -32,6 +32,7 @@ misaka-studio-core = { version = "0.1.2", path = "crates/misaka-studio-core" }
 
 anyhow = "1"
 axum = { version = "0.8", features = ["macros", "ws"] }
+base64 = "0.22"
 blake2b_simd = "1.0"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -49,7 +50,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["io"] }
 # Plain ws:// to a loopback node; no TLS feature on purpose.
-tokio-tungstenite = "0.23"
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

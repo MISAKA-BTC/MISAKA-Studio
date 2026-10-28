@@ -20,6 +20,7 @@
 //! identity, which is worse than no identity.
 
 use crate::{Error, Result};
+use misaka_studio_core::image_model::LocalImageModel;
 use misaka_studio_core::model::{LocalModel, ModelSource};
 use misaka_studio_core::palw;
 use misaka_studio_core::quant::Quantization;
@@ -69,11 +70,19 @@ impl Sidecar {
 pub struct ModelStore {
     roots: RwLock<Vec<PathBuf>>,
     cache: RwLock<Arc<Vec<LocalModel>>>,
+    /// Diffusers-format checkpoints found in the same roots, kept separately: an image model is
+    /// not a value [`LocalModel`]'s GGUF-shaped fields can hold, and it is loaded by a different
+    /// backend seam ([`crate::backend::ImageBackend`], not [`crate::backend::InferenceBackend`]).
+    image_cache: RwLock<Arc<Vec<LocalImageModel>>>,
 }
 
 impl ModelStore {
     pub fn new(roots: Vec<PathBuf>) -> Self {
-        ModelStore { roots: RwLock::new(roots), cache: RwLock::new(Arc::new(Vec::new())) }
+        ModelStore {
+            roots: RwLock::new(roots),
+            cache: RwLock::new(Arc::new(Vec::new())),
+            image_cache: RwLock::new(Arc::new(Vec::new())),
+        }
     }
 
     pub async fn roots(&self) -> Vec<PathBuf> {
@@ -86,22 +95,38 @@ impl ModelStore {
         self.refresh().await
     }
 
-    /// Walk the directories and rebuild the list.
+    /// Walk the directories and rebuild both lists. One walk of the disk serves both — a
+    /// diffusers checkpoint and a GGUF are never the same file, but scanning twice would still
+    /// mean stalling the same slow network drive twice for no benefit.
     pub async fn refresh(&self) -> Result<Arc<Vec<LocalModel>>> {
         let roots = self.roots.read().await.clone();
         // Blocking: a scan is filesystem work, and doing it on the async runtime stalls every
         // in-flight generation on a slow network drive.
-        let models = tokio::task::spawn_blocking(move || scan_roots(&roots))
+        let (models, image_models) = tokio::task::spawn_blocking(move || scan_roots(&roots))
             .await
             .map_err(|e| Error::io("model scan", std::io::Error::other(e)))?;
         let models = Arc::new(models);
         *self.cache.write().await = models.clone();
+        *self.image_cache.write().await = Arc::new(image_models);
         Ok(models)
     }
 
     /// The last scan's result. Cheap; call [`Self::refresh`] to make it current.
     pub async fn list(&self) -> Arc<Vec<LocalModel>> {
         self.cache.read().await.clone()
+    }
+
+    /// The diffusers-format checkpoints found by the last scan.
+    pub async fn list_images(&self) -> Arc<Vec<LocalImageModel>> {
+        self.image_cache.read().await.clone()
+    }
+
+    pub async fn get_image(&self, id: &str) -> Option<LocalImageModel> {
+        self.image_cache.read().await.iter().find(|m| m.id == id).cloned()
+    }
+
+    pub async fn require_image(&self, id: &str) -> Result<LocalImageModel> {
+        self.get_image(id).await.ok_or_else(|| Error::ModelNotFound { id: id.to_string() })
     }
 
     pub async fn get(&self, id: &str) -> Option<LocalModel> {
@@ -211,17 +236,20 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn scan_roots(roots: &[PathBuf]) -> Vec<LocalModel> {
+fn scan_roots(roots: &[PathBuf]) -> (Vec<LocalModel>, Vec<LocalImageModel>) {
     let mut found: HashMap<String, LocalModel> = HashMap::new();
+    let mut found_images: HashMap<String, LocalImageModel> = HashMap::new();
     for root in roots {
-        scan_dir(root, 0, &mut found);
+        scan_dir(root, 0, &mut found, &mut found_images);
     }
     let mut models: Vec<LocalModel> = found.into_values().collect();
     models.sort_by_key(|m| m.name.to_lowercase());
-    models
+    let mut image_models: Vec<LocalImageModel> = found_images.into_values().collect();
+    image_models.sort_by_key(|m| m.name.to_lowercase());
+    (models, image_models)
 }
 
-fn scan_dir(dir: &Path, depth: usize, found: &mut HashMap<String, LocalModel>) {
+fn scan_dir(dir: &Path, depth: usize, found: &mut HashMap<String, LocalModel>, found_images: &mut HashMap<String, LocalImageModel>) {
     if depth > MAX_DEPTH {
         return;
     }
@@ -235,13 +263,20 @@ fn scan_dir(dir: &Path, depth: usize, found: &mut HashMap<String, LocalModel>) {
         let Ok(file_type) = entry.file_type() else { continue };
 
         if file_type.is_dir() {
+            // A diffusers checkpoint is a directory named by `model_index.json`, checked before
+            // the MLX directory shape below — the two never collide (MLX ships `config.json`,
+            // diffusers ships `model_index.json`) but the more specific signal goes first.
+            if let Some(model) = inspect_diffusers_dir(&path) {
+                found_images.entry(model.id.clone()).or_insert(model);
+                continue;
+            }
             // An MLX model is a directory, so a directory is checked as a model before being
             // descended into.
             if let Some(model) = inspect_mlx_dir(&path) {
                 found.entry(model.id.clone()).or_insert(model);
                 continue;
             }
-            scan_dir(&path, depth + 1, found);
+            scan_dir(&path, depth + 1, found, found_images);
             continue;
         }
 
@@ -374,6 +409,68 @@ fn inspect_mlx_dir(path: &Path) -> Option<LocalModel> {
     })
 }
 
+/// A diffusers checkpoint directory: `model_index.json` plus `.safetensors` weights, directly
+/// inside or one level down (`unet/`, `transformer/`, `vae/`, `text_encoder/`, ...) — the
+/// standard Hugging Face `diffusers` layout. Checked before [`inspect_mlx_dir`] in [`scan_dir`]:
+/// the two shapes never overlap (MLX ships `config.json` at the top level, diffusers ships
+/// `model_index.json`), but the more specific file name is the one to trust first.
+fn inspect_diffusers_dir(path: &Path) -> Option<LocalImageModel> {
+    let index_path = path.join("model_index.json");
+    if !index_path.is_file() {
+        return None;
+    }
+    if !dir_has_safetensors(path, 0) {
+        return None;
+    }
+
+    let index: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&index_path).ok()?).ok()?;
+    let id = path.file_name()?.to_string_lossy().into_owned();
+    let size_bytes = dir_size(path);
+    let architecture = index.get("_class_name").and_then(|v| v.as_str()).map(str::to_string);
+    // A checkpoint is worth offering reference/edit images for when its own pipeline class says
+    // so (Qwen-Image-Edit, an Img2Img/Inpaint/ControlNet variant) or it declares an image
+    // encoder component — better than guessing from the model's name, which the directory need
+    // not match.
+    let supports_reference_images = architecture
+        .as_deref()
+        .map(|a| a.contains("Img2Img") || a.contains("Edit") || a.contains("Inpaint") || a.contains("ControlNet"))
+        .unwrap_or(false)
+        || index.get("image_encoder").is_some();
+    let modified_at = std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+
+    Some(LocalImageModel {
+        name: id.clone(),
+        id,
+        path: path.to_path_buf(),
+        size_bytes,
+        architecture,
+        supports_reference_images,
+        source: Sidecar::load(path).source,
+        sha256: None,
+        modified_at,
+    })
+}
+
+/// Whether a directory has `.safetensors` files at its top level or one level down — diffusers
+/// checkpoints commonly split weights across component subfolders.
+fn dir_has_safetensors(path: &Path, depth: usize) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else { return false };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else { continue };
+        if file_type.is_file() && entry.file_name().to_string_lossy().ends_with(".safetensors") {
+            return true;
+        }
+        if file_type.is_dir() && depth == 0 && dir_has_safetensors(&entry.path(), depth + 1) {
+            return true;
+        }
+    }
+    false
+}
+
 fn dir_size(path: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(path) else { return 0 };
     entries
@@ -504,5 +601,53 @@ mod tests {
         assert_eq!(model.block_count, Some(36));
         assert_eq!(model.quantization.as_ref().expect("quant").label, "MLX-4bit");
         assert!(model.size_bytes >= 128);
+    }
+
+    #[tokio::test]
+    async fn a_diffusers_directory_is_one_image_model_kept_apart_from_chat_models() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model_dir = dir.path().join("qwen-image-2.1");
+        std::fs::create_dir(&model_dir).expect("mkdir");
+        std::fs::write(model_dir.join("model_index.json"), r#"{"_class_name":"QwenImageEditPipeline"}"#).expect("write index");
+        std::fs::create_dir(model_dir.join("transformer")).expect("mkdir transformer");
+        std::fs::write(model_dir.join("transformer/diffusion_pytorch_model.safetensors"), vec![0u8; 256]).expect("write weights");
+
+        let store = ModelStore::new(vec![dir.path().to_path_buf()]);
+        store.refresh().await.expect("scans");
+
+        assert!(store.list().await.is_empty(), "a diffusers checkpoint is not a chat model");
+        let images = store.list_images().await;
+        assert_eq!(images.len(), 1);
+        let model = &images[0];
+        assert_eq!(model.id, "qwen-image-2.1");
+        assert_eq!(model.architecture.as_deref(), Some("QwenImageEditPipeline"));
+        assert!(model.supports_reference_images, "an Edit pipeline supports reference images");
+        assert!(model.size_bytes >= 256);
+
+        let fetched = store.require_image("qwen-image-2.1").await.expect("found by id");
+        assert_eq!(fetched.id, model.id);
+    }
+
+    /// An MLX chat model and a diffusers image model must not be confused for one another even
+    /// when scanned from the same root.
+    #[tokio::test]
+    async fn mlx_and_diffusers_directories_coexist_without_crossing_lists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let mlx_dir = dir.path().join("Qwen3-4B-mlx");
+        std::fs::create_dir(&mlx_dir).expect("mkdir");
+        std::fs::write(mlx_dir.join("config.json"), r#"{"model_type":"qwen3"}"#).expect("write config");
+        std::fs::write(mlx_dir.join("model.safetensors"), vec![0u8; 64]).expect("write weights");
+
+        let image_dir = dir.path().join("flux-klein");
+        std::fs::create_dir(&image_dir).expect("mkdir");
+        std::fs::write(image_dir.join("model_index.json"), r#"{"_class_name":"FluxPipeline"}"#).expect("write index");
+        std::fs::write(image_dir.join("diffusion_pytorch_model.safetensors"), vec![0u8; 64]).expect("write weights");
+
+        let store = ModelStore::new(vec![dir.path().to_path_buf()]);
+        store.refresh().await.expect("scans");
+
+        assert_eq!(store.list().await.len(), 1, "only the MLX directory is a chat model");
+        assert_eq!(store.list_images().await.len(), 1, "only the diffusers directory is an image model");
     }
 }

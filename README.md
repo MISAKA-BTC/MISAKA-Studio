@@ -100,6 +100,62 @@ Linux needs the webview development packages (`libwebkit2gtk-4.1-dev`, `libgtk-3
 Windows have their webviews already. Bundle icons for Windows and macOS are generated from
 `desktop/src-tauri/icons/icon.png` with `cargo tauri icon`.
 
+## Working in the window
+
+The window has two sides, switched at the top of the sidebar the way Claude's desktop app does it:
+**Chat** — conversations with the loaded model — and **Code** — coding-agent sessions, grouped by the
+project folder they work in. Each side remembers the thread it had open. And it is built to be driven
+from the keyboard, the way an editor is.
+
+| Key | Does |
+|---|---|
+| `⌘⇧1` · `⌘⇧2` | Chat · Code |
+| `⌘K` / `Ctrl+K` | Command palette: every action, every thread (titles and message text), every installed model, and the prompt-mining controls |
+| `⌘N` (`⌘⇧O` in a browser tab) · `⌘⇧A` | New chat or session on this side · new Code session |
+| `⌘B` · `⌘,` · `⌘1`…`⌘6` | Sidebar · Settings · the six views |
+| `⌘L` · `⌘/` | Focus the composer · every shortcut |
+| `⌘⌥B` · `⌘⇧G` · `⌘J` · `⌘⇧E` | Code: session summary · changes · terminal · files |
+| `⌘⇧M` | Mining panel |
+| `Esc` | Stop the reply or the agent |
+
+**The Code side** is a session per task, in a project folder. Beside it: a **session summary** (the
+folder, its git branch and how many files are changed, the approval policy, how full the model's
+window is, what the session has changed and mined); **Changes** — the working tree's git status with
+a diff for every file, and below it the agent's own edits with Revert; a **terminal** bound to the
+folder (output streams as it is written, Ctrl+C stops the command and everything it started, and a
+block's output can be sent to the agent); and a **file browser** with a highlighted viewer and
+"Mention" to hand a file to the agent.
+
+**The composer carries everything you change while working**: the model (with the context size to
+load it at), attached text files (drag them in, paste them, or `@`-mention a file in a Code session),
+and `/` commands — `/model`, `/clear`, `/rename`, `/export`, `/mine on|off`, `/think on|off`,
+`/chat`, `/code`, `/help`. A thinking model's reasoning streams into a block above its
+answer and folds to "Thought for 12s" when the answer starts. Threads are grouped by day in the
+sidebar; star, rename (double-click) and export them as Markdown from there or from the palette.
+
+**Code sessions work in a folder.** Open one (`⌘⇧A`, or Open folder… on the Code side), describe a task, and the
+local model lists, reads and searches files, edits them, and runs commands in that folder — one
+tool call per step, in the Qwen3 XML tool format that small local models follow most reliably. What
+it may do without asking is the thread's choice: *Read only*, *Ask* (every edit and command waits),
+*Auto edit* (the default — edits apply at once, commands wait), or *Full auto*. Every edit lands in
+the **Changes** panel as a diff, and Revert puts the file back byte for byte (it refuses when the
+file has changed since, unless told otherwise). Give the agent a window of at least 16K tokens —
+32K is comfortable; the model picker loads at either. The mining gateway's 512-token class cannot
+run an agent at all: see below for how agent work and mining go together.
+
+The folder API behind this (`/api/v1/workspace/*`) reads and writes files and runs commands, so it
+has the strictest of the API's guards: served only on a loopback bind, only to this machine, and
+only to the Studio's own window — a page on any other origin, an origin listed in
+`server.cors_origins`, or a page reached through DNS rebinding is refused before anything is read.
+
+**Prompt mining is part of the window, not a separate tab.** The ⛏ chip in the composer says what
+happens to what you type — mined *inline* (the gateway is the chat engine, so the answer is the
+work), mined in the *background* (the chat answers locally, the prompt is queued for the slot), or
+not mined, and why. The status bar keeps the queue's counts in view, the Mining panel lists what
+this thread has had mined and the claims it produced, and mining can be turned off per thread.
+Background mining is how an agent thread mines: the agent runs on the local engine and the task
+you typed — only what you typed, never file contents or tool output — goes to the queue.
+
 ## Using it as an API
 
 Point anything that speaks OpenAI at `http://127.0.0.1:1338/v1`:
@@ -122,6 +178,16 @@ metrics, settings, provenance records. `misaka-studiod --help` lists the flags;
 **The default bind is `127.0.0.1` and there is no authentication.** Binding anywhere else without
 `--api-key` is refused at startup rather than served: an open inference endpoint on a shared
 network is the kind of mistake that stays open for a week before anyone notices.
+
+**Loopback is not the same as private, though**: every website open in a browser on this machine
+can send requests to `127.0.0.1`. `/v1` stays open to them — calling the local model is what an
+OpenAI-compatible endpoint is for — but the Studio's own API, `/api/v1` (settings, downloads,
+engines, the node, the record log), answers only the Studio's window: requests with no `Origin`
+(curl, scripts, the desktop shell), loopback origins such as the Vite dev server, and the Tauri
+window. Anything else gets a 403, and so does a `Host` that is not this machine (DNS rebinding). To
+let a web app you trust call it, list its origin in `server.cors_origins` in the settings file —
+`["https://app.example"]`; `["*"]` restores "any origin" for `/api/v1`, deliberately. The folder API
+under `/api/v1/workspace` is never opened by that list.
 
 ## What it does that is worth knowing about
 
@@ -297,6 +363,7 @@ from a guess is worse than none.
 ```bash
 cd misaka-studio && cargo test           # runtime and core
 npm --prefix ui run build                # typecheck + bundle
+npm --prefix ui test                     # the UI's logic: history, the agent's protocol and loop, diffs, fuzzy search…
 ```
 
 The mock backend exists so the streaming, metrics and provenance paths are testable with no GPU and

@@ -29,6 +29,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub mod devices;
+pub mod diffusion;
 pub mod gateway;
 pub mod llamacpp;
 pub mod misaka;
@@ -90,6 +91,14 @@ pub struct Usage {
 pub enum StreamEvent {
     /// A chunk of generated text.
     Delta(String),
+    /// A chunk of the model's reasoning — what a thinking model (Qwen3, DeepSeek-R1, …) writes
+    /// before its answer, which a current `llama-server` splits out of the content and sends as
+    /// `delta.reasoning_content`.
+    ///
+    /// Shown, never committed: the output commitment and the inference hash cover the answer
+    /// (`Delta`) alone, so a record means the same thing whether or not the engine separated the
+    /// thinking out, and a person reading the log reads the reply they were given.
+    Reasoning(String),
     /// Generation finished normally.
     Done { usage: Usage, finish_reason: String },
 }
@@ -210,6 +219,93 @@ impl Availability {
 
 /// A backend handle, shared.
 pub type SharedBackend = Arc<dyn InferenceBackend>;
+
+/// **The image-generation seam.**
+///
+/// A sibling to [`InferenceBackend`], not an extension of it: a diffusion model does not take
+/// [`GenerationRequest`]'s chat-shaped input or answer in [`StreamEvent`]'s text deltas, and
+/// forcing one trait to carry both would mean every chat backend gaining dead image-shaped
+/// methods, or every image backend gaining dead chat-shaped ones. The seam is real ("driven as a
+/// supervised child process") but the shape above it is not the same shape.
+pub trait ImageBackend: Send + Sync {
+    /// Stable name: `diffusion`.
+    fn name(&self) -> &'static str;
+
+    fn availability(&self) -> BoxFuture<'_, Availability>;
+
+    fn load(&self, request: ImageLoadRequest) -> BoxFuture<'_, crate::Result<LoadedImageModel>>;
+
+    fn unload(&self) -> BoxFuture<'_, crate::Result<()>>;
+
+    fn loaded(&self) -> BoxFuture<'_, Option<LoadedImageModel>>;
+
+    /// One request may ask for several images (`n`); they come back together because the
+    /// sidecar answers `/generate` as a single JSON response, not a stream.
+    fn generate(&self, request: Txt2ImgRequest) -> BoxFuture<'_, crate::Result<Vec<GeneratedImage>>>;
+}
+
+/// An image backend handle, shared.
+pub type SharedImageBackend = Arc<dyn ImageBackend>;
+
+/// Numeric precision to load the diffusion pipeline in. Mirrors what `diffusers` accepts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageDtype {
+    #[default]
+    Fp16,
+    Bf16,
+    Fp32,
+}
+
+impl ImageDtype {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ImageDtype::Fp16 => "fp16",
+            ImageDtype::Bf16 => "bf16",
+            ImageDtype::Fp32 => "fp32",
+        }
+    }
+}
+
+/// What to load into the sidecar.
+#[derive(Clone, Debug)]
+pub struct ImageLoadRequest {
+    pub model_id: String,
+    pub model_path: PathBuf,
+    pub dtype: ImageDtype,
+    /// `cuda` / `mps` / `cpu`. `None` lets the sidecar's own default apply.
+    pub device: Option<String>,
+}
+
+/// What a backend reports about the image model it currently holds.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LoadedImageModel {
+    pub model_id: String,
+    pub load_ms: u64,
+}
+
+/// What to generate, and how.
+#[derive(Clone, Debug)]
+pub struct Txt2ImgRequest {
+    pub prompt: String,
+    pub negative_prompt: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    pub steps: u32,
+    pub guidance_scale: f32,
+    pub seed: Option<u64>,
+    /// Raw image bytes (PNG/JPEG as uploaded), for multi-reference generation or editing.
+    /// Empty for a plain text-to-image request.
+    pub reference_images: Vec<Vec<u8>>,
+    /// How many images to produce from this one prompt.
+    pub n: u32,
+}
+
+/// One generated image, undecoded — exactly the bytes the sidecar produced.
+#[derive(Clone)]
+pub struct GeneratedImage {
+    pub png_bytes: Vec<u8>,
+}
 
 /// Render chat turns into a single prompt.
 ///

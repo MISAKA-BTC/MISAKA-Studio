@@ -23,7 +23,15 @@
 //! A chat request may carry `"misaka": {"pinned": ["…"]}` — the conversation's pinned notes, which
 //! the context manager keeps ahead of history (`crate::context`). What the manager decided comes
 //! back as `misaka.context`: on the role-only opening chunk of a stream, and on the response of a
-//! non-streaming call. Both are fields OpenAI clients ignore.
+//! non-streaming call. Both are fields OpenAI clients ignore. `"misaka": {"thinking": false}` asks
+//! a reasoning model to answer without thinking first.
+//!
+//! # Reasoning
+//!
+//! A thinking model's reasoning is passed through the way llama.cpp and DeepSeek's API send it:
+//! as `delta.reasoning_content` chunks in a stream, and as `choices[0].message.reasoning_content`
+//! on a non-streaming response (absent when there was none). A client that does not know the
+//! field skips it and sees the answer alone — which is also all the provenance record commits to.
 
 use crate::backend::{ChatMessage, StreamEvent, Usage};
 use crate::context::ContextReport;
@@ -114,6 +122,11 @@ pub struct MisakaChatExtension {
     /// The conversation's pinned notes.
     #[serde(default)]
     pub pinned: Vec<String>,
+    /// `false` asks a reasoning model to answer without thinking first
+    /// (`chat_template_kwargs.enable_thinking = false`). Absent or `true` leaves the model's own
+    /// default, which for Qwen3 is to think.
+    #[serde(default)]
+    pub thinking: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,8 +187,9 @@ async fn chat_completions(State(state): State<Arc<AppState>>, Json(request): Jso
     let defaults = state.settings.read().await.generation.sampling();
     let (params, stop) = request.sampling.resolve(defaults);
 
-    let pinned = request.misaka.map(|m| m.pinned).unwrap_or_default();
-    let (context, stream) = state.generate_managed(request.messages, None, params, stop, pinned).await?;
+    let extension = request.misaka.unwrap_or_default();
+    let options = crate::state::GenerateOptions { pinned: extension.pinned, disable_thinking: extension.thinking == Some(false) };
+    let (context, stream) = state.generate_with(request.messages, None, params, stop, options).await?;
     Ok(if request.stream { sse_response(stream, model, true, context) } else { aggregate(stream, model, true, context).await? })
 }
 
@@ -205,11 +219,13 @@ async fn aggregate(
     context: Option<ContextReport>,
 ) -> Result<Response> {
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut usage = Usage::default();
     let mut finish_reason = "stop".to_string();
     while let Some(event) = stream.next().await {
         match event? {
             StreamEvent::Delta(delta) => text.push_str(&delta),
+            StreamEvent::Reasoning(delta) => reasoning.push_str(&delta),
             StreamEvent::Done { usage: u, finish_reason: r } => {
                 usage = u;
                 finish_reason = r;
@@ -219,7 +235,11 @@ async fn aggregate(
 
     let id = completion_id(chat);
     let choice = if chat {
-        serde_json::json!({ "index": 0, "message": { "role": "assistant", "content": text }, "finish_reason": finish_reason })
+        let mut message = serde_json::json!({ "role": "assistant", "content": text });
+        if !reasoning.is_empty() {
+            message["reasoning_content"] = serde_json::json!(reasoning);
+        }
+        serde_json::json!({ "index": 0, "message": message, "finish_reason": finish_reason })
     } else {
         serde_json::json!({ "index": 0, "text": text, "finish_reason": finish_reason })
     };
@@ -266,8 +286,18 @@ fn sse_response(
     };
 
     let events = futures_util::stream::iter(opener.map(|v| Ok(Event::default().data(v.to_string()))))
-        .chain(stream.map(move |event| {
+        .chain(stream.filter_map(move |event| {
             let json = match event {
+                // OpenAI's chat chunk with the field llama.cpp and DeepSeek use for it. A raw
+                // completion has nowhere to put reasoning (no engine sends any there), so it is
+                // dropped rather than sent as an empty `text` chunk.
+                Ok(StreamEvent::Reasoning(reasoning)) => {
+                    if !chat {
+                        return futures_util::future::ready(None);
+                    }
+                    let choice = serde_json::json!({ "index": 0, "delta": { "reasoning_content": reasoning }, "finish_reason": null });
+                    serde_json::json!({ "id": id, "object": object, "created": created, "model": model, "choices": [choice] })
+                }
                 Ok(StreamEvent::Delta(delta)) => {
                     let choice = if chat {
                         serde_json::json!({ "index": 0, "delta": { "content": delta }, "finish_reason": null })
@@ -292,7 +322,7 @@ fn sse_response(
                 // what a client sees here too.
                 Err(e) => serde_json::json!({ "error": { "message": e.to_string(), "type": e.openai_type() } }),
             };
-            Ok::<Event, Infallible>(Event::default().data(json.to_string()))
+            futures_util::future::ready(Some(Ok::<Event, Infallible>(Event::default().data(json.to_string()))))
         }))
         .chain(futures_util::stream::iter([Ok(Event::default().data("[DONE]"))]));
 
@@ -323,6 +353,11 @@ mod tests {
             serde_json::from_str(r#"{"messages":[{"role":"user","content":"hi"}],"misaka":{"pinned":["P is outside the circle"]}}"#)
                 .unwrap();
         assert_eq!(pinned.misaka.unwrap().pinned, vec!["P is outside the circle".to_string()]);
+        let thinking: ChatCompletionRequest =
+            serde_json::from_str(r#"{"messages":[{"role":"user","content":"hi"}],"misaka":{"thinking":false}}"#).unwrap();
+        let extension = thinking.misaka.unwrap();
+        assert_eq!(extension.thinking, Some(false));
+        assert!(extension.pinned.is_empty(), "each field is optional on its own");
     }
 
     #[test]

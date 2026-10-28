@@ -15,7 +15,7 @@
 // 3. A question asked again replaces its earlier asking: the earlier copy and the replies to it are
 //    left out. Someone who sends the same words again is retrying, not adding context.
 
-import type { ChatMessage } from './types'
+import type { Attachment, ChatMessage } from './types'
 
 /** The length of text compared when looking for a repeated tail. */
 const TAIL = 120
@@ -88,19 +88,60 @@ export function trimRepeatedTail(text: string): string | null {
   return null
 }
 
+/** A fence that no run of backticks inside `text` can close early. */
+function fenceFor(text: string): string {
+  const longest = Math.max(2, ...Array.from(text.matchAll(/`+/g), (m) => m[0].length))
+  return '`'.repeat(longest + 1)
+}
+
+/** An attachment as the model reads it: named, fenced, and marked when it was cut. */
+export function attachmentBlock(attachment: Attachment): string {
+  const fence = fenceFor(attachment.content)
+  const label = attachment.path ?? attachment.name
+  const note = attachment.truncated ? ' (truncated)' : ''
+  return `Attached file \`${label}\`${note}:\n${fence}${attachment.language ?? ''}\n${attachment.content}\n${fence}`
+}
+
+/** A user message's text with its attachments after it — what the model is sent for it. */
+export function contentForModel(message: Pick<ChatMessage, 'content' | 'attachments'>): string {
+  if (!message.attachments?.length) return message.content
+  return [message.content, ...message.attachments.map(attachmentBlock)].filter((part) => part.trim()).join('\n\n')
+}
+
+/**
+ * A reply without its `<think>` blocks.
+ *
+ * An engine that does not separate reasoning leaves it in the content. It is the model's scratch
+ * work, not something it said: sent back, it costs window and teaches the next turn to think out
+ * loud in the answer. An unclosed block at the start means the reply never got past thinking.
+ */
+export function stripThinking(text: string): string {
+  let closed = text.replace(/<think>[\s\S]*?<\/think>\s*/g, '')
+  // A closing tag with no opening one: the chat template wrote `<think>` into the prompt, so the
+  // reply begins inside the block. Everything up to the tag is thinking.
+  const orphan = closed.indexOf('</think>')
+  if (orphan !== -1 && !closed.slice(0, orphan).includes('<think>')) closed = closed.slice(orphan + '</think>'.length).trimStart()
+  return /^\s*<think>/.test(closed) ? '' : closed
+}
+
 /** The conversation as the model should see it. */
 export function historyForModel(messages: ChatMessage[]): { role: ChatMessage['role']; content: string }[] {
-  // Rule 3 first: the last asking of each question wins.
+  // Rule 3 first: the last asking of each question wins. Tool results are not questions: an agent
+  // that reads the same file twice gets the same text twice, and both turns are real history.
   const lastAsking = new Map<string, number>()
   messages.forEach((m, i) => {
-    if (m.role === 'user') lastAsking.set(m.content.trim(), i)
+    if (m.role === 'user' && !m.toolResults) lastAsking.set(contentForModel(m).trim(), i)
   })
   const out: { role: ChatMessage['role']; content: string }[] = []
   let skippingReplies = false
   messages.forEach((m, i) => {
     if (m.role === 'user') {
-      skippingReplies = lastAsking.get(m.content.trim()) !== i
-      if (!skippingReplies) out.push({ role: m.role, content: m.content })
+      if (m.toolResults) {
+        if (!skippingReplies) out.push({ role: m.role, content: m.content })
+        return
+      }
+      skippingReplies = lastAsking.get(contentForModel(m).trim()) !== i
+      if (!skippingReplies) out.push({ role: m.role, content: contentForModel(m) })
       return
     }
     if (m.role === 'system') {
@@ -108,17 +149,18 @@ export function historyForModel(messages: ChatMessage[]): { role: ChatMessage['r
       return
     }
     // An assistant reply.
-    if (skippingReplies || m.error || m.streaming || !m.content.trim()) return
-    if (loops(m.content)) {
+    const content = stripThinking(m.content)
+    if (skippingReplies || m.error || m.streaming || !content.trim()) return
+    if (loops(content)) {
       // Kept only when the loop was an ending: most of the reply must survive the cut, or it was a
       // loop with a preamble and sending the preamble teaches the loop's opening.
-      const trimmed = trimRepeatedTail(m.content)
-      if (trimmed && trimmed.length >= MIN_KEPT_REPLY && trimmed.length * 2 >= m.content.trimEnd().length) {
+      const trimmed = trimRepeatedTail(content)
+      if (trimmed && trimmed.length >= MIN_KEPT_REPLY && trimmed.length * 2 >= content.trimEnd().length) {
         out.push({ role: m.role, content: trimmed })
       }
       return
     }
-    out.push({ role: m.role, content: m.content })
+    out.push({ role: m.role, content })
   })
   return out
 }
