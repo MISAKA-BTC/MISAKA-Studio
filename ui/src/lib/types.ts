@@ -330,7 +330,11 @@ export type DownloadProgress = {
   error: string | null
 }
 
+export type WebSource = { title: string; url: string; text: string }
+export type WebResult = { route: 'direct' | 'tor'; sources: WebSource[] }
+
 export type Settings = {
+  web: { mode: 'off' | 'direct' | 'tor'; tor_proxy: string; tor_browser_path: string | null }
   models_dir: string
   /** A model id to load as soon as the runtime is up; null loads nothing. */
   load_on_start: string | null
@@ -656,6 +660,8 @@ export type Conversation = {
    *  on. Absent means on. In agent mode only what the person typed is mined — never file contents
    *  or tool output, which may be private code. */
   mine?: boolean
+  /** Opt-in Web tools; only while mining is off for this conversation. */
+  web?: boolean
 }
 
 // --- the Network tab -------------------------------------------------------

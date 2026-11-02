@@ -28,6 +28,8 @@ import { DiffStat, DiffView } from './DiffView'
 type CardStatus = ToolCall['status'] | 'preparing' | 'cut_off' | 'interrupted'
 
 const META: Record<string, { icon: IconName; base: string; doing: string; done: string; quiet: boolean }> = {
+  web_search: { icon: 'globe', base: 'Search Web', doing: 'Searching Web', done: 'Searched Web', quiet: false },
+  web_fetch: { icon: 'globe', base: 'Read page', doing: 'Reading page', done: 'Read page', quiet: false },
   list_files: { icon: 'folder', base: 'List', doing: 'Listing', done: 'Listed', quiet: true },
   read_file: { icon: 'fileText', base: 'Read', doing: 'Reading', done: 'Read', quiet: true },
   search: { icon: 'search', base: 'Search', doing: 'Searching', done: 'Searched', quiet: true },
@@ -56,6 +58,8 @@ function verbFor(meta: typeof UNKNOWN_META, status: CardStatus, created: boolean
 /** One line of what the call targets: the path, the pattern, the command. */
 function targetOf(name: string, args: Record<string, unknown>): ReactNode {
   switch (name) {
+    case 'web_search': return argText(args, 'query')
+    case 'web_fetch': return argText(args, 'url')
     case 'list_files': {
       const path = cleanPath(argText(args, 'path'))
       return path && path !== '.' ? path : <span className="font-sans">the workspace</span>

@@ -6,6 +6,7 @@
 // A private channel for the UI would let that endpoint rot unnoticed.
 
 import type {
+  WebResult,
   BackendInfo,
   CatalogEntry,
   CatalogRepo,
@@ -98,6 +99,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  web: {
+    browser: () => request<{ installed: boolean; path: string | null }>('/api/v1/web/browser'),
+    open: (url: string) => request<{ opened: boolean }>('/api/v1/web/open', { method: 'POST', body: JSON.stringify({ url, mining: false }) }),
+    search: (query: string, signal?: AbortSignal) => request<WebResult>('/api/v1/web/search', { method: 'POST', body: JSON.stringify({ query, mining: false }), signal }),
+    fetch: (url: string, signal?: AbortSignal) => request<WebResult>('/api/v1/web/fetch', { method: 'POST', body: JSON.stringify({ url, mining: false }), signal }),
+    check: () => request<{ route: 'direct' | 'tor'; is_tor: boolean; ip: string }>('/api/v1/web/check', { method: 'POST' }),
+  },
   health: () => request<{ status: string; version: string }>('/api/v1/health'),
   system: () => request<SystemInfo>('/api/v1/system'),
   metrics: () => request<RuntimeSample>('/api/v1/metrics'),

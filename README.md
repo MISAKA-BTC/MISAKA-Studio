@@ -107,6 +107,39 @@ Linux needs the webview development packages (`libwebkit2gtk-4.1-dev`, `libgtk-3
 Windows have their webviews already. Bundle icons for Windows and macOS are generated from
 `desktop/src-tauri/icons/icon.png` with `cargo tauri icon`.
 
+## Web research and Tor Browser
+
+Chat and Code both have a **Web off** switch in the composer. Enabling it turns prompt mining
+off for that conversation and enables `web_search` and `web_fetch` on a local model. A gateway
+answer is itself mined, so load a local model first. Web research is opt-in; existing settings
+and conversations remain offline until enabled. The agent can search current information,
+read public pages and cite source URLs. Chat's research mode has no filesystem or terminal tools.
+
+Every search and page fetch opens a tab in the **external Tor Browser**. Citation links in
+responses also open there. Studio never falls back to the operating system's default browser.
+Install [Tor Browser](https://www.torproject.org/download/) and finish its Connect setup first.
+The application is detected automatically on common installations; otherwise set its application
+or launcher path under **Settings → Web access & Tor Browser**.
+
+The model's research connection defaults to **Tor** when Web is first enabled. Its SOCKS listener
+is `127.0.0.1:9150` for Tor Browser (`127.0.0.1:9050` for standalone Tor). Web tool requests use
+SOCKS5 with remote hostname resolution, as recommended in the
+[Tor Project's DNS leak guidance](https://support.torproject.org/little-t-tor/troubleshooting/check-for-leaks/).
+Before sending a query or page request, Studio verifies the SOCKS listener is using a Tor exit
+(successful checks are cached for one minute). A failed Tor connection or verification stops the
+request; it never retries through a direct connection. **Save &
+test connection** asks Tor Project to verify the exit and displays the result. Direct research
+is an explicit alternative in Settings; browser tabs still open in Tor Browser in that mode.
+
+This routes the built-in research tools and their DNS through Tor. It does not route model
+downloads, mining, terminal commands, or the rest of the computer's traffic. It does not promise
+complete anonymity. The model reads bounded public text, without signing in or executing web
+JavaScript; interactive/sign-in pages can be viewed in Tor Browser but are not controlled or
+read through its logged-in session. Search uses Bing with a DuckDuckGo fallback on the same
+connection route; either provider may refuse automation or Tor exit nodes. Web content is
+untrusted evidence, not instructions to run commands or disclose files. Research text is kept
+in the conversation's local tool history, like other tool results.
+
 ## Working in the window
 
 The window has two sides, switched at the top of the sidebar the way Claude's desktop app does it:

@@ -33,6 +33,7 @@ import {
   type OutputLimits,
   type ToolOutcome,
   type WorkspaceApi,
+  type ToolContext,
 } from './tools.ts'
 
 /** One streamed reply, as `streamReply` returns it (`ReplyOutcome`). */
@@ -64,7 +65,7 @@ export type AgentLoopDeps = {
   callModel: (request: { assistantId: string; messages: ModelMessage[]; pinned: string[] }) => Promise<ModelReply>
   /** The system prompt for this step — rebuilt each time, so a policy changed mid-run applies. */
   systemPrompt: (conversation: Conversation) => string
-  workspace: { root: string; api: WorkspaceApi; limits: OutputLimits }
+  workspace: { root: string; api: WorkspaceApi; limits: OutputLimits } & Pick<ToolContext, 'web' | 'webOnly'>
   /** Wait for the person to answer the approval card of `toolCallId`. */
   requestApproval: (toolCallId: string) => Promise<ApprovalAnswer>
   /** Kinds approved with "Always allow in this thread". */

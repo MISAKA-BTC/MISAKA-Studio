@@ -580,6 +580,11 @@ export const useStudio = create<StudioState>()(
         let conversationId = get().activeConversationId
         if (!conversationId || !get().conversations.some((c) => c.id === conversationId)) conversationId = get().newConversation()
 
+        if (get().conversations.find((c) => c.id === conversationId)?.web) {
+          const { startAgentRun } = await import('../lib/agent/run')
+          return startAgentRun(conversationId, trimmed, attachments)
+        }
+
         const message: ChatMessage = {
           id: uid(),
           role: 'user',

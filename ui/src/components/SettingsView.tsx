@@ -1,3 +1,4 @@
+import { WebSettingsPanel } from './WebSettingsPanel'
 // Settings.
 //
 // Everything here writes to the runtime's settings file through the API, not to browser storage —
@@ -65,6 +66,10 @@ export function SettingsView() {
   return (
     <div className="h-full overflow-y-auto">
       <div className="mx-auto max-w-3xl space-y-4 p-4 pb-24">
+        <WebSettingsPanel web={draft.web ?? { mode: 'off', tor_proxy: '127.0.0.1:9150', tor_browser_path: null }} onChange={(web) => set('web', web)} onSave={async () => {
+          const saved = await api.saveSettings(draft)
+          useStudio.setState({ settings: saved })
+        }} />
         <Section title="Models" description="Where GGUF files live. Moving this rescans; it does not move any files.">
           <Field label="Model directory">
             <input className="input mt-1" value={draft.models_dir} onChange={(e) => set('models_dir', e.target.value)} />

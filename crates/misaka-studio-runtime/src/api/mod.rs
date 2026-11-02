@@ -41,6 +41,7 @@ pub mod network;
 pub mod openai;
 pub mod prompt_mining;
 pub mod ui;
+pub mod web;
 pub mod workspace;
 
 /// Build the whole application router.
@@ -52,6 +53,10 @@ pub fn router(state: Arc<AppState>, ui_dir: Option<PathBuf>, cors_origins: Vec<S
         // `/api/v1` changes settings, starts downloads and engines and reads the record log, so it
         // answers the Studio's own window and the origins listed in `server.cors_origins` only.
         .nest("/api/v1", management::router().route_layer(axum::middleware::from_fn_with_state(state.clone(), guard::studio)))
+        .nest(
+            "/api/v1/web",
+            web::router().route_layer(axum::middleware::from_fn_with_state(state.clone(), guard::workspace)),
+        )
         // The coding agent's file and process API: the stricter guard, which no listing reaches.
         .nest(
             "/api/v1/workspace",

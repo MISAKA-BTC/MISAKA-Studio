@@ -13,6 +13,7 @@
 
 import { create } from 'zustand'
 import { api } from '../api'
+import { webEnabled } from '../web'
 import { hasRepeatedTail } from '../history'
 import type { Attachment, MessageMining, WorkspaceInfo } from '../types'
 import { chatModelId, streamReply, uid, useStudio } from '../../store/studio'
@@ -100,7 +101,9 @@ export async function startAgentRun(
   if (studio.streaming && studio.streaming.conversationId !== conversationId) {
     return back('info', 'Another thread is still answering. Stop it there, or wait, then send again.')
   }
-  if (conversation.mode !== 'agent' || !conversation.workspace) {
+  const webChat = conversation.mode !== 'agent'
+  if (webChat && !webEnabled(conversation, studio.settings, studio.runtime?.backend)) return back('error', 'Web research requires Web access on, mining off in this thread, and a local model.')
+  if (!webChat && !conversation.workspace) {
     useUi.getState().openWorkspacePicker(conversationId)
     return back('info', 'Choose the folder the agent works in, then send again.')
   }
@@ -108,7 +111,7 @@ export async function startAgentRun(
   if (!modelId) return back('error', 'No model is available. Download one from the Models tab.')
   if (studio.runtime?.model_id === modelId && studio.runtime.backend === 'gateway') return back('error', GATEWAY_EXPLAINED)
   const window = studio.runtime?.model_id === modelId ? studio.runtime.context_size : null
-  if (contextTooSmall(window) && !contextWarned.has(`${modelId}:${window}`)) {
+  if (!webChat && contextTooSmall(window) && !contextWarned.has(`${modelId}:${window}`)) {
     contextWarned.add(`${modelId}:${window}`)
     studio.toast(
       'info',
@@ -118,9 +121,9 @@ export async function startAgentRun(
 
   // The folder as the runtime sees it now — it may have moved or gone since the thread was made —
   // and its branch, for the system prompt.
-  let info: WorkspaceInfo
+  let info: Pick<WorkspaceInfo, 'root' | 'name' | 'branch' | 'is_git'> = { root: '', name: 'Web research', branch: null, is_git: false }
   try {
-    info = await openWorkspace(conversation.workspace, true)
+    if (!webChat) info = await openWorkspace(conversation.workspace!, true)
   } catch (error) {
     return back('error', `The folder ${conversation.workspace} cannot be opened: ${(error as Error).message}`)
   }
@@ -167,7 +170,7 @@ export async function startAgentRun(
             modelId: chatModelId(now, conversationId) ?? modelId,
             pinned,
             // Room for a whole file in one write_file; the context manager keeps the answer's share.
-            maxTokens: Math.max(now.settings?.generation.max_tokens ?? 0, 4096),
+            maxTokens: Math.min(Math.max(now.settings?.generation.max_tokens ?? 0, 4096), window ? Math.max(1024, Math.floor(window / 4)) : 4096),
             stop: ['</tool_call>'],
             // A file being written is not a loop, however repetitive its code: the chat's check
             // runs only outside an open call.
@@ -177,6 +180,8 @@ export async function startAgentRun(
         systemPrompt: (thread) =>
           buildSystemPrompt({
             root: info.root,
+            webOnly: webChat,
+            web: webEnabled(thread, useStudio.getState().settings, useStudio.getState().runtime?.backend),
             name: info.name,
             branch: info.branch,
             isGit: info.is_git,
@@ -185,7 +190,19 @@ export async function startAgentRun(
             policy: thread.approval ?? 'auto_edit',
             userInstructions: useStudio.getState().settings?.generation.system_prompt ?? null,
           }),
-        workspace: { root: info.root, api: api.workspace, limits: outputLimits(window) },
+        workspace: {
+          root: info.root, api: api.workspace, limits: outputLimits(window), webOnly: webChat,
+          web: {
+            enabled: () => {
+              const now = useStudio.getState()
+              return webEnabled(now.conversations.find((c) => c.id === conversationId), now.settings, now.runtime?.backend)
+            },
+            api: {
+              search: (query, signal) => api.web.search(query, signal),
+              fetch: (url, signal) => api.web.fetch(url, signal),
+            },
+          },
+        },
         requestApproval: (toolCallId) =>
           new Promise<ApprovalAnswer>((resolve) => {
             if (!running()) return resolve('stop')
@@ -211,6 +228,7 @@ export async function startAgentRun(
           if (message.content) void useStudio.getState().enqueueMining(conversationId, message.id, message.content)
         },
         signal: controller.signal,
+        maxSteps: webChat ? 12 : undefined,
         newId: uid,
         now: Date.now,
       },

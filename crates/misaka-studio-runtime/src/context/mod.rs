@@ -122,6 +122,9 @@ pub struct Draft {
     pinned_omitted: usize,
     recent: Vec<ChatMessage>,
     question: Vec<ChatMessage>,
+    /// A tool result is not the user query. Qwen templates need the real query
+    /// even when older tool steps are compacted.
+    query_anchor: Option<ChatMessage>,
     pub older: Vec<ChatMessage>,
     pub memory_budget: u64,
     window: u64,
@@ -169,8 +172,18 @@ fn compose_system(base: &str, pins: &[String], memory: Option<&str>, japanese: b
     (!parts.is_empty()).then(|| ChatMessage::new("system", parts.join("\n\n")))
 }
 
-fn assemble(system: Option<ChatMessage>, recent: &[ChatMessage], question: &[ChatMessage]) -> Vec<ChatMessage> {
+fn assemble(
+    system: Option<ChatMessage>,
+    recent: &[ChatMessage],
+    question: &[ChatMessage],
+    query_anchor: Option<&ChatMessage>,
+) -> Vec<ChatMessage> {
     let mut out: Vec<ChatMessage> = system.into_iter().collect();
+    if let Some(anchor) = query_anchor
+        && !recent.iter().chain(question).any(|m| m.role == "user" && m.content == anchor.content)
+    {
+        out.push(anchor.clone());
+    }
     out.extend(recent.iter().cloned());
     out.extend(question.iter().cloned());
     out
@@ -211,6 +224,13 @@ pub fn plan(inputs: &PlanInputs<'_>) -> Result<Draft, String> {
         Some(i) => (rest[..i].to_vec(), rest[i..].to_vec()),
         None => (Vec::new(), rest.clone()),
     };
+    let query_anchor = if question.first().is_some_and(|m| m.role == "user" && m.content.trim_start().starts_with("<tool_response>")) {
+        history.iter().rev().find(|m| m.role == "user" && !m.content.trim_start().starts_with("<tool_response>")).cloned()
+    } else {
+        None
+    };
+    let assemble =
+        |system, recent: &[ChatMessage], question: &[ChatMessage]| self::assemble(system, recent, question, query_anchor.as_ref());
     let continuation = question.len() > 1 && question.last().is_some_and(|m| m.role == "assistant");
     // What must fit whole. A partial reply an engine cannot continue from inside is cut to its end
     // later (`continuation_as_instruction`), so only the question itself is required here —
@@ -236,6 +256,7 @@ pub fn plan(inputs: &PlanInputs<'_>) -> Result<Draft, String> {
         pinned_omitted: 0,
         recent: Vec::new(),
         question: question.clone(),
+        query_anchor: query_anchor.clone(),
         older: Vec::new(),
         memory_budget: 0,
         window: inputs.window,
@@ -362,6 +383,7 @@ impl Draft {
             pinned_omitted,
             recent,
             question,
+            query_anchor,
             older,
             memory_budget,
             window,
@@ -372,6 +394,9 @@ impl Draft {
             continuation,
             question_over_budget,
         } = self;
+
+        let assemble =
+            |system, recent: &[ChatMessage], question: &[ChatMessage]| self::assemble(system, recent, question, query_anchor.as_ref());
 
         if let Some(messages) = fitted_as_sent {
             let prompt_tokens = counter.messages(&messages);
@@ -583,6 +608,26 @@ mod tests {
 
     fn inputs<'a>(messages: &'a [ChatMessage], pinned: &'a [String], window: u64, counter: &'a TokenCounter) -> PlanInputs<'a> {
         PlanInputs { messages, pinned, window, max_tokens: 2048, counter, engine_continues_turns: false, count_scale_permille: 1000 }
+    }
+
+    #[test]
+    fn compacting_tool_steps_keeps_the_real_user_query_for_qwen_templates() {
+        let counter = TokenCounter::estimate();
+        let task = "Read the public source and cite it.";
+        let response = "<tool_response>Verified evidence</tool_response>";
+        let messages = vec![
+            msg("system", "Research assistant"),
+            msg("user", task),
+            msg("assistant", &"older tool call ".repeat(1000)),
+            msg("user", response),
+        ];
+        let result = plan(&inputs(&messages, &[], 512, &counter)).unwrap().finish(None, &counter, None);
+        assert!(result.report.managed);
+        assert_eq!(result.messages.iter().filter(|m| m.role == "user" && m.content == task).count(), 1);
+        assert_eq!(result.messages.last().unwrap().content, response, "keep the tool-response shape unchanged");
+        let fitting = plan(&inputs(&messages, &[], 65536, &counter)).unwrap().finish(None, &counter, None);
+        assert!(!fitting.report.managed);
+        assert_eq!(fitting.messages.iter().filter(|m| m.content == task).count(), 1);
     }
 
     const Q1: &str = "原点 O を中心とする半径 1 の円に円外の点 P(x0, y0) から 2 本の接線を引く。2 つの接点の中点 Q の座標を求めよ。";

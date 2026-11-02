@@ -28,6 +28,7 @@ import type {
   WorkspaceTree,
   WorkspaceWrite,
 } from '../types.ts'
+import { formatWebResult, type WebApi } from '../web.ts'
 import { diffStats, lineCount, structuredDiff, unifiedPatch } from '../diff.ts'
 import { planEdit } from './edit.ts'
 import { TOOL_NAMES, toolSpec, truncateMiddle, type ToolKind, type ToolSpec } from './protocol.ts'
@@ -55,6 +56,8 @@ export type OutputLimits = { read: number; search: number; list: number; exec: n
 export type ToolContext = {
   /** The workspace's absolute path. */
   root: string
+  webOnly?: boolean
+  web?: { api: WebApi; enabled: () => boolean }
   api: WorkspaceApi
   policy: ApprovalPolicy
   /** Kinds the person chose "Always allow" for in this thread. */
@@ -264,6 +267,8 @@ export function compactArgs(args: Record<string, unknown>): Record<string, unkno
 export function summarizeCall(name: string, args: Record<string, unknown>): string {
   const path = typeof args.path === 'string' && args.path.trim() ? cleanPath(args.path) : null
   switch (name) {
+    case 'web_search': return `Web search: ${String(args.query ?? '')}`
+    case 'web_fetch': return `Read Web page: ${String(args.url ?? '')}`
     case 'list_files':
       return `List ${path && path !== '.' ? path : 'the workspace'}`
     case 'read_file': {
@@ -434,8 +439,15 @@ export async function prepareCall(call: { name: string; args: Record<string, unk
   const name = canonicalToolName(call.name)
   const spec = toolSpec(name)
   if (!spec) {
-    const known = TOOL_NAMES.filter((n) => context.policy !== 'read_only' || toolSpec(n)?.kind === 'read').join(', ')
+    const known = TOOL_NAMES.filter((n) => {
+      const web = n === 'web_search' || n === 'web_fetch'
+      return (web ? context.web?.enabled() : !context.webOnly) && (context.policy !== 'read_only' || toolSpec(n)?.kind === 'read')
+    }).join(', ')
     return settled(failure(call.name || 'Tool call', `there is no tool called ${JSON.stringify(call.name)}. The tools are: ${known}.`))
+  }
+  const isWeb = name === 'web_search' || name === 'web_fetch'
+  if ((context.webOnly && !isWeb) || (isWeb && !context.web?.enabled())) {
+    return settled(failure(name, 'This tool is not enabled. Web tools require Web access on, mining off, and a local model. Chat has no file or command tools.'))
   }
   const coerced = coerceArgs(spec, call.args)
   const summary = summarizeCall(name, call.args)
@@ -452,6 +464,16 @@ export async function prepareCall(call: { name: string; args: Record<string, unk
   }
   try {
     switch (spec.name) {
+      case 'web_search':
+      case 'web_fetch':
+        return runReading(args, summary, async (signal) => {
+          if (!context.web?.enabled()) return failure(summary, 'Web access was disabled or mining was enabled before the request ran.')
+          const result = spec.name === 'web_search'
+            ? await context.web.api.search(String(args.query), signal)
+            : await context.web.api.fetch(String(args.url), signal)
+          const output = formatWebResult(result, context.limits.read)
+          return { status: 'done', summary, output, display: { kind: 'text', text: output } }
+        })
       case 'list_files':
         return prepareList(args, context, summary)
       case 'read_file':

@@ -1,3 +1,4 @@
+import { WebChip } from './WebChip'
 // The composer: what is typed, what is attached, and everything that decides where it goes.
 //
 // Everything a person changes *while* writing lives inside the card — the files, the model, the
@@ -579,6 +580,7 @@ export const Composer = memo(function Composer({
                 <span className="hidden line-through decoration-ink-400 @2xl:inline">Thinking</span>
               </button>
             )}
+            <WebChip conversation={conversation} createThread={createHere} disabled={busyHere || busyElsewhere} />
             <MiningChip conversation={conversation} compact={mode === 'agent'} />
             <ModelPicker />
             {busyHere ? (

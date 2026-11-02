@@ -575,6 +575,31 @@ impl Default for ContextSettings {
 
 pub const SETTINGS_SCHEMA: u32 = 1;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebMode {
+    #[default]
+    Off,
+    Direct,
+    Tor,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebSettings {
+    pub mode: WebMode,
+    /// A loopback SOCKS listener; hostnames are resolved by Tor, never locally.
+    pub tor_proxy: String,
+    /// Tor Browser application (.app on macOS) or launcher executable; auto-detect when absent.
+    pub tor_browser_path: Option<PathBuf>,
+}
+
+impl Default for WebSettings {
+    fn default() -> Self {
+        Self { mode: WebMode::Off, tor_proxy: "127.0.0.1:9150".into(), tor_browser_path: None }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -605,6 +630,7 @@ pub struct Settings {
     pub huggingface: HuggingFaceSettings,
     pub ui: UiSettings,
     pub provenance: ProvenanceSettings,
+    pub web: WebSettings,
 }
 
 impl Default for Settings {
@@ -622,6 +648,7 @@ impl Default for Settings {
             huggingface: HuggingFaceSettings::default(),
             ui: UiSettings::default(),
             provenance: ProvenanceSettings::default(),
+            web: WebSettings::default(),
         }
     }
 }

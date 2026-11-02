@@ -26,10 +26,11 @@
 // Plain TypeScript with type-only imports, so `node --test` can load it.
 
 import type { ApprovalPolicy } from '../types.ts'
+import { WEB_RULES } from '../web.ts'
 
 // --- tools ------------------------------------------------------------------------
 
-export type ToolName = 'list_files' | 'read_file' | 'search' | 'edit_file' | 'write_file' | 'run_command'
+export type ToolName = 'list_files' | 'read_file' | 'search' | 'edit_file' | 'write_file' | 'run_command' | 'web_search' | 'web_fetch'
 
 /** What a tool does, which is what the approval policy decides on. */
 export type ToolKind = 'read' | 'edit' | 'command'
@@ -101,10 +102,15 @@ export const TOOLS: readonly ToolSpec[] = [
   },
 ]
 
-export const TOOL_NAMES: readonly string[] = TOOLS.map((t) => t.name)
+export const WEB_TOOLS: readonly ToolSpec[] = [
+  { name: 'web_search', kind: 'read', description: 'Search the public web for current information. Returns titles, source URLs and snippets. Follow up with web_fetch to verify details.', params: [{ name: 'query', type: 'string', description: 'A focused public search query, no private data.', required: true }] },
+  { name: 'web_fetch', kind: 'read', description: 'Read a public HTTP/HTTPS page and return its text and source URL. Does not execute JavaScript or log in.', params: [{ name: 'url', type: 'string', description: 'The absolute public page URL.', required: true }] },
+]
+
+export const TOOL_NAMES: readonly string[] = [...TOOLS, ...WEB_TOOLS].map((t) => t.name)
 
 export function toolSpec(name: string): ToolSpec | undefined {
-  return TOOLS.find((t) => t.name === name)
+  return [...TOOLS, ...WEB_TOOLS].find((t) => t.name === name)
 }
 
 /** The tools a policy offers. Read-only offers none that change anything — not even by name. */
@@ -146,6 +152,8 @@ function toolSchema(tool: ToolSpec) {
 export type AgentPromptContext = {
   /** The workspace's absolute path. */
   root: string
+  web?: boolean
+  webOnly?: boolean
   name?: string | null
   branch?: string | null
   isGit?: boolean
@@ -201,7 +209,7 @@ const READ_ONLY_RULES = [
  * every token here is one fewer for the code.
  */
 export function buildSystemPrompt(context: AgentPromptContext): string {
-  const tools = toolsFor(context.policy)
+  const tools = context.webOnly ? (context.web ? [...WEB_TOOLS] : []) : [...toolsFor(context.policy), ...(context.web ? WEB_TOOLS : [])]
   const toolBlock =
     '# Tools\n\nYou have access to the following functions:\n\n<tools>\n' +
     tools.map((tool) => pyJson(toolSchema(tool))).join('\n') +
@@ -224,12 +232,16 @@ export function buildSystemPrompt(context: AgentPromptContext): string {
   ].join(' ')
   const rules = (context.policy === 'read_only' ? READ_ONLY_RULES : RULES).map((rule) => `- ${rule}`).join('\n')
 
+  if (context.webOnly) {
+    return [toolBlock, `You are MISAKA Studio, a local research assistant. Today is ${context.date}. Reply in the user's language.`, context.web ? WEB_RULES : 'Web research is currently disabled. Do not make tool calls or claim to have browsed.', context.userInstructions ?? ''].join('\n\n')
+  }
   const parts = [
     toolBlock,
     'You are MISAKA Agent, a coding agent running locally in MISAKA Studio, on the user\'s own machine. You help with the code in one folder by using the functions above. Reply in the language the user writes in.',
     `# Workspace\n${where}\n${POLICY_TEXT[context.policy]}`,
     `# Rules\n${rules}`,
   ]
+  if (context.web) parts.push(`# Web research\n${WEB_RULES}`)
   const own = context.userInstructions?.trim()
   if (own) parts.push(`# The user's standing instructions\n${own}`)
   return parts.join('\n\n')

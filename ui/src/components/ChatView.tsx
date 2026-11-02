@@ -175,7 +175,7 @@ export function ChatView() {
         const studio = useStudio.getState()
         // Stop keeps what was generated — but an edit replaces it, so the reply in flight stops first.
         if (studio.streaming?.conversationId === thread.id) studio.stop()
-        if (thread.mode === 'agent') {
+        if (thread.mode === 'agent' || thread.web) {
           void rerunAgent(thread, thread.messages.findIndex((m) => m.id === id), content.trim())
           return
         }
@@ -187,7 +187,7 @@ export function ChatView() {
         if (busyElsewhere(thread.id)) return toast(elsewhere)
         followRef.current = true
         useUi.getState().focusComposer()
-        if (thread.mode === 'agent') {
+        if (thread.mode === 'agent' || thread.web) {
           const index = lastTypedIndex(thread.messages)
           const original = thread.messages[index]
           if (original) void rerunAgent(thread, index, original.content)
@@ -197,7 +197,7 @@ export function ChatView() {
       },
       continueReply: () => {
         const { conversation: thread, generating: busy } = latest.current
-        if (!thread || busy || thread.mode === 'agent') return
+        if (!thread || busy || thread.mode === 'agent' || thread.web) return
         if (busyElsewhere(thread.id)) return toast(elsewhere)
         followRef.current = true
         useUi.getState().focusComposer()
@@ -272,7 +272,7 @@ export function ChatView() {
                     <div key={message.id} className={index === 0 ? '' : continuing ? 'mt-1' : 'mt-3'}>
                       <Message
                         message={message}
-                        agent={agent}
+                        agent={agent || !!message.toolCalls?.length}
                         last={index === rows.length - 1}
                         generating={generating}
                         editing={editingId === message.id}
