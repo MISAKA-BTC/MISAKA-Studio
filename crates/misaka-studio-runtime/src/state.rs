@@ -128,7 +128,7 @@ pub struct AppState {
 impl AppState {
     pub async fn new(settings: Settings, settings_path: PathBuf, data_dir: PathBuf) -> Arc<Self> {
         let hardware = HardwareSnapshot::probe();
-        let store = Arc::new(ModelStore::new(vec![settings.models_dir.clone()]));
+        let store = Arc::new(ModelStore::new(crate::backend::strata::model_roots(&settings)));
         if let Err(e) = store.refresh().await {
             tracing::warn!("initial model scan failed: {e}");
         }
@@ -399,6 +399,14 @@ impl AppState {
     /// the user to discover when generation fails.
     pub async fn apply_settings(&self, new: Settings) -> Result<Settings> {
         let old = self.settings.read().await.clone();
+        if new.backend.strata != old.backend.strata
+            || (new.backend.kind == BackendKind::Strata && old.backend.kind != BackendKind::Strata)
+        {
+            crate::backend::strata::validate_settings(&new.backend.strata, &self.hardware)?;
+            if let Some(path) = new.backend.strata.config_path.as_deref() {
+                crate::backend::strata::PreparedProfile::read(path)?;
+            }
+        }
         new.save(&self.settings_path)?;
 
         // A gateway engine IS its address: `GatewayBackend::new` copies it at construction and never reads settings again,
@@ -407,6 +415,7 @@ impl AppState {
         let backend_changed = new.backend.kind != old.backend.kind
             || new.backend.llama_server_path != old.backend.llama_server_path
             || new.backend.mlx_server_path != old.backend.mlx_server_path
+            || new.backend.strata != old.backend.strata
             || new.node.palw_gateway_url != old.node.palw_gateway_url
             // Background mining moves the chat off the gateway and onto the local runtime (when
             // it is installed); the engine has to follow the switch, in both directions.
@@ -415,7 +424,7 @@ impl AppState {
             || new.image_backend.python_path != old.image_backend.python_path
             || new.image_backend.diffusion_server_path != old.image_backend.diffusion_server_path
             || new.image_backend.device != old.image_backend.device;
-        let models_dir_changed = new.models_dir != old.models_dir;
+        let models_dir_changed = new.models_dir != old.models_dir || new.backend.strata.config_path != old.backend.strata.config_path;
         let hub_changed = new.huggingface.endpoint != old.huggingface.endpoint || new.huggingface.token != old.huggingface.token;
         let recording_changed = new.provenance.record_inferences != old.provenance.record_inferences
             || new.provenance.max_records != old.provenance.max_records;
@@ -434,7 +443,7 @@ impl AppState {
             *self.image_backend.write().await = build_image_backend(&new);
         }
         if models_dir_changed {
-            self.store.set_roots(vec![new.models_dir.clone()]).await?;
+            self.store.set_roots(crate::backend::strata::model_roots(&new)).await?;
         }
         if hub_changed {
             *self.catalog.write().await = Arc::new(Catalog::new(new.huggingface.endpoint.clone(), new.huggingface.token.clone()));
@@ -464,6 +473,15 @@ impl AppState {
     /// MINES, and someone who joined a pool slot asked for exactly that.
     async fn backend_for(&self, model: &LocalModel, settings: &Settings) -> SharedBackend {
         let configured = self.backend.read().await.clone();
+        if crate::backend::strata::configured_for(&settings.backend.strata, model) {
+            return if configured.name() == "strata" {
+                configured
+            } else {
+                build_backend_kind(BackendKind::Strata, settings, &self.hardware)
+            };
+        }
+        let configured =
+            if configured.name() == "strata" { build_backend_kind(BackendKind::Auto, settings, &self.hardware) } else { configured };
         let is_artifact = model.path.file_name().and_then(|n| n.to_str()).is_some_and(palw::is_artifact_filename);
         // In `Background` mode the chat is answered here and the gateway mines from the queue —
         // but only when the local integer runtime is actually installed. Otherwise the gateway
@@ -526,15 +544,20 @@ impl AppState {
             return Err(Error::BackendUnavailable { backend: backend.name().to_string(), reason, remedy });
         }
 
-        let context_size =
-            context_override.or(settings.generation.context_size).unwrap_or_else(|| model.recommended_context(&self.hardware) as u32);
+        let context_size = context_override.or(settings.generation.context_size).unwrap_or_else(|| {
+            if backend.name() == "strata" {
+                model.context_length.unwrap_or(8192).min(8192) as u32
+            } else {
+                model.recommended_context(&self.hardware) as u32
+            }
+        });
         // The engine's own device list, when it has one: a CPU-only build on a machine with a
         // card must plan for the CPU, and a Vulkan build on a card the probe cannot see must plan
         // for the card.
         // Only an engine that offloads is given a layer count. The integer runtime computes on the CPU by
         // construction and the gateway runs somewhere else; a planned count for either was echoed back
         // as "28/28 on GPU" on the model bar, once the artifact's header said how many layers it has.
-        let offloads = ![MisakaBackend::NAME, crate::backend::gateway::NAME].contains(&backend.name());
+        let offloads = ![MisakaBackend::NAME, crate::backend::gateway::NAME, "strata"].contains(&backend.name());
         let devices = if offloads { backend.devices().await } else { None };
         let gpu_layers = if offloads {
             plan_gpu_layers(&model, &self.hardware, devices.as_deref(), context_size as u64, settings.backend.gpu_layers)
@@ -561,7 +584,9 @@ impl AppState {
         let runtime = RuntimeIdentity::derive(backend.descriptor().await);
         // Hashing is deliberately not done here: it would add a minute to every load of a large
         // model. The identity fills in the first time provenance is asked for.
-        let identity = model.identity();
+        // A Strata pack includes companion weights and a separate tokenizer. The native
+        // GGUF's digest alone is not a commitment to that full asset set.
+        let identity = if backend.name() == "strata" { None } else { model.identity() };
         // The engine that answered this load is the one `generate` has to reach, so the choice is
         // recorded rather than recomputed. Unloading does not put the configured one back: what
         // matters is which engine holds the model, and after an unload none does.
@@ -588,6 +613,9 @@ impl AppState {
     /// Compute and cache the model identity for the loaded model, hashing the file if needed.
     pub async fn resolve_identity(&self) -> Result<Option<ModelIdentity>> {
         let Some(state) = self.loaded().await else { return Ok(None) };
+        if state.backend == "strata" {
+            return Ok(None);
+        }
         if let Some(identity) = state.identity {
             return Ok(Some(identity));
         }
@@ -1209,6 +1237,9 @@ pub fn build_backend_kind(kind: BackendKind, settings: &Settings, hardware: &Har
     let tag = accelerator_tag(hardware);
     match kind {
         BackendKind::Mock => Arc::new(MockBackend::default()),
+        BackendKind::Strata => {
+            Arc::new(crate::backend::strata::StrataBackend::new(settings.backend.strata.clone(), hardware.clone(), timeout))
+        }
         BackendKind::Mlx => Arc::new(MlxBackend::new(settings.backend.mlx_server_path.clone(), timeout)),
         BackendKind::LlamaCpp => Arc::new(LlamaCppBackend::new(settings.backend.llama_server_path.clone(), tag, timeout)),
         // The integer runtime, driven through the same child-engine supervisor as the others. It
@@ -1396,6 +1427,22 @@ mod tests {
         // An MLX model is a directory: no file name, and no artifact, so no refusal from here.
         assert!(engine_pairing_refusal("c", None, "mlx").is_none());
     }
+    #[tokio::test]
+    async fn strata_profile_routes_its_native_model_and_leaves_dense_gguf_on_llamacpp() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = crate::backend::strata::tests::fixture(dir.path(), 512);
+        let mut settings = Settings::default();
+        settings.backend.kind = BackendKind::Strata;
+        settings.backend.strata.config_path = Some(profile);
+        settings.models_dir = dir.path().join("models");
+        let state = AppState::new(settings.clone(), dir.path().join("settings.json"), dir.path().join("data")).await;
+        let native = state.store.require("native").await.unwrap();
+        assert_eq!(state.backend_for(&native, &settings).await.name(), "strata");
+        assert_eq!(state.backend_for(&model(12, 65), &settings).await.name(), "llamacpp");
+        settings.backend.kind = BackendKind::Auto;
+        assert_eq!(state.backend_for(&native, &settings).await.name(), "strata");
+    }
+
     use misaka_studio_core::hardware::{Accelerator, AcceleratorKind};
     use misaka_studio_core::model::ModelSource;
 

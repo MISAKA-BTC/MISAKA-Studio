@@ -240,7 +240,17 @@ fn scan_roots(roots: &[PathBuf]) -> (Vec<LocalModel>, Vec<LocalImageModel>) {
     let mut found: HashMap<String, LocalModel> = HashMap::new();
     let mut found_images: HashMap<String, LocalImageModel> = HashMap::new();
     for root in roots {
-        scan_dir(root, 0, &mut found, &mut found_images);
+        if root.is_file() {
+            let sidecar = Sidecar::load(root);
+            if let Ok(mut model) = LocalModel::inspect(root, sidecar.source) {
+                if sidecar.hashed_size == Some(model.size_bytes) {
+                    model.sha256 = sidecar.sha256;
+                }
+                found.insert(model.id.clone(), model);
+            }
+        } else {
+            scan_dir(root, 0, &mut found, &mut found_images);
+        }
     }
     let mut models: Vec<LocalModel> = found.into_values().collect();
     models.sort_by_key(|m| m.name.to_lowercase());

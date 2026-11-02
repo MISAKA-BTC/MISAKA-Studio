@@ -36,6 +36,7 @@ pub mod misaka;
 pub mod mlx;
 pub mod mock;
 pub mod openai_child;
+pub mod strata;
 pub(crate) use openai_child::SseParser;
 
 /// One turn in a conversation.

@@ -30,6 +30,7 @@ export type ModelRequirements = {
 }
 
 export type FitVerdict =
+  | { verdict: 'ssd_streaming'; cache_budget_bytes: number | null }
   | { verdict: 'fits'; device: string; headroom_bytes: number }
   | { verdict: 'tight'; device: string; headroom_bytes: number }
   | { verdict: 'partial_offload'; device: string; gpu_bytes: number; needed_bytes: number }
@@ -340,9 +341,10 @@ export type Settings = {
   load_on_start: string | null
   server: { host: string; port: number; api_key: string | null; cors_origins: string[] }
   backend: {
-    kind: 'auto' | 'llama_cpp' | 'mlx' | 'misaka' | 'gateway' | 'mock'
+    kind: 'auto' | 'llama_cpp' | 'mlx' | 'strata' | 'misaka' | 'gateway' | 'mock'
     llama_server_path: string | null
     mlx_server_path: string | null
+    strata: { config_path: string | null; python_path: string | null; arena_gb: number | null; io_threads: number; prefetch_experts: number }
     misaka_serve_path: string | null
     misaka_tokenizer_path: string | null
     gpu_layers: { mode: 'auto' } | { mode: 'all' } | { mode: 'none' } | { mode: 'fixed'; layers: number }

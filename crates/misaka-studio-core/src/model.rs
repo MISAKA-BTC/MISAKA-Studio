@@ -205,6 +205,8 @@ pub enum FitVerdict {
     /// Does not fit anywhere. Carries the shortfall so the UI can suggest a smaller
     /// quantization or a shorter context instead of just saying no.
     DoesNotFit { needed_bytes: u64, available_bytes: u64 },
+    /// Prepared Strata model: expert weights remain on SSD. Actual memory is checked at load.
+    SsdStreaming { cache_budget_bytes: Option<u64> },
 }
 
 impl FitVerdict {
@@ -269,6 +271,10 @@ impl FitVerdict {
                 device,
                 gb(*gpu_bytes)
             ),
+            FitVerdict::SsdStreaming { cache_budget_bytes } => match cache_budget_bytes {
+                Some(bytes) => format!("Strata SSD streaming — {} expert cache; memory checked at load", gb(*bytes)),
+                None => "Strata SSD streaming — adaptive expert cache; memory checked at load".into(),
+            },
             FitVerdict::DoesNotFit { needed_bytes, available_bytes } => {
                 format!("Needs {}, this machine has {} — try a smaller quantization", gb(*needed_bytes), gb(*available_bytes))
             }

@@ -136,19 +136,37 @@ fn view(model: &LocalModel, hardware: &HardwareSnapshot) -> ModelView {
     ModelView { recommended_context, requirements, fit_summary: fit.summary(), fit, identity: model.identity(), model: model.clone() }
 }
 
+fn views(models: &[LocalModel], hardware: &HardwareSnapshot, settings: &Settings) -> Vec<ModelView> {
+    let profile = settings.backend.strata.config_path.as_deref().and_then(crate::backend::strata::native_path);
+    models
+        .iter()
+        .map(|model| {
+            let mut v = view(model, hardware);
+            if profile.as_ref().is_some_and(|p| model.path.canonicalize().ok().as_ref() == Some(p)) {
+                v.recommended_context = model.context_length.unwrap_or(8192).min(8192);
+                v.requirements = model.requirements(v.recommended_context);
+                v.fit = crate::backend::strata::streaming_fit(&settings.backend.strata, hardware);
+                v.fit_summary = v.fit.summary();
+                v.identity = None;
+            }
+            v
+        })
+        .collect()
+}
+
 async fn list_models(State(state): State<Arc<AppState>>) -> Json<Vec<ModelView>> {
     let models = state.store.list().await;
-    Json(models.iter().map(|m| view(m, &state.hardware)).collect())
+    Json(views(&models, &state.hardware, &*state.settings.read().await))
 }
 
 async fn refresh_models(State(state): State<Arc<AppState>>) -> Result<Json<Vec<ModelView>>> {
     let models = state.store.refresh().await?;
-    Ok(Json(models.iter().map(|m| view(m, &state.hardware)).collect()))
+    Ok(Json(views(&models, &state.hardware, &*state.settings.read().await)))
 }
 
 async fn get_model(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<ModelView>> {
     let model = state.store.require(&id).await?;
-    Ok(Json(view(&model, &state.hardware)))
+    Ok(Json(views(&[model], &state.hardware, &*state.settings.read().await).remove(0)))
 }
 
 async fn delete_model(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<serde_json::Value>> {
@@ -191,7 +209,7 @@ async fn hash_model(State(state): State<Arc<AppState>>, Path(id): Path<String>) 
     if state.loaded().await.map(|s| s.model.id) == Some(id) {
         state.resolve_identity().await?;
     }
-    Ok(Json(view(&model, &state.hardware)))
+    Ok(Json(views(&[model], &state.hardware, &*state.settings.read().await).remove(0)))
 }
 
 #[derive(Deserialize)]
@@ -249,7 +267,9 @@ async fn backends(State(state): State<Arc<AppState>>) -> Json<Vec<BackendInfo>> 
     let mut out = Vec::new();
     // `Auto` is not listed: it is a rule for choosing among these, not a backend, and showing it
     // beside them would invite "is Auto available?" — a question with no answer.
-    for kind in [BackendKind::LlamaCpp, BackendKind::Mlx, BackendKind::Misaka, BackendKind::Gateway, BackendKind::Mock] {
+    for kind in
+        [BackendKind::LlamaCpp, BackendKind::Mlx, BackendKind::Strata, BackendKind::Misaka, BackendKind::Gateway, BackendKind::Mock]
+    {
         let probe = Settings { backend: BackendSettings { kind, ..settings.backend.clone() }, ..settings.clone() };
         let backend = crate::state::build_backend(&probe, &state.hardware);
         out.push(BackendInfo {
@@ -394,4 +414,27 @@ async fn list_records(State(state): State<Arc<AppState>>, Query(query): Query<Re
 async fn get_record(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<StoredRecord>> {
     let records = state.records.read().await.clone();
     records.get(&id).await.map(Json).ok_or_else(|| Error::bad_request(format!("no record with id '{id}'")))
+}
+
+#[cfg(test)]
+mod strata_tests {
+    use super::*;
+    #[test]
+    fn oversized_prepared_moe_is_selectable_as_ssd_streaming_without_claiming_ram_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = crate::backend::strata::tests::fixture(dir.path(), 512);
+        std::fs::OpenOptions::new().write(true).open(dir.path().join("native.gguf")).unwrap().set_len(80 << 30).unwrap();
+        let model = LocalModel::inspect(dir.path().join("native.gguf"), Default::default()).unwrap();
+        let mut hw = HardwareSnapshot::probe();
+        hw.total_memory = 24 << 30;
+        hw.accelerators.clear();
+        let mut settings = Settings::default();
+        assert!(matches!(views(std::slice::from_ref(&model), &hw, &settings)[0].fit, FitVerdict::DoesNotFit { .. }));
+        settings.backend.strata.config_path = Some(profile);
+        let result = views(&[model], &hw, &settings).remove(0);
+        assert!(matches!(result.fit, FitVerdict::SsdStreaming { .. }));
+        assert!(result.requirements.weights_bytes >= 80 << 30);
+        assert_eq!(result.recommended_context, 8192);
+        assert!(result.identity.is_none());
+    }
 }

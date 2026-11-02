@@ -78,3 +78,15 @@ LM Studio and other closed-source local-LLM applications. No part of this work
 derives from their code, their protocols, or from reverse-engineering them.
 Where MISAKA Studio and such products share a feature, it is because both solve
 the same problem for the same users.
+
+--------------------------------------------------------------------------------
+Strata — https://github.com/Niko1221/Strata
+Licensed under the MIT License
+--------------------------------------------------------------------------------
+
+Studio optionally drives Strata Metal and its OpenAI server as external processes.
+No Strata source or binary is bundled in this tree. scripts/install-strata.py
+installs a pinned upstream source checkout in the user's application data folder;
+that installation retains upstream's LICENSE and dependency notices. The Studio
+bridge is original integration code. Distributions that bundle Strata must also
+retain its MIT license and applicable third-party notices.

@@ -25,6 +25,8 @@ function shortFit(fit: FitVerdict): string {
       return 'fits'
     case 'tight':
       return 'tight fit'
+    case 'ssd_streaming':
+      return 'Strata · SSD streaming'
     case 'partial_offload':
       return 'partly on CPU'
     case 'does_not_fit':

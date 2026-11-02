@@ -14,7 +14,7 @@ to the prompt and the answer, derived exactly the way MISAKA consensus derives t
       │  HTTP:  /v1/…  and  /api/v1/…
   MISAKA Runtime API              misaka-studiod
       │  InferenceBackend
-  LLM backend                     llama.cpp · MLX · (MISAKA's own runtime, later)
+  LLM backend                     llama.cpp · MLX · Strata (SSD experts) · MISAKA
       │
   GPU / CPU
 ```
@@ -381,6 +381,10 @@ It skips itself, loudly, when those are not set. Three bugs were found by runnin
 other means: llama.cpp's current version banner (`version: 0.3.0-dev (build 1, commit 90c26fc)`)
 parsed to a commit that was a whole sentence; `-fa` as a bare flag is now an error, so every load
 died in a usage message; and a model with no chat template answered `400 unordered_map::at`.
+
+## Strata SSD streaming
+
+Prepared Strata Metal MoE models can stream experts from SSD with an adaptive or fixed expert cache. Studio supervises the native engine and its OpenAI server, routes only the registered profile's model to it, and keeps ordinary GGUFs on their usual backend. See [installation, configuration and supported models](docs/strata-ssd.md). Dense models such as Huihui Qwen 27B do not gain MoE paging from this backend.
 
 ## Licensing
 

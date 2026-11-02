@@ -390,7 +390,7 @@ export function FitBadge({ fit, summary }: { fit: FitVerdict; summary: string })
       ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
       : fit.verdict === 'tight'
         ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300'
-        : fit.verdict === 'partial_offload'
+        : fit.verdict === 'partial_offload' || fit.verdict === 'ssd_streaming'
           ? 'bg-orange-100 text-orange-800 dark:bg-orange-950/60 dark:text-orange-300'
           : 'bg-red-100 text-red-800 dark:bg-red-950/60 dark:text-red-300'
   return (

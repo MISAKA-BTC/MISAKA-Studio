@@ -33,6 +33,8 @@ pub enum BackendKind {
     LlamaCpp,
     /// Apple's MLX, via `mlx_lm.server`. macOS/Apple Silicon only.
     Mlx,
+    /// Strata Metal with SSD expert streaming, using a prepared upstream profile.
+    Strata,
     /// The deterministic integer runtime (`misaka-palw-serve`), driven as a child process. Its
     /// arithmetic is the class a chain registers, so two machines running one artifact agree.
     Misaka,
@@ -115,6 +117,7 @@ pub struct BackendSettings {
     pub llama_server_path: Option<PathBuf>,
     /// Path to the MLX server entry point (macOS).
     pub mlx_server_path: Option<PathBuf>,
+    pub strata: StrataSettings,
     /// Path to `misaka-palw-serve`, the integer runtime's OpenAI server. `None` looks beside the
     /// Studio's own executable and on PATH, the same way the other engines are found.
     pub misaka_serve_path: Option<PathBuf>,
@@ -146,6 +149,7 @@ impl Default for BackendSettings {
             kind: BackendKind::Auto,
             llama_server_path: None,
             mlx_server_path: None,
+            strata: StrataSettings::default(),
             misaka_serve_path: None,
             misaka_tokenizer_path: None,
             gpu_layers: GpuLayers::Auto,
@@ -156,6 +160,24 @@ impl Default for BackendSettings {
             extra_args: Vec::new(),
             startup_timeout_secs: 600,
         }
+    }
+}
+
+/// Strata's prepared Metal profile is opt-in; ordinary GGUFs retain their usual engine.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StrataSettings {
+    pub config_path: Option<PathBuf>,
+    pub python_path: Option<PathBuf>,
+    /// Decimal GB, matching STRATA_METAL_ARENA_GB. None uses the engine's adaptive budget.
+    pub arena_gb: Option<u32>,
+    pub io_threads: u32,
+    pub prefetch_experts: u32,
+}
+
+impl Default for StrataSettings {
+    fn default() -> Self {
+        Self { config_path: None, python_path: None, arena_gb: None, io_threads: 4, prefetch_experts: 4 }
     }
 }
 
