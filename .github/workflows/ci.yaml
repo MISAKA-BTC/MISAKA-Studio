@@ -82,6 +82,9 @@ jobs:
         run: npm run build
       # The Markdown math normaliser has a test file of what models actually write; Node runs it
       # without a framework. See ui/test/.
+      - name: Desktop build regression tests
+        run: node --test ../scripts/desktop.test.mjs
+
       - name: Test
         run: npm test
 

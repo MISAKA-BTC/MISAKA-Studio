@@ -72,8 +72,8 @@ The block above is bash. **Windows PowerShell 5.1 — the one that ships with Wi
 ("&& is not a valid statement separator in this version"). Use `;`, backslashes, and the `.exe`:
 
 ```powershell
-cargo build --release
 npm --prefix ui install; npm --prefix ui run build
+cargo build --release
 .\target\release\misaka-studiod.exe
 ```
 
@@ -86,6 +86,18 @@ path separators. Git Bash and WSL run the bash block as written.
 cd desktop/src-tauri
 cargo tauri dev          # or: cargo tauri build   (needs the Tauri CLI: cargo install tauri-cli)
 ```
+
+Both Tauri commands now build the UI, compile the matching runtime, and refresh the
+runtime in `desktop/src-tauri/resources/` before starting or packaging the shell. A failure
+stops the command rather than packaging an old runtime. After pulling `main`, run the command
+again and launch the newly built app in `target/release/bundle/` (or replace your installed app
+with it). Pulling source or building `misaka-studiod` alone does not update an existing app in
+`/Applications` or another install directory. Quit the old app/runtime before opening the new
+build so the shell does not attach to the old service.
+
+On macOS, the engine search also checks `/opt/homebrew/bin/llama-server` and
+`/usr/local/bin/llama-server` after PATH. Finder launches do not normally inherit a terminal's
+Homebrew PATH. An engine explicitly selected in Settings still takes priority.
 
 The shell spawns `misaka-studiod` itself, waits for it to be healthy, and stops it on exit — unless
 one was **already** running on the configured port, in which case it attaches to that one rather

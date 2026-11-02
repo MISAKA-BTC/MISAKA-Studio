@@ -7,12 +7,13 @@
 //!
 //! # Finding the binary
 //!
-//! Three places, in order, because each is right for a different kind of user:
+//! Search order:
 //!
 //! 1. **The configured path** — someone who built llama.cpp with flags they care about, or the
 //!    build the Studio installed for them (`crate::engines` writes this setting).
 //! 2. **Next to the Studio executable** — the packaged desktop app ships an engine beside itself.
 //! 3. **`PATH`** — a developer with `llama-server` installed system-wide.
+//! 4. **macOS Homebrew prefixes** — Finder does not inherit a shell's PATH.
 //!
 //! When none of them has it, the backend reports unavailable *with the remedy*, and the app
 //! keeps running on the mock backend rather than failing to start. A local-LLM app that refuses
@@ -90,6 +91,8 @@ pub enum ProgramSource {
     BesideApp,
     /// Found on `PATH`.
     Path,
+    /// A standard macOS Homebrew prefix, even when Finder supplies a minimal PATH.
+    SystemInstall,
     /// Nowhere: the bare name, so the error names what is missing.
     Missing,
 }
@@ -101,23 +104,37 @@ pub fn resolve_program(configured: Option<PathBuf>) -> PathBuf {
 
 /// Where the engine binary is, and how it was found.
 pub fn resolve_program_with_source(configured: Option<PathBuf>) -> (PathBuf, ProgramSource) {
+    let exe = std::env::current_exe().ok();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let system_dirs =
+        if cfg!(target_os = "macos") { vec![PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")] } else { vec![] };
+    resolve_program_in(configured, exe.as_deref().and_then(|p| p.parent()), std::env::split_paths(&path), system_dirs)
+}
+
+fn resolve_program_in(
+    configured: Option<PathBuf>,
+    exe_dir: Option<&std::path::Path>,
+    path_dirs: impl IntoIterator<Item = PathBuf>,
+    system_dirs: impl IntoIterator<Item = PathBuf>,
+) -> (PathBuf, ProgramSource) {
     let exe_name = engine_file_name();
 
     if let Some(path) = configured {
         return (path, ProgramSource::Configured);
     }
     // Beside the Studio's own executable: how the packaged app ships an engine.
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
+    if let Some(dir) = exe_dir {
         for candidate in [dir.join(exe_name), dir.join("engines").join(exe_name)] {
             if candidate.is_file() {
                 return (candidate, ProgramSource::BesideApp);
             }
         }
     }
-    if let Some(found) = which(exe_name) {
+    if let Some(found) = path_dirs.into_iter().map(|dir| dir.join(exe_name)).find(|p| p.is_file()) {
         return (found, ProgramSource::Path);
+    }
+    if let Some(found) = system_dirs.into_iter().map(|dir| dir.join(exe_name)).find(|p| p.is_file()) {
+        return (found, ProgramSource::SystemInstall);
     }
     // Not found: return the bare name so the error names the thing that is missing rather than
     // an absolute path that never existed.
@@ -127,12 +144,6 @@ pub fn resolve_program_with_source(configured: Option<PathBuf>) -> (PathBuf, Pro
 /// `llama-server`, or `llama-server.exe`.
 pub fn engine_file_name() -> &'static str {
     if cfg!(windows) { "llama-server.exe" } else { "llama-server" }
-}
-
-/// A minimal `which`, to avoid a dependency for eleven lines.
-fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|dir| dir.join(name)).find(|c| c.is_file())
 }
 
 /// The environment an engine needs to find the libraries beside it.
@@ -415,21 +426,31 @@ mod tests {
     /// user sees names `llama-server` and not a path that never existed.
     #[test]
     fn a_missing_engine_is_named_not_pathed() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let empty_path = dir.path().display().to_string();
-        // A PATH with nothing on it, restored afterwards; `which` reads the real one otherwise.
-        let saved = std::env::var_os("PATH");
-        unsafe { std::env::set_var("PATH", &empty_path) };
-        let (program, source) = resolve_program_with_source(None);
-        match saved {
-            Some(v) => unsafe { std::env::set_var("PATH", v) },
-            None => unsafe { std::env::remove_var("PATH") },
+        let (program, source) = resolve_program_in(None, None, [], []);
+        assert_eq!(program, PathBuf::from(engine_file_name()));
+        assert_eq!(source, ProgramSource::Missing);
+    }
+
+    #[test]
+    fn finder_finds_homebrew_without_overriding_explicit_or_path_engines() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let brew = root.path().join("homebrew/bin");
+        let path = root.path().join("path");
+        let app = root.path().join("app");
+        for dir in [&brew, &path, &app.join("engines")] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(engine_file_name()), b"engine").unwrap();
         }
-        if source == ProgramSource::Missing {
-            assert_eq!(program, PathBuf::from(engine_file_name()));
-        } else {
-            // A packaged layout with an engine beside the test binary is a legitimate find.
-            assert_eq!(source, ProgramSource::BesideApp);
-        }
+        assert_eq!(resolve_program_in(None, None, [], [brew.clone()]), (brew.join(engine_file_name()), ProgramSource::SystemInstall));
+        assert_eq!(
+            resolve_program_in(None, None, [path.clone()], [brew.clone()]),
+            (path.join(engine_file_name()), ProgramSource::Path)
+        );
+        assert_eq!(
+            resolve_program_in(None, Some(&app), [path.clone()], [brew.clone()]),
+            (app.join("engines").join(engine_file_name()), ProgramSource::BesideApp)
+        );
+        let configured = root.path().join("chosen-engine");
+        assert_eq!(resolve_program_in(Some(configured.clone()), Some(&app), [path], [brew]), (configured, ProgramSource::Configured));
     }
 }

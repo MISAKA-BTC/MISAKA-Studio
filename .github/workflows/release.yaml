@@ -69,20 +69,23 @@ jobs:
 
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2
 
-      - name: Build the UI
-        run: |
-          npm --prefix ui ci
-          npm --prefix ui run build
+      - name: Install the Tauri CLI
+        run: cargo install tauri-cli --version '^2' --locked
 
-      # The bundle has to carry the runtime: that is what makes the installed app self-contained —
-      # no PATH, no second download, no Rust on the user's machine. Note where it ends up. This
-      # copies into the desktop crate's `resources/`, and tauri keeps that directory name inside
-      # the bundle, so the sidecar sits one level DOWN from the executable (and in
-      # `Contents/Resources/resources/` on macOS) — NOT beside it, which is what this comment used
-      # to claim and what `locate_runtime_binary` used to assume. v0.1.0 shipped the file in every
-      # installer with no way to reach it.
-      - name: Build the runtime
-        run: cargo build --release --bin misaka-studiod
+      # Invoked from `desktop/src-tauri` because that is where the config lives — but note that the
+      # config's two kinds of path do NOT share a base, which is what broke the first release run
+      # on all three platforms at once:
+      #
+      #   frontendDist        is relative to the config file      -> desktop/src-tauri/../../ui/dist
+      #   beforeBuildCommand  runs in the app dir (desktop/)      -> desktop/../scripts
+      #
+      # Written as `../../ui`, the before-command resolved to a `ui/` one level ABOVE the checkout
+      # (`/Users/runner/work/MISAKA-Studio/ui`) and died on a package.json that was never there.
+      # Moving the invocation around cannot fix that; tauri picks the app dir itself. The fix is in
+      # the config, and this step stays where the CLI expects to be run.
+      - name: Bundle
+        working-directory: desktop/src-tauri
+        run: cargo tauri build --bundles ${{ matrix.bundles }}
 
       # The runtime compiles `ui/dist` into itself, so "Build the UI" must come first — and if it
       # ever stops doing so, the binary still builds, still runs, and serves the headless "no UI
@@ -102,35 +105,6 @@ jobs:
             *files*) ;;
             *) echo "::error::the release runtime has no UI compiled in — 'Build the UI' must run before 'Build the runtime'"; exit 1 ;;
           esac
-
-      - name: Stage the runtime as a bundle resource
-        shell: bash
-        run: |
-          mkdir -p desktop/src-tauri/resources
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cp target/release/misaka-studiod.exe desktop/src-tauri/resources/
-          else
-            cp target/release/misaka-studiod desktop/src-tauri/resources/
-          fi
-          ls -l desktop/src-tauri/resources
-
-      - name: Install the Tauri CLI
-        run: cargo install tauri-cli --version '^2' --locked
-
-      # Invoked from `desktop/src-tauri` because that is where the config lives — but note that the
-      # config's two kinds of path do NOT share a base, which is what broke the first release run
-      # on all three platforms at once:
-      #
-      #   frontendDist        is relative to the config file      -> desktop/src-tauri/../../ui/dist
-      #   beforeBuildCommand  runs in the app dir (desktop/)      -> desktop/../ui
-      #
-      # Written as `../../ui`, the before-command resolved to a `ui/` one level ABOVE the checkout
-      # (`/Users/runner/work/MISAKA-Studio/ui`) and died on a package.json that was never there.
-      # Moving the invocation around cannot fix that; tauri picks the app dir itself. The fix is in
-      # the config, and this step stays where the CLI expects to be run.
-      - name: Bundle
-        working-directory: desktop/src-tauri
-        run: cargo tauri build --bundles ${{ matrix.bundles }}
 
       - name: Collect the installers
         shell: bash

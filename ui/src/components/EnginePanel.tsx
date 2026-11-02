@@ -17,6 +17,7 @@ import { Icon, Spinner } from './common'
 const SOURCE_LABEL = {
   configured: 'from Settings',
   beside_app: 'beside the app',
+  system_install: 'system installation (Homebrew)',
   path: 'on PATH',
   missing: 'not found',
 } as const

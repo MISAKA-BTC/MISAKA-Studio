@@ -222,7 +222,7 @@ export type InstallStatus = {
 /** `/api/v1/engines`: the engine a load would run, what it can drive, and what could replace it. */
 export type EnginesView = {
   program: string
-  source: 'configured' | 'beside_app' | 'path' | 'missing'
+  source: 'configured' | 'beside_app' | 'path' | 'system_install' | 'missing'
   version: string | null
   error: string | null
   devices: EngineDevice[] | null
