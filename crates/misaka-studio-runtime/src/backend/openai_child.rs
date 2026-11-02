@@ -101,9 +101,10 @@ impl ChildEngine {
             config,
             running: Arc::new(RwLock::new(None)),
             log: Arc::new(Mutex::new(VecDeque::with_capacity(LOG_LINES))),
-            // No overall timeout: a generation legitimately runs for minutes. Connect timeouts
-            // still apply, so a dead engine is detected quickly.
-            http: reqwest::Client::builder().connect_timeout(Duration::from_secs(5)).build().expect("http client builds"),
+            // A child engine is always on loopback: external HTTP/Tor proxy
+            // environment variables must never intercept this connection.
+            // No overall timeout: a generation legitimately runs for minutes.
+            http: reqwest::Client::builder().no_proxy().connect_timeout(Duration::from_secs(5)).build().expect("http client builds"),
         }
     }
 
@@ -344,32 +345,92 @@ impl ChildEngine {
         }
 
         Ok(async_stream(move |tx| async move {
-            let mut parser = SseParser::new(chat);
-            let mut byte_stream = response.bytes_stream();
-            use futures_util::StreamExt;
-
-            while let Some(chunk) = byte_stream.next().await {
-                let chunk = match chunk {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let message = stream_break_message(&e, &running, &log).await;
+            let mut response = response;
+            // A request that emitted no tokens can be retried once without
+            // duplicating visible output or executing a tool a second time.
+            for attempt in 0..2 {
+                let mut parser = SseParser::new(chat);
+                let mut byte_stream = response.bytes_stream();
+                let mut emitted = false;
+                let mut transport_error = None;
+                use futures_util::StreamExt;
+                while let Some(chunk) = tokio::select! {
+                    _ = tx.closed() => return,
+                    chunk = byte_stream.next() => chunk,
+                } {
+                    let chunk = match chunk {
+                        Ok(c) => c,
+                        Err(error) => {
+                            transport_error = Some(error);
+                            break;
+                        }
+                    };
+                    for event in parser.push(&chunk) {
+                        emitted = true;
+                        if tx.send(Ok(event)).await.is_err() {
+                            // Dropping the response cancels the engine request.
+                            return;
+                        }
+                    }
+                    if let Some(message) = parser.take_error() {
                         let _ = tx.send(Err(Error::Engine { backend, message })).await;
                         return;
                     }
-                };
-                for event in parser.push(&chunk) {
-                    if tx.send(Ok(event)).await.is_err() {
-                        // Client hung up. Dropping the response cancels the HTTP request, which
-                        // is what tells the engine to stop generating.
+                    if parser.done_marker {
+                        // SSE is finished. Do not wait for HTTP chunk framing:
+                        // an engine may close after [DONE] without a zero chunk.
+                        let _ = tx.send(Ok(parser.finish(fallback_prompt_tokens))).await;
                         return;
                     }
                 }
-                if let Some(message) = parser.take_error() {
-                    let _ = tx.send(Err(Error::Engine { backend, message })).await;
+                if parser.is_complete() {
+                    // Some engines omit [DONE] but do send finish_reason.
+                    let _ = tx.send(Ok(parser.finish(fallback_prompt_tokens))).await;
                     return;
                 }
+                if tx.is_closed() {
+                    return;
+                }
+                if attempt == 0 && !emitted && same_engine_alive(&running, &base).await {
+                    if tx.is_closed() {
+                        return;
+                    }
+                    tracing::warn!(backend, "engine stream ended before any tokens; retrying once");
+                    let retry = tokio::select! {
+                        _ = tx.closed() => return,
+                        response = http.post(&url).json(&body).send() => response,
+                    };
+                    match retry {
+                        Ok(retry) if retry.status().is_success() => {
+                            response = retry;
+                            continue;
+                        }
+                        Ok(retry) => {
+                            let status = retry.status();
+                            let text = retry.text().await.unwrap_or_default();
+                            let _ = tx
+                                .send(Err(Error::Engine {
+                                    backend,
+                                    message: format!("engine retry returned {status}: {}", text.trim()),
+                                }))
+                                .await;
+                        }
+                        Err(error) => {
+                            let message = stream_break_message(&error, &running, &log, &base).await;
+                            let _ = tx.send(Err(Error::Engine { backend, message })).await;
+                        }
+                    }
+                    return;
+                }
+                let message = if let Some(error) = transport_error {
+                    stream_break_message(&error, &running, &log, &base).await
+                } else {
+                    "stream ended before the engine sent a completion signal. The partial reply is incomplete; retry the request."
+                        .into()
+                };
+                let _ = tx.send(Err(Error::Engine { backend, message })).await;
+                return;
             }
-            let _ = tx.send(Ok(parser.finish(fallback_prompt_tokens))).await;
         }))
     }
 
@@ -401,6 +462,12 @@ impl ChildEngine {
     }
 }
 
+/// Never replay into a replacement model or a process that has already died.
+async fn same_engine_alive(running: &Arc<RwLock<Option<Running>>>, base: &str) -> bool {
+    let mut guard = running.write().await;
+    guard.as_mut().is_some_and(|r| format!("http://127.0.0.1:{}", r.port) == base && matches!(r.child.try_wait(), Ok(None)))
+}
+
 /// **Why a stream broke, with the facts that decide what to do next.**
 ///
 /// reqwest's own text for a body that stops arriving is `error decoding response body` — the
@@ -413,6 +480,7 @@ async fn stream_break_message(
     error: &reqwest::Error,
     running: &Arc<RwLock<Option<Running>>>,
     log: &Arc<Mutex<VecDeque<String>>>,
+    expected_base: &str,
 ) -> String {
     let cause = error_chain(error);
     // A dying process closes its sockets a moment before it becomes reapable: the EOF arrives
@@ -421,7 +489,17 @@ async fn stream_break_message(
     // concluding that it is; a crash is worth that much of a wait to be named as one.
     let mut exited = None;
     for _ in 0..10 {
-        exited = running.write().await.as_mut().and_then(|r| r.child.try_wait().ok().flatten());
+        let mut guard = running.write().await;
+        let Some(current) = guard.as_mut() else {
+            return format!(
+                "stream broke: the model was unloaded while generating ({cause}). Select the model and retry the request."
+            );
+        };
+        if format!("http://127.0.0.1:{}", current.port) != expected_base {
+            return format!("stream broke: the engine was replaced while generating ({cause}). Retry with the selected model.");
+        }
+        exited = current.child.try_wait().ok().flatten();
+        drop(guard);
         if exited.is_some() {
             break;
         }
@@ -594,14 +672,18 @@ pub(crate) struct SseParser {
     /// at 0.0 tok/s: the one failure that looks like nothing happening. Measured on a chat whose
     /// second turn exceeded the class's context.
     error: Option<String>,
+    done_marker: bool,
 }
 
 impl SseParser {
     pub(crate) fn new(chat: bool) -> Self {
-        SseParser { buffer: Vec::new(), chat, text_len: 0, usage: None, finish_reason: None, error: None }
+        SseParser { buffer: Vec::new(), chat, text_len: 0, usage: None, finish_reason: None, error: None, done_marker: false }
     }
 
     pub(crate) fn push(&mut self, bytes: &[u8]) -> Vec<StreamEvent> {
+        if self.done_marker {
+            return Vec::new();
+        }
         self.buffer.extend_from_slice(bytes);
         let mut events = Vec::new();
         while let Some(idx) = self.buffer.iter().position(|&b| b == b'\n') {
@@ -610,7 +692,11 @@ impl SseParser {
             let line = line.trim();
             let Some(payload) = line.strip_prefix("data:") else { continue };
             let payload = payload.trim();
-            if payload.is_empty() || payload == "[DONE]" {
+            if payload == "[DONE]" {
+                self.done_marker = true;
+                break;
+            }
+            if payload.is_empty() {
                 continue;
             }
             let Ok(json) = serde_json::from_str::<serde_json::Value>(payload) else { continue };
@@ -666,6 +752,10 @@ impl SseParser {
     /// did not — a blank tokens/sec readout is a worse answer than an approximate one, as long
     /// as it is never presented as exact.
     /// The server's own error, once, if it sent one.
+    fn is_complete(&self) -> bool {
+        self.done_marker || self.finish_reason.is_some()
+    }
+
     pub(crate) fn take_error(&mut self) -> Option<String> {
         self.error.take()
     }
@@ -686,6 +776,147 @@ impl SseParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn done_is_a_terminal_sse_frame_even_when_more_bytes_follow() {
+        let mut parser = SseParser::new(true);
+        let events = parser.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\ndata: {\"error\":\"must be ignored after DONE\"}\n\n");
+        assert_eq!(events, vec![StreamEvent::Delta("ok".into())]);
+        assert!(parser.is_complete());
+        assert!(parser.take_error().is_none());
+        assert!(parser.push(b"data: ignored\n").is_empty());
+    }
+
+    #[test]
+    fn a_partial_answer_is_not_a_completed_stream() {
+        let mut parser = SseParser::new(true);
+        parser.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n");
+        assert!(!parser.is_complete());
+        parser.push(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n");
+        assert!(parser.is_complete());
+    }
+
+    #[tokio::test]
+    async fn an_unloaded_engine_is_not_reported_as_still_running() {
+        let running = Arc::new(RwLock::new(None));
+        let log = Arc::new(Mutex::new(VecDeque::new()));
+        let error = reqwest::Client::new().get("not an absolute URL").build().unwrap_err();
+        let message = stream_break_message(&error, &running, &log, "http://127.0.0.1:1").await;
+        assert!(message.contains("model was unloaded"), "{message}");
+        assert!(!message.contains("still running"));
+        assert!(!same_engine_alive(&running, "http://127.0.0.1:1").await);
+    }
+
+    /// Real HTTP chunked responses, including the exact failure reported by the
+    /// user: the socket closes without the terminal zero-size HTTP chunk.
+    #[cfg(unix)]
+    async fn broken_http_fixture(bodies: &[&str]) -> Vec<Result<StreamEvent>> {
+        use futures_util::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bodies: Vec<String> = bodies.iter().map(|s| s.to_string()).collect();
+        let server = tokio::spawn(async move {
+            for body in bodies {
+                let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                loop {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buffer[..n]);
+                    if let Some(end) = request.windows(4).position(|b| b == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                        let length: usize =
+                            headers.lines().find_map(|l| l.strip_prefix("content-length:").map(str::trim)).unwrap().parse().unwrap();
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+                if !body.is_empty() {
+                    let chunk = format!("{:x}\r\n{}\r\n", body.len(), body);
+                    socket.write_all(chunk.as_bytes()).await.unwrap();
+                }
+                socket.shutdown().await.unwrap(); // deliberately omit 0\r\n\r\n
+            }
+        });
+        let engine = ChildEngine::new(ChildEngineConfig {
+            name: "test",
+            program: PathBuf::from("unused"),
+            args: Box::new(|_, _| vec![]),
+            health_path: "/health",
+            context_from_health: None,
+            startup_timeout: Duration::from_secs(1),
+            env: vec![],
+            offload_from_log: None,
+        });
+        let child = tokio::process::Command::new("sleep").arg("60").kill_on_drop(true).spawn().unwrap();
+        *engine.running.write().await = Some(Running {
+            child,
+            port,
+            model: LoadedModel { model_id: "m".into(), context_size: 8192, gpu_layers: None, load_ms: 0, offload: None },
+        });
+        let request = GenerationRequest {
+            model: "m".into(),
+            messages: vec![super::super::ChatMessage::new("user", "hi")],
+            prompt: None,
+            params: Default::default(),
+            stop: vec![],
+            prompt_tokens: None,
+            disable_thinking: false,
+        };
+        let stream = engine.generate(request).await.unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>()).await.unwrap();
+        server.await.unwrap();
+        engine.unload().await.unwrap();
+        events
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_complete_answer_survives_a_truncated_http_chunk_terminator() {
+        let events = broken_http_fixture(&["data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\ndata: [DONE]\n\n"]).await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].as_ref().unwrap(), &StreamEvent::Delta("ok".into()));
+        assert!(matches!(events[1], Ok(StreamEvent::Done { usage: Usage { total_tokens: 4, .. }, .. })));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_finish_reason_also_proves_completion_without_done() {
+        let events =
+            broken_http_fixture(&["data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"length\"}]}\n\n"]).await;
+        assert!(matches!(events.last(), Some(Ok(StreamEvent::Done { finish_reason, .. })) if finish_reason == "length"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupted_partial_answers_are_not_replayed_or_marked_done() {
+        let events = broken_http_fixture(&["data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"]).await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].as_ref().unwrap(), &StreamEvent::Delta("partial".into()));
+        assert!(events[1].is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_disconnect_before_tokens_is_retried_once() {
+        let events =
+            broken_http_fixture(&["", "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\ndata: [DONE]\n\n"]).await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].as_ref().unwrap(), &StreamEvent::Delta("recovered".into()));
+        assert!(matches!(events[1], Ok(StreamEvent::Done { .. })));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_empty_disconnects_stop_after_one_retry() {
+        let events = broken_http_fixture(&["", ""]).await;
+        assert_eq!(events.len(), 1);
+        assert!(events[0].is_err());
+    }
 
     /// Both banner shapes. The labelled one is what a `llama-server` built in 2026 actually
     /// prints — copied from a real run, not from the source.
